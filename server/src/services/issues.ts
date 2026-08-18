@@ -2038,6 +2038,7 @@ export type IssueDependencyReadiness = {
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
   pendingFinalizeBlockerIssueIds: string[];
+  /** Backward-compatible field name; cancelled is done-equivalent, while pending finalization keeps this false. */
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
@@ -2342,6 +2343,14 @@ function createIssueDependencyReadiness(
   };
 }
 
+const TERMINAL_DEPENDENCY_STATUSES = ["done", "cancelled"] as const;
+
+function isTerminalDependencyStatus(status: string): boolean {
+  return TERMINAL_DEPENDENCY_STATUSES.includes(
+    status as (typeof TERMINAL_DEPENDENCY_STATUSES)[number],
+  );
+}
+
 /**
  * Returns the set of execution-workspace ids whose most recent workspace operation
  * is NOT a successful `workspace_finalize`. These workspaces have either an in-flight
@@ -2624,8 +2633,8 @@ async function listIssueDependencyReadinessMap(
     );
 
   // Collect issue/workspace pairs of "done" blockers — these are the only ones
-  // subject to the workspace-finalize barrier. Blockers that aren't done already
-  // mark the dependent as not-ready and don't need a finalize check.
+  // subject to the workspace-finalize barrier. Non-terminal blockers already
+  // mark the dependent as not-ready and cancelled blockers need no finalize check.
   const doneBlockerWorkspacePairs: Array<{
     blockerIssueId: string;
     executionWorkspaceId: string;
@@ -2650,9 +2659,10 @@ async function listIssueDependencyReadinessMap(
       readinessMap.get(row.issueId) ??
       createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // Both terminal issue states satisfy explicit dependencies. Only `done`
+    // blockers participate in workspace finalization because cancelled work has
+    // no delivered workspace state to synchronize.
+    if (!isTerminalDependencyStatus(row.blockerStatus)) {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -2728,8 +2738,7 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
+        notInArray(issues.status, [...TERMINAL_DEPENDENCY_STATUSES]),
       ),
     )
     .then((rows) => rows.map((row) => row.id));
@@ -3645,7 +3654,7 @@ async function terminalExplicitBlockersByRoot(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
+            notInArray(issues.status, [...TERMINAL_DEPENDENCY_STATUSES]),
           ),
         );
 
@@ -3672,7 +3681,7 @@ async function terminalExplicitBlockersByRoot(
   ): IssueRelationIssueSummary[] => {
     if (seen.has(issueId)) return [];
     const node = nodesById.get(issueId);
-    if (!node || node.status === "done") return [];
+    if (!node || isTerminalDependencyStatus(node.status)) return [];
     const nextSeen = new Set(seen);
     nextSeen.add(issueId);
     const downstreamIds = edgesByIssueId.get(issueId) ?? [];
@@ -3800,7 +3809,7 @@ async function listIssueBlockerAttentionMap(
 
       const unresolvedExplicitBlockerRows = explicitBlockerRows.filter(
         (row) =>
-          row.status !== "done" ||
+          !isTerminalDependencyStatus(row.status) ||
           pendingFinalizeBlockerIssueIds.has(row.blockerIssueId),
       );
       appendBlockerAttentionEdges(edgesByIssueId, [
@@ -3912,7 +3921,7 @@ async function listIssueBlockerAttentionMap(
   }
 
   const explicitWaitCandidateIds = [...nodesById.values()]
-    .filter((node) => node.status !== "done")
+    .filter((node) => !isTerminalDependencyStatus(node.status))
     .map((node) => node.id);
   const explicitWaitingIssueIds = new Set<string>();
   if (explicitWaitCandidateIds.length > 0) {
@@ -4114,7 +4123,7 @@ async function listIssueBlockerAttentionMap(
     }
     const nodeSample = blockerSampleIdentifier(node);
     if (
-      node.status === "done" &&
+      isTerminalDependencyStatus(node.status) &&
       !pendingFinalizeBlockerIssueIds.has(node.id)
     ) {
       return {
@@ -4167,15 +4176,6 @@ async function listIssueBlockerAttentionMap(
         sampleStalledBlockerIdentifier: null,
       };
     }
-    if (node.status === "cancelled") {
-      return {
-        covered: false,
-        stalled: false,
-        sampleBlockerIdentifier: nodeSample,
-        sampleStalledBlockerIdentifier: null,
-        terminalBlockerIssueId: node.id,
-      };
-    }
     if (node.status === "backlog" && node.assigneeAgentId) {
       return {
         covered: false,
@@ -4189,7 +4189,8 @@ async function listIssueBlockerAttentionMap(
     const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
-        blocker?.status !== "done" ||
+        !blocker ||
+        !isTerminalDependencyStatus(blocker.status) ||
         pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       );
     });
@@ -4280,7 +4281,8 @@ async function listIssueBlockerAttentionMap(
     return (edgesByIssueId.get(node.id) ?? []).some((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       if (
-        blocker?.status === "done" &&
+        blocker &&
+        isTerminalDependencyStatus(blocker.status) &&
         !pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       )
         return false;
@@ -4300,7 +4302,8 @@ async function listIssueBlockerAttentionMap(
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
-        blocker?.status !== "done" ||
+        !blocker ||
+        !isTerminalDependencyStatus(blocker.status) ||
         pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       );
     });
@@ -5534,7 +5537,7 @@ async function listIssueBlockedInboxAttentionMap(
           and(
             eq(issues.companyId, companyId),
             visibleIssueCondition(),
-            ne(issues.status, "done"),
+            notInArray(issues.status, [...TERMINAL_DEPENDENCY_STATUSES]),
           ),
         ),
       dbOrTx
@@ -9146,7 +9149,7 @@ export function issueService(db: Db) {
       if (wakeableCandidates.length === 0) return [];
 
       // Defer to the unified readiness check so that a dependent only fires when
-      // (a) every blocker is done AND (b) every done blocker's workspace has
+      // (a) every blocker is terminal AND (b) every done blocker's workspace has
       // recorded a successful workspace_finalize. The finalize hook also calls
       // this function on completion, so a wake initially gated by an in-flight
       // sync-back will re-fire once the restore lands locally.

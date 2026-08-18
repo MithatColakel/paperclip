@@ -225,6 +225,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    blockerStatus?: "done" | "cancelled";
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
@@ -305,7 +306,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         companyId,
         projectId: workspaceState === "none" ? null : projectId,
         title: "Synthetic completed blocker",
-        status: "done",
+        status: opts.blockerStatus ?? "done",
         priority: "medium",
         executionWorkspaceId: workspaceState === "none" ? null : executionWorkspaceId,
         issueNumber: 2,
@@ -508,6 +509,36 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted")));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ entityId: blockedIssueId });
+  });
+
+  it("reconciles a previously stranded dependent whose cancelled blocker has an unfinished workspace", async () => {
+    const { agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "not_finalized",
+        blockerStatus: "cancelled",
+      });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(1);
+    expect(result.notReadySkipped).toBe(0);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+
+    const wake = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({
+      reason: "issue_blockers_resolved",
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+    });
   });
 
   it("reconciles a resolved blocked dependency after the assignee-null window closes", async () => {
@@ -746,15 +777,15 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     });
   });
 
-  it("does not duplicate an existing dependency wake keyed to any resolved blocker", async () => {
+  it("does not duplicate an existing dependency wake keyed to any terminal blocker", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const secondBlockerIssueId = randomUUID();
     await db.insert(issues).values({
       id: secondBlockerIssueId,
       companyId,
-      title: "Second completed blocker",
-      status: "done",
+      title: "Cancelled blocker",
+      status: "cancelled",
       priority: "medium",
       issueNumber: 3,
       identifier: "R-MULTI-3",
