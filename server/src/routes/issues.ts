@@ -1284,15 +1284,14 @@ function buildIssueBlockerDiagnosticsResponse(input: {
       const flags: IssueBlockerDiagnosticFlag[] = [];
       if (issue.status === "blocked" && blocker.status === "done")
         flags.push("done_but_blocking");
-      if (blocker.status === "cancelled")
-        flags.push("cancelled_blocker_in_set");
       if (isPendingFinalize) flags.push("workspace_finalize_pending");
 
       return {
         ...blocker,
         isUnresolved,
         isPendingFinalize,
-        isDependencyReady: blocker.status === "done" && !isPendingFinalize,
+        isDependencyReady:
+          isClosedIssueStatus(blocker.status) && !isPendingFinalize,
         flags,
       };
     },
@@ -1365,15 +1364,6 @@ function buildIssueBlockerDiagnosis(input: {
     return `${blockerDiagnosticLabel(input.issue)} is waiting for ${blockerDiagnosticLabel(
       pendingFinalize,
     )} to finish workspace finalization.`;
-  }
-
-  const cancelled = input.blockers.find(
-    (blocker) => blocker.status === "cancelled",
-  );
-  if (cancelled) {
-    return `${blockerDiagnosticLabel(input.issue)} is blocked by ${blockerDiagnosticLabel(
-      cancelled,
-    )}, which is cancelled; cancelled blockers do not resolve until the blocker relation is removed or replaced.`;
   }
 
   const unresolved = input.blockers.find((blocker) => blocker.isUnresolved);
@@ -1652,15 +1642,6 @@ function buildIssueWakeDiagnosis(input: {
     return `No wake row exists for ${blockerDiagnosticLabel(input.issue)} in the bounded window. ${blockerDiagnosticLabel(
       input.issue,
     )} is waiting for ${blockerDiagnosticLabel(pendingFinalize)} to finish workspace finalization, so issue_blockers_resolved has not fired.`;
-  }
-
-  const cancelled = blockerDiagnostics.blockers.find(
-    (blocker) => blocker.status === "cancelled",
-  );
-  if (cancelled) {
-    return `No wake row exists for ${blockerDiagnosticLabel(input.issue)} in the bounded window. ${blockerDiagnosticLabel(
-      input.issue,
-    )} is blocked by ${blockerDiagnosticLabel(cancelled)}, which is cancelled; cancelled blockers do not fire issue_blockers_resolved.`;
   }
 
   const unresolved = blockerDiagnostics.blockers.find(
@@ -14497,6 +14478,7 @@ export function issueRoutes(
           blockedTransitionAt?: Date | string | null;
           source: string;
           mutation: string;
+          resolvedBlockerStatus?: "done" | "cancelled";
         }) => {
           const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: input.dependentIssueId,
@@ -14527,6 +14509,9 @@ export function issueRoutes(
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
               mutation: input.mutation,
+              ...(input.resolvedBlockerStatus
+                ? { resolvedBlockerStatus: input.resolvedBlockerStatus }
+                : {}),
             },
             idempotencyKey,
             requestedByActorType: actor.actorType,
@@ -14538,6 +14523,9 @@ export function issueRoutes(
               source: input.source,
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
+              ...(input.resolvedBlockerStatus
+                ? { resolvedBlockerStatus: input.resolvedBlockerStatus }
+                : {}),
             },
           });
         };
@@ -14697,9 +14685,13 @@ export function issueRoutes(
           }
         }
 
-        const becameDone =
-          existing.status !== "done" && issue.status === "done";
-        if (becameDone) {
+        const resolvedBlockerStatus = isClosedIssueStatus(issue.status)
+          ? issue.status
+          : null;
+        const becameDependencyTerminal =
+          !isClosedIssueStatus(existing.status) &&
+          resolvedBlockerStatus !== null;
+        if (becameDependencyTerminal) {
           const dependents = await svc.listWakeableBlockedDependents(issue.id);
           for (const dependent of dependents) {
             await addDependencyResolvedWakeup({
@@ -14709,7 +14701,8 @@ export function issueRoutes(
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
               source: "issue.blockers_resolved",
-              mutation: "blocker_done",
+              mutation: `blocker_${resolvedBlockerStatus}`,
+              resolvedBlockerStatus,
             });
           }
         }
@@ -17960,6 +17953,7 @@ export function issueRoutes(
           resolvedBlockerIssueId: string;
           blockerIssueIds: string[];
           blockedTransitionAt?: Date | string | null;
+          resolvedBlockerStatus: "done" | "cancelled";
         }) => {
           const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: input.dependentIssueId,
@@ -17989,7 +17983,8 @@ export function issueRoutes(
               issueId: input.dependentIssueId,
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
-              mutation: "comment",
+              mutation: `blocker_${input.resolvedBlockerStatus}`,
+              resolvedBlockerStatus: input.resolvedBlockerStatus,
             },
             idempotencyKey,
             requestedByActorType: actor.actorType,
@@ -18001,6 +17996,7 @@ export function issueRoutes(
               source: "issue.blockers_resolved",
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
+              resolvedBlockerStatus: input.resolvedBlockerStatus,
             },
           });
         };
@@ -18123,10 +18119,13 @@ export function issueRoutes(
           }
         }
 
-        const becameDone =
-          issueBeforeCommentDecision.status !== "done" &&
-          currentIssue.status === "done";
-        if (becameDone) {
+        const resolvedBlockerStatus = isClosedIssueStatus(currentIssue.status)
+          ? currentIssue.status
+          : null;
+        const becameDependencyTerminal =
+          !isClosedIssueStatus(issueBeforeCommentDecision.status) &&
+          resolvedBlockerStatus !== null;
+        if (becameDependencyTerminal) {
           const dependents = await svc.listWakeableBlockedDependents(
             currentIssue.id,
           );
@@ -18137,6 +18136,7 @@ export function issueRoutes(
               resolvedBlockerIssueId: currentIssue.id,
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
+              resolvedBlockerStatus,
             });
           }
         }
