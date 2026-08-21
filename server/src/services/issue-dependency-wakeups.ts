@@ -148,7 +148,7 @@ function wakeCoversIssueBlockersResolvedReadyState(
     oldStateKey: string;
     legacyKeys: Set<string>;
     blockedTransitionAt: Date | null;
-    latestBlockerUpdatedAt: Date | null;
+    latestBlockerTerminalTransitionAt: Date | null;
   },
 ): boolean {
   const idempotencyKey = wake.idempotencyKey;
@@ -156,20 +156,22 @@ function wakeCoversIssueBlockersResolvedReadyState(
 
   // A completed state-key wake only covers the blocker resolution it was
   // requested for. A blocker that is reopened and closed again after the wake
-  // starts a new resolution, so the dependent must be woken again.
-  const completedAfterLatestBlockerUpdate =
-    !keys.latestBlockerUpdatedAt ||
-    wake.requestedAt.getTime() >= keys.latestBlockerUpdatedAt.getTime();
+  // starts a new resolution, so the dependent must be woken again. Unrelated
+  // blocker edits do not move the terminal transition and never re-wake.
+  const requestedAfterLatestBlockerTransition =
+    !keys.latestBlockerTerminalTransitionAt ||
+    wake.requestedAt.getTime() >=
+      keys.latestBlockerTerminalTransitionAt.getTime();
 
   if (idempotencyKey === keys.cycleKey) {
     if (!IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return false;
-    return wake.status !== "completed" || completedAfterLatestBlockerUpdate;
+    return wake.status !== "completed" || requestedAfterLatestBlockerTransition;
   }
 
   if (idempotencyKey === keys.oldStateKey) {
     if (IN_FLIGHT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return true;
     if (wake.status !== "completed") return false;
-    if (!completedAfterLatestBlockerUpdate) return false;
+    if (!requestedAfterLatestBlockerTransition) return false;
     if (!keys.blockedTransitionAt) return true;
     return wake.requestedAt.getTime() >= keys.blockedTransitionAt.getTime();
   }
@@ -186,13 +188,15 @@ function wakeCoversIssueBlockersResolvedReadyState(
  * dependent issue. The check is level-triggered and cycle-aware:
  *
  * - The cycle-aware state key matches an in-flight wake, or a `completed` wake
- *   requested after the latest blocker update. This suppresses a duplicate for
- *   the SAME ready state, including the current blocked cycle, and lets a later
- *   blocker reopen/close cycle create a new wake.
+ *   requested after the latest blocker terminal transition. This suppresses a
+ *   duplicate for the SAME ready state, including the current blocked cycle,
+ *   and lets a later blocker reopen/close cycle create a new wake without
+ *   treating unrelated blocker edits as a new cycle.
  * - The old no-cycle state key matches in-flight statuses (deploy overlap),
  *   or a `completed` wake whose `requestedAt` is at or after both the current
- *   `blockedTransitionAt` (same cycle) and the latest blocker update. A
- *   completed old-key wake from a previous cycle does not suppress.
+ *   `blockedTransitionAt` (same cycle) and the latest blocker terminal
+ *   transition. A completed old-key wake from a previous cycle does not
+ *   suppress.
  * - Each legacy per-edge key matches only a wake that is still in flight.
  *
  * Returns the first matching wake or `null`.
@@ -208,10 +212,14 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
 ) {
   const cycleKey = buildIssueBlockersResolvedWakeStateKey(input);
   const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
-  const blockerUpdatedAtRows =
+  const blockerTerminalStateRows =
     input.blockerIssueIds.length > 0
       ? await db
-          .select({ updatedAt: issues.updatedAt })
+          .select({
+            status: issues.status,
+            completedAt: issues.completedAt,
+            cancelledAt: issues.cancelledAt,
+          })
           .from(issues)
           .where(
             and(
@@ -220,8 +228,15 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
             ),
           )
       : [];
-  const latestBlockerUpdatedAt = blockerUpdatedAtRows.reduce<Date | null>(
-    (latest, row) => (!latest || row.updatedAt > latest ? row.updatedAt : latest),
+  const latestBlockerTerminalTransitionAt = blockerTerminalStateRows.reduce<Date | null>(
+    (latest, row) => {
+      const transitionedAt = row.status === "done"
+        ? row.completedAt
+        : row.status === "cancelled"
+          ? row.cancelledAt
+          : null;
+      return transitionedAt && (!latest || transitionedAt > latest) ? transitionedAt : latest;
+    },
     null,
   );
   const legacyKeyList = [
@@ -260,7 +275,7 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),
       blockedTransitionAt,
-      latestBlockerUpdatedAt,
+      latestBlockerTerminalTransitionAt,
     }),
   );
   return covering ?? null;
