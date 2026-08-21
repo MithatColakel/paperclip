@@ -1,7 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests } from "@paperclipai/db";
+import { agentWakeupRequests, issues } from "@paperclipai/db";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
@@ -148,18 +148,28 @@ function wakeCoversIssueBlockersResolvedReadyState(
     oldStateKey: string;
     legacyKeys: Set<string>;
     blockedTransitionAt: Date | null;
+    latestBlockerUpdatedAt: Date | null;
   },
 ): boolean {
   const idempotencyKey = wake.idempotencyKey;
   if (!idempotencyKey) return false;
 
+  // A completed state-key wake only covers the blocker resolution it was
+  // requested for. A blocker that is reopened and closed again after the wake
+  // starts a new resolution, so the dependent must be woken again.
+  const completedAfterLatestBlockerUpdate =
+    !keys.latestBlockerUpdatedAt ||
+    wake.requestedAt.getTime() >= keys.latestBlockerUpdatedAt.getTime();
+
   if (idempotencyKey === keys.cycleKey) {
-    return IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status);
+    if (!IDEMPOTENT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return false;
+    return wake.status !== "completed" || completedAfterLatestBlockerUpdate;
   }
 
   if (idempotencyKey === keys.oldStateKey) {
     if (IN_FLIGHT_DEPENDENCY_WAKE_STATUS_SET.has(wake.status)) return true;
     if (wake.status !== "completed") return false;
+    if (!completedAfterLatestBlockerUpdate) return false;
     if (!keys.blockedTransitionAt) return true;
     return wake.requestedAt.getTime() >= keys.blockedTransitionAt.getTime();
   }
@@ -175,13 +185,14 @@ function wakeCoversIssueBlockersResolvedReadyState(
  * Find a wake that already covers the current dependency-ready state of the
  * dependent issue. The check is level-triggered and cycle-aware:
  *
- * - The cycle-aware state key matches a wake in any idempotent status
- *   (including `completed`). This suppresses a duplicate for the SAME ready
- *   state, including the current blocked cycle.
+ * - The cycle-aware state key matches an in-flight wake, or a `completed` wake
+ *   requested after the latest blocker update. This suppresses a duplicate for
+ *   the SAME ready state, including the current blocked cycle, and lets a later
+ *   blocker reopen/close cycle create a new wake.
  * - The old no-cycle state key matches in-flight statuses (deploy overlap),
- *   or a `completed` wake whose `requestedAt` is at or after the current
- *   `blockedTransitionAt` (same cycle). A completed old-key wake from a
- *   previous cycle does not suppress.
+ *   or a `completed` wake whose `requestedAt` is at or after both the current
+ *   `blockedTransitionAt` (same cycle) and the latest blocker update. A
+ *   completed old-key wake from a previous cycle does not suppress.
  * - Each legacy per-edge key matches only a wake that is still in flight.
  *
  * Returns the first matching wake or `null`.
@@ -197,6 +208,22 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
 ) {
   const cycleKey = buildIssueBlockersResolvedWakeStateKey(input);
   const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
+  const blockerUpdatedAtRows =
+    input.blockerIssueIds.length > 0
+      ? await db
+          .select({ updatedAt: issues.updatedAt })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, input.companyId),
+              inArray(issues.id, [...new Set(input.blockerIssueIds)]),
+            ),
+          )
+      : [];
+  const latestBlockerUpdatedAt = blockerUpdatedAtRows.reduce<Date | null>(
+    (latest, row) => (!latest || row.updatedAt > latest ? row.updatedAt : latest),
+    null,
+  );
   const legacyKeyList = [
     ...new Set(
       input.blockerIssueIds
@@ -233,6 +260,7 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),
       blockedTransitionAt,
+      latestBlockerUpdatedAt,
     }),
   );
   return covering ?? null;
