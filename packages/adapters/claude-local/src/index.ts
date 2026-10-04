@@ -26,7 +26,7 @@ export const type = "claude_local";
 export function claudeLocalReasoningEffortsForModel(model: string): readonly string[] {
   const id = model.trim().replace(/\[1m\]$/, "").replace(/^(?:(?:us|eu|apac|global)\.)?anthropic\./, "");
   if (/^claude-haiku-/.test(id)) return [];
-  if (/^claude-(?:opus-5(?:-5)?|opus-4-[78]|sonnet-5|fable-5(?:-1)?)$/.test(id)) {
+  if (/^claude-(?:opus-5(?:-5)?|opus-4-[78]|sonnet-5(?:-5)?|fable-5(?:-1)?)$/.test(id)) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
   if (/^claude-(?:opus|sonnet)-4-6(?:-v1)?$/.test(id)) return ["low", "medium", "high", "max"];
@@ -43,6 +43,7 @@ export const models = [
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },
   { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
@@ -88,7 +89,7 @@ Operational fields:
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:
-- Claude Opus 5.5 uses model ID \`claude-opus-5-5\` and requires Claude Code v2.1.280 or later.
+- Claude Opus 5.5 (\`claude-opus-5-5\`) and Claude Sonnet 5.5 (\`claude-sonnet-5-5\`) require Claude Code v2.1.280 or later; on the ACP engine set CLAUDE_CODE_EXECUTABLE to a current \`claude\` binary when the bundled Agent SDK ships an older Claude Code.
 - filesystemScope and networkScope are spawn-level confinement and are orthogonal to Claude permission flags. Both require Bubblewrap on the host and explicit engine="cli"; default or explicit ACP is rejected because ACP confinement is not yet supported. networkScope="allowlist" injects HTTP_PROXY/HTTPS_PROXY for the CLI while its private network namespace blocks direct sockets, so every required provider/API hostname must be listed explicitly.
 - The Claude ACP lane requires Node >=24.11.0 and @agentclientprotocol/claude-agent-acp to be installed with this adapter package. Missing prerequisites fail both default and explicit ACP runs with an actionable setup error; the adapter never switches engines automatically.
 - For ACP runs, model selection is passed through ANTHROPIC_MODEL at ACP server startup; Paperclip-managed Claude permissions and ephemeral skill materialization are handled by the shared ACP engine.
