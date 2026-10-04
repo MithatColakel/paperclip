@@ -2782,6 +2782,67 @@ describe("AgentConfigForm environment selector", () => {
     expect(onApplyStored).not.toHaveBeenCalled();
   });
 
+  it("offers the saved Claude login bind for a local environment and saves it with the apply-existing flag", async () => {
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", latestVersion: 1 });
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local" },
+    );
+    roots.push(result.root);
+
+    await flushUntil(() => Boolean(findButton(result.container, "Use saved login")));
+    // The sandbox login panel stays hidden for a local environment.
+    expect(findButton(result.container, "Sign in")).toBeFalsy();
+
+    await clickByText(result.container, "Use saved login");
+    await flushUntil(() => result.onSave.mock.calls.length > 0);
+
+    const patch = result.onSave.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch.applyStoredClaudeLogin).toBe(true);
+    const env = ((patch.adapterConfig ?? {}) as Record<string, unknown>).env as Record<string, unknown>;
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toMatchObject({
+      type: "user_secret_ref",
+      key: "CLAUDE_CODE_OAUTH_TOKEN",
+    });
+    expect(mockAgentsApi.startClaudeSetupTokenLogin).not.toHaveBeenCalled();
+  });
+
+  it("does not offer the saved Claude login bind for a local environment without a stored value", async () => {
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue(null);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local" },
+    );
+    roots.push(result.root);
+    await flushReact();
+
+    expect(findButton(result.container, "Use saved login")).toBeFalsy();
+  });
+
+  it("does not offer the saved Claude login bind when the agent already has the binding", async () => {
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", latestVersion: 1 });
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      {
+        adapterType: "claude_local",
+        adapterConfig: {
+          env: {
+            CLAUDE_CODE_OAUTH_TOKEN: {
+              type: "user_secret_ref",
+              key: "CLAUDE_CODE_OAUTH_TOKEN",
+              version: "latest",
+              required: true,
+            },
+          },
+        },
+      },
+    );
+    roots.push(result.root);
+    await flushReact();
+
+    expect(findButton(result.container, "Use saved login")).toBeFalsy();
+  });
+
   it("returns to its start state with a fixed message on a server failed state", async () => {
     mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
     mockAgentsApi.getClaudeSetupTokenLoginStatus.mockResolvedValue({

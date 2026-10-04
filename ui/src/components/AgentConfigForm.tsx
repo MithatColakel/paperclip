@@ -1154,6 +1154,20 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     Boolean(selectedCompanyId) &&
     Boolean(authMissingCheck) &&
     (!loginNeedsPty || providerSupportsLoginPty);
+  // A non-sandbox environment (local, ssh) cannot run the setup-token login, but
+  // the server's apply-existing path binds the owner's stored token for any
+  // environment. Offer that bind outside the sandbox login panel so a token saved
+  // under My secrets can be used without a sandbox provider.
+  const currentEnvBindings = (isCreate
+    ? val!.envBindings ?? {}
+    : eff("adapterConfig", "env", (config.env ?? EMPTY_ENV) as Record<string, EnvBinding>)) as Record<string, EnvBinding>;
+  const showSavedClaudeLoginBind =
+    adapterType === "claude_local" &&
+    !showAdapterLogin &&
+    effectiveLoginEnvironment?.driver !== "sandbox" &&
+    (isCreate || !((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection)) &&
+    !(CLAUDE_OAUTH_TOKEN_ENV_KEY in currentEnvBindings) &&
+    Boolean(selectedCompanyId);
   const runEnvironmentTest = useCallback(async () => {
     if (!selectedCompanyId) {
       throw new Error("Select an organization to test adapter environment");
@@ -1679,6 +1693,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 isCreate ? handleApplyStoredClaudeLogin : handleApplyStoredClaudeLoginEdit
               }
               onAccountBinding={isCreate ? undefined : handleCodexAccountBindingEdit}
+            />
+          )}
+
+          {showInlineAdapterTestEnvironmentFeedback && showSavedClaudeLoginBind && (
+            <SavedClaudeLoginBinder
+              companyId={selectedCompanyId!}
+              onApply={isCreate ? handleApplyStoredClaudeLogin : handleApplyStoredClaudeLoginEdit}
             />
           )}
 
@@ -2239,6 +2260,70 @@ export type AdapterLoginDescriptor = {
   adapterType: string;
   environmentId: string;
 };
+
+// Offers the apply-existing Claude login bind for environments that cannot run
+// the sandbox setup-token login. It reads only the owner's token status (the
+// secret id and version, never the token) and renders nothing until a stored
+// value exists. The server still verifies the actor and the stored value.
+export function SavedClaudeLoginBinder({
+  companyId,
+  onApply,
+}: {
+  companyId: string;
+  onApply: () => void | Promise<void>;
+}) {
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const storedTokenQuery = useQuery({
+    queryKey: ["claude-oauth-token-status", companyId],
+    queryFn: async () => {
+      try {
+        return await agentsApi.getClaudeOAuthTokenStatus(companyId);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status === 404) return false;
+      return failureCount < 2;
+    },
+  });
+  if (!storedTokenQuery.data) return null;
+
+  const apply = async () => {
+    setApplying(true);
+    setApplyError(null);
+    try {
+      await onApply();
+    } catch (error) {
+      setApplyError(error instanceof Error ? error.message : "Could not bind the saved login.");
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 rounded-md border border-border px-3 py-2 text-xs">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-muted-foreground">
+          A Claude login is saved under My secrets. Bind it so runs use the responsible user&apos;s subscription.
+        </span>
+        <Button
+          type="button"
+          variant="default"
+          size="sm"
+          className="h-7 px-2.5 text-xs"
+          disabled={applying}
+          onClick={() => void apply()}
+        >
+          Use saved login
+        </Button>
+      </div>
+      {applyError && <p className="text-destructive">{applyError}</p>}
+    </div>
+  );
+}
 
 // The panel props. `onStored` reports the non-secret `storedSessionId` claim from
 // a Claude login that reaches the server `stored` state. The create-mode form
