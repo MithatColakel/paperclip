@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +25,8 @@ vi.mock("./ssh.js", () => ({
   syncDirectoryToSsh,
 }));
 
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES, prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 
@@ -348,5 +349,30 @@ describe("remote managed runtime", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  it("keeps nested repository .git entries that a git-backed upload never sends", async () => {
+    const localDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-local-"));
+    const remoteCopyDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-copy-"));
+    cleanupDirs.push(localDir, remoteCopyDir);
+    const nested = path.join(".paperclip-repositories", "backend-abc123");
+    await mkdir(path.join(localDir, nested), { recursive: true });
+    await writeFile(path.join(localDir, nested, ".git"), "gitdir: /repos/backend/.git/worktrees/abc123\n", "utf8");
+    await writeFile(path.join(localDir, nested, "README.md"), "backend\n", "utf8");
+    await writeFile(path.join(localDir, "main.txt"), "main\n", "utf8");
+
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES],
+    });
+
+    // The host copy is what tar --exclude .git uploaded: no .git at any depth.
+    await mkdir(path.join(remoteCopyDir, nested), { recursive: true });
+    await writeFile(path.join(remoteCopyDir, nested, "README.md"), "backend\n", "utf8");
+    await writeFile(path.join(remoteCopyDir, "main.txt"), "main edited\n", "utf8");
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: remoteCopyDir, targetDir: localDir });
+
+    await expect(readFile(path.join(localDir, nested, ".git"), "utf8")).resolves.toContain("gitdir:");
+    await expect(readFile(path.join(localDir, "main.txt"), "utf8")).resolves.toBe("main edited\n");
   });
 });

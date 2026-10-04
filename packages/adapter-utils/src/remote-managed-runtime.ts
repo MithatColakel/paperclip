@@ -33,6 +33,18 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
   ".git",
 ].flatMap((entry) => [entry, `${entry}/*`, `*/${entry}`, `*/${entry}/*`]);
 
+// A git-backed upload runs tar with `--exclude .git`, which drops `.git` at every
+// depth, so nested repositories (e.g. `.paperclip-repositories/*`) reach the host
+// without their `.git`. The restore baseline must skip them the same way;
+// otherwise the merge reads their absence as a remote deletion and removes the
+// local `.git`, leaving "already exists but is not a git checkout" workspaces.
+export const GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES = [
+  ...GIT_ARCHIVE_EXCLUDES,
+  "*/.git",
+  "*/.git/*",
+  ".paperclip-runtime",
+];
+
 export interface RemoteManagedRuntimeAsset {
   key: string;
   localDir: string;
@@ -148,7 +160,7 @@ export async function prepareRemoteManagedRuntime(input: {
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
+          ? [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES]
           : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
       })
     : null;
