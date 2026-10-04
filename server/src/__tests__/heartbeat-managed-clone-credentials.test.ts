@@ -68,6 +68,22 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
     }
   });
 
+  it("materializes repositories inside a shared workspace that is not a git checkout", async () => {
+    const first = await createLocalSourceRepo();
+    const sharedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-default-"));
+    try {
+      const additional = await prepareProjectRepositoryWorkspaces({
+        cwd: sharedCwd, anchorRepoUrl: null,
+        workspaces: [{ id: "first", repoUrl: first, repoRef: null }],
+      });
+      expect(additional).toHaveLength(1);
+      expect(path.relative(sharedCwd, additional[0]!.cwd)).toMatch(/^\.paperclip-repositories\//);
+      expect((await execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd: additional[0]!.cwd })).stdout.trim()).toBe("true");
+    } finally {
+      await Promise.all([first, sharedCwd].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
+    }
+  });
+
   it("fails task preparation when any attached repository cannot be cloned", async () => {
     const first = await createLocalSourceRepo();
     try {
