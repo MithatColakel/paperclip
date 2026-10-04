@@ -2612,12 +2612,19 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
     throw new Error("Project repositories directory escapes the task workspace");
   }
-  const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
-    .then((result) => path.resolve(input.cwd, result.stdout.trim()));
-  const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
-  if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
-    await fs.mkdir(path.dirname(excludePath), { recursive: true });
-    await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+  // A shared workspace without an anchor repository (the project `_default`) is
+  // not a git checkout, so there is no status to keep the nested checkouts out of.
+  const insideGitWorkTree = await execFile("git", ["-C", input.cwd, "rev-parse", "--is-inside-work-tree"], { timeout: 10_000 })
+    .then((result) => result.stdout.trim() === "true")
+    .catch(() => false);
+  if (insideGitWorkTree) {
+    const excludePath = await execFile("git", ["-C", input.cwd, "rev-parse", "--git-path", "info/exclude"], { timeout: 10_000 })
+      .then((result) => path.resolve(input.cwd, result.stdout.trim()));
+    const exclude = await fs.readFile(excludePath, "utf8").catch(() => "");
+    if (!exclude.split(/\r?\n/).includes(`/${PROJECT_REPOSITORIES_DIR}/`)) {
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      await fs.appendFile(excludePath, `\n/${PROJECT_REPOSITORIES_DIR}/\n`);
+    }
   }
   const results = [];
   for (const workspace of selected) {
