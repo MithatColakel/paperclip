@@ -27,6 +27,8 @@ export const label = "Claude Code";
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
 export const models = [
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+  { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
@@ -48,7 +50,7 @@ Core fields:
 - engine (string, optional): defaults to ACP, including legacy unset/"auto" values. Missing prerequisites and execution failures fail the run without changing engines. Set "cli" to explicitly select the CLI engine.
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime
-- model (string, optional): Claude model id. Missing or blank defaults to ${DEFAULT_CLAUDE_LOCAL_MODEL} in both CLI and ACP, including existing agents. Explicit model IDs and ANTHROPIC_MODEL overrides are preserved. Bedrock/Vertex without an explicit model retain their provider default.
+- model (string, optional): Claude model id. Missing or blank defaults to ${DEFAULT_CLAUDE_LOCAL_MODEL} in both CLI and ACP, including existing agents. Explicit model IDs and ANTHROPIC_MODEL overrides are preserved. Bedrock/Vertex without an explicit model retain their provider default. Claude Opus 5.5 (\`claude-opus-5-5\`) and Claude Sonnet 5.5 (\`claude-sonnet-5-5\`) require Claude Code v2.1.280 or later; on the ACP engine set CLAUDE_CODE_EXECUTABLE to a current \`claude\` binary when the bundled Agent SDK ships an older Claude Code.
 - effort (string, optional): reasoning effort passed via --effort (low|medium|high)
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
