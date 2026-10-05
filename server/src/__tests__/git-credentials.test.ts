@@ -183,6 +183,63 @@ describe("createGitRemoteAuthProvider", () => {
     expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("agent-b-legacy-token");
     expect(db.select).toHaveBeenCalledTimes(2);
   });
+
+  describe("GitHub app connected with an app key", () => {
+    // Each db.select() resolves to the next queued row set (then none), whatever the chain.
+    function queuedDb(results: unknown[][]) {
+      const query = (rows: unknown[]) => {
+        const chain: Record<string, unknown> = {
+          then: (resolve: (value: unknown[]) => unknown, reject: (error: unknown) => unknown) =>
+            Promise.resolve(rows).then(resolve, reject),
+        };
+        for (const method of ["from", "where", "leftJoin", "limit"]) chain[method] = () => chain;
+        return chain;
+      };
+      const select = vi.fn(() => query([]));
+      for (const rows of results) select.mockReturnValueOnce(query(rows));
+      return { select } as unknown as Db;
+    }
+
+    function appKeyDb() {
+      return queuedDb([
+        [{ id: "github-connection", companyId: "company-1", enabled: true, status: "active", healthStatus: "ok", config: { sourceTemplateKey: "github", connectionMethodKey: "mcp-key" } }],
+        [{ connectionId: "github-connection", companyId: "company-1", targetType: "agent", targetId: "agent-a" }],
+        [{
+          id: "grant-1", companyId: "company-1", connectionId: "github-connection", kind: "user", subjectUserId: "user-1",
+          status: "active", providerTenant: null, createdAt: new Date("2026-10-04T00:00:00Z"),
+          credentialSecretRefs: [{ label: "GitHub token", required: true, secretId: "app-key-secret", configPath: "credentials.authorization", versionSelector: "latest" }],
+        }],
+        [{ id: "membership-1", role: "owner" }],
+      ]);
+    }
+
+    it("authenticates git with the app key instead of failing the checkout", async () => {
+      const resolveSecretValue = vi.fn(async () => "  Bearer github_pat_app_key\n");
+      const secrets = { getByName: vi.fn(async () => null), resolveSecretValue, resolveUserSecretValue: vi.fn() };
+      const provider = createGitRemoteAuthProvider(appKeyDb(), "company-1", { agentId: "agent-a", responsibleUserId: "user-1" }, {
+        secrets,
+        env: { GITHUB_TOKEN: "server-env-token" },
+      });
+
+      const invocation = await provider(githubUrl);
+
+      expect(invocation?.source).toBe("managed_connection");
+      expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("github_pat_app_key");
+      expect(resolveSecretValue).toHaveBeenCalledWith("company-1", "app-key-secret", "latest", expect.anything());
+      expect(secrets.resolveUserSecretValue).not.toHaveBeenCalled();
+      expect(secrets.getByName).not.toHaveBeenCalled();
+    });
+
+    it("reports a blank app key instead of running git anonymously", async () => {
+      const secrets = { getByName: vi.fn(async () => null), resolveSecretValue: vi.fn(async () => "Bearer "), resolveUserSecretValue: vi.fn() };
+      const provider = createGitRemoteAuthProvider(appKeyDb(), "company-1", { agentId: "agent-a", responsibleUserId: "user-1" }, {
+        secrets,
+        env: {},
+      });
+
+      await expect(provider(githubUrl)).rejects.toThrow("The GitHub app key is missing");
+    });
+  });
 });
 
 describe("buildGitAuthInvocation", () => {

@@ -505,10 +505,15 @@ export async function resolveManagedGitHubCredential(
         heartbeatRunId: context.heartbeatRunId,
       });
     }
-    const accessRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    const oauthRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+    // A GitHub app connected with a personal access token (the MCP "app key"
+    // method) has no OAuth grant or GitHub account metadata; its key is the
+    // same token git accepts, stored as the app's company-scoped secret.
+    const appKeyRef = oauthRef ? undefined : grant.credentialSecretRefs.find((ref) => ref.configPath === "credentials.authorization");
+    const accessRef = oauthRef ?? appKeyRef;
     const github = grant.providerTenant?.github;
-    if (!accessRef || !github) return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity is incomplete" };
-    if (github.installationCount < 1 || github.repositoryCount < 1) {
+    if (!accessRef || (oauthRef && !github)) return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity is incomplete" };
+    if (github && (github.installationCount < 1 || github.repositoryCount < 1)) {
       return { configured: true, identitySource: selection.identitySource, error: "The managed GitHub identity no longer has repository access" };
     }
     const accessContext = {
@@ -521,7 +526,7 @@ export async function resolveManagedGitHubCredential(
       responsibleUserId: context.responsibleUserId ?? null,
     };
     let token: string;
-    if (grant.kind === "user") {
+    if (grant.kind === "user" && !appKeyRef) {
       if (!grant.subjectUserId || !secrets.resolveUserSecretValue) {
         return { configured: true, identitySource: selection.identitySource, error: "The personal GitHub credential cannot be resolved" };
       }
@@ -544,13 +549,18 @@ export async function resolveManagedGitHubCredential(
     } else {
       token = await secrets.resolveSecretValue(companyId, accessRef.secretId, accessRef.versionSelector ?? "latest", { accessContext });
     }
+    if (appKeyRef) {
+      // The app key is sent as `Authorization: Bearer <key>`; tolerate a pasted prefix.
+      token = token.trim().replace(/^bearer(?:\s+|$)/i, "");
+      if (!token) return { configured: true, identitySource: selection.identitySource, error: "The GitHub app key is missing" };
+    }
     return {
       configured: true, identitySource: selection.identitySource,
       credential: {
         token,
         source: "managed_connection" as const,
         secretName: null,
-        githubIdentity: { userId: github.userId, login: github.login },
+        githubIdentity: github ? { userId: github.userId, login: github.login } : undefined,
         identitySource: grant.kind === "agent" ? "dedicated" as const : "personal" as const,
         connectionId: grant.connectionId,
         grantId: grant.id,
