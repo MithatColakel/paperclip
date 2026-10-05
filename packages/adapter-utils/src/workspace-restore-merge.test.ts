@@ -404,20 +404,23 @@ describe("workspace restore merge", () => {
 
       const targetDir = path.join(rootDir, "target");
       await mkdir(targetDir, { recursive: true });
-
-      // Pre-create the lock directory a live process holds, so `isLockStale`
-      // never reports it stale and the retry loop can only leave through the
-      // deadline check. The owner pid is this test process, which stays alive.
-      const canonicalTargetDir = await realpath(targetDir);
-      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
       const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
-      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
-      await mkdir(heldLockDir, { recursive: true });
-      await writeFile(
-        path.join(heldLockDir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
-        "utf8",
-      );
+
+      // Hold the lock for real from this process, so the owner record is one
+      // this process wrote: `isLockStale` must never report it stale, and the
+      // retry loop can only leave through the deadline check.
+      let signalHeld: () => void = () => undefined;
+      let releaseHolder: () => void = () => undefined;
+      const held = new Promise<void>((resolve) => {
+        signalHeld = resolve;
+      });
+      const holder = withDirectoryMergeLock(targetDir, async () => {
+        signalHeld();
+        await new Promise<void>((resolve) => {
+          releaseHolder = resolve;
+        });
+      });
+      await held;
 
       // Reach the real deadline without a real 30-second wait: the first
       // `Date.now()` call computes the deadline (unchanged), and every call
@@ -437,6 +440,11 @@ describe("workspace restore merge", () => {
         dateNowSpy.mockRestore();
       }
 
+      // The waiter gave up without taking the live holder's lock away.
+      await expect(readdir(lockRootDir)).resolves.toHaveLength(1);
+      releaseHolder();
+      await holder;
+
       expect(caughtError).toBeInstanceOf(Error);
       expect(caughtError?.code).toBe(WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE);
       // The classifier reads only `code`; prove the message text carries no
@@ -444,8 +452,9 @@ describe("workspace restore merge", () => {
       // have produced this result.
       expect(caughtError?.message).not.toContain("restore_lock_timeout");
       expect(classifyWorkspaceRestoreFailure(caughtError)).toBe("restore_lock_timeout");
+      // The holder above is this process, so the diagnostic names it as local.
       expect(caughtError).toMatchObject({ workspaceRestoreLock: {
-        ownerState: "alive", ownerSameProcess: true, knownLocalHolder: false,
+        ownerState: "alive", ownerSameProcess: true, knownLocalHolder: true,
       } });
     });
 
@@ -557,7 +566,7 @@ describe("workspace restore merge", () => {
       });
     });
 
-    it("reports an owner older than this process without reclaiming a live PID", async () => {
+    it("reports an owner older than this process without reclaiming a live PID from this boot", async () => {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lock-older-owner-"));
       cleanupDirs.push(rootDir);
       useTempPaperclipHome(path.join(rootDir, "home"), "test-instance");
@@ -567,7 +576,12 @@ describe("workspace restore merge", () => {
       const lockDir = path.join(rootDir, "home", "instances", "test-instance", "locks", "directory-merge", `${lockKey}.lock`);
       await mkdir(lockDir, { recursive: true });
       const now = Date.now();
-      const owner = JSON.stringify({ pid: process.pid, createdAt: new Date(now - process.uptime() * 1000 - 10_000).toISOString(), private: "private owner payload" });
+      // Only a record carrying this boot's id is never reclaimed; a record from
+      // an earlier boot with the same pid is reclaimed (covered below).
+      const bootIds = globalThis as unknown as Record<symbol, string | undefined>;
+      const bootIdKey = Symbol.for("paperclip.directoryMergeLock.ownerBootId");
+      bootIds[bootIdKey] ??= "test-boot";
+      const owner = JSON.stringify({ pid: process.pid, bootId: bootIds[bootIdKey], createdAt: new Date(now - process.uptime() * 1000 - 10_000).toISOString(), private: "private owner payload" });
       await writeFile(path.join(lockDir, "owner.json"), owner);
       const clock = vi.spyOn(Date, "now").mockReturnValue(now)
         .mockReturnValueOnce(now).mockReturnValueOnce(now + 30_001);
@@ -584,6 +598,54 @@ describe("workspace restore merge", () => {
       expect(JSON.stringify(diagnostic)).not.toContain(lockDir);
       expect(await readFile(path.join(lockDir, "owner.json"), "utf8")).toBe(owner);
     });
+
+    it.each([
+      ["a record written before boot ids existed", {}],
+      ["a record from an earlier boot", { bootId: "earlier-boot" }],
+    ])(
+      "reclaims a lock left with this process's pid by %s (a container restart reuses the server pid)",
+      async (_label, ownerFields) => {
+        const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+        cleanupDirs.push(rootDir);
+        const paperclipHome = path.join(rootDir, "paperclip-home");
+        useTempPaperclipHome(paperclipHome, "test-instance");
+
+        const targetDir = path.join(rootDir, "target");
+        await mkdir(targetDir, { recursive: true });
+
+        // The lock a previous container left behind: its server had the same
+        // pid this process has now, and nothing released the lock directory.
+        const canonicalTargetDir = await realpath(targetDir);
+        const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+        const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+        const leftoverLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+        await mkdir(leftoverLockDir, { recursive: true });
+        await writeFile(
+          path.join(leftoverLockDir, "owner.json"),
+          `${JSON.stringify({ pid: process.pid, ...ownerFields, createdAt: "2026-10-04T17:24:25.429Z" })}\n`,
+          "utf8",
+        );
+
+        // Fail fast instead of waiting 30 seconds if the leftover is not
+        // reclaimed: every `Date.now()` after the deadline reports far past it.
+        const realNow = Date.now();
+        const dateNowSpy = vi
+          .spyOn(Date, "now")
+          .mockImplementationOnce(() => realNow)
+          .mockImplementation(() => Number.MAX_SAFE_INTEGER);
+        let ran = false;
+        try {
+          await withDirectoryMergeLock(targetDir, async () => {
+            ran = true;
+          });
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        expect(ran).toBe(true);
+        await expect(readdir(lockRootDir)).resolves.toHaveLength(0);
+      },
+    );
 
     it.skipIf(process.platform === "win32")(
       "serializes two concurrent writers that address one target through different aliases",
