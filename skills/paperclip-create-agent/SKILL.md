@@ -100,7 +100,7 @@ curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt" \
 - if the role may handle private advisories or sensitive disclosures, confirm a confidential workflow exists first (dedicated skill or documented manual process)
 - capabilities
 - managed instructions bundle (`AGENTS.md`) for adapters that support it; avoid durable `promptTemplate` config
-- for coding or execution agents, include the Paperclip execution contract: start actionable work in the same heartbeat; do not stop at a plan unless planning was requested; leave durable progress with a clear next action; use child issues for long or parallel delegated work instead of polling; mark blocked work with owner/action; respect budget, pause/cancel, approval gates, and company boundaries
+- for coding or execution agents, include the Paperclip execution contract: start actionable work in the same heartbeat; do not stop at a plan unless planning was requested; leave durable progress with a clear next action; do not create or assign tasks (follow-up work is a proposal for the coordinator; hand-offs go through the coordinator); mark blocked work with owner/action; respect budget, pause/cancel, approval gates, and company boundaries
 - instruction text such as `AGENTS.md` built from step 4; for local managed-bundle adapters, send this as top-level `instructionsBundle.files["AGENTS.md"]`. Do not set `adapterConfig.promptTemplate` or `bootstrapPromptTemplate` for new agents.
 - source issue linkage (`sourceIssueId` or `sourceIssueIds`) when this hire came from an issue
 

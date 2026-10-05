@@ -147,10 +147,62 @@ function openProvider() {
     (host.querySelector('[role="radio"]') as HTMLElement).click(),
   );
 }
+function typeInto(input: HTMLInputElement, value: string) {
+  const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+  flushSync(() => {
+    setValue.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+function primaryButton(text: string) {
+  return [...host.querySelectorAll("button")].find((b) => b.textContent?.includes(text))!;
+}
+const SETUP_TOKEN = `sk-ant-oat01-${"a".repeat(95)}`;
 describe("AgentProviderConnection reuse", () => {
-  it.each(["claude_local", "codex_local"] as const)("does not offer a server-host command when health disables local login: %s", async adapterType => {
+  it("connects a Claude subscription with a setup token where browser sign-in is unavailable", async () => {
     const onComplete = vi.fn();
-    const intent = { provider: adapterType === "claude_local" ? "anthropic" as const : "openai" as const, method: "subscription" as const, name: "Hosted account", ownership: "personal" as const, agentIds: [], allAgents: false };
+    const intent = { provider: "anthropic" as const, method: "subscription" as const, name: "Hosted account", ownership: "shared" as const, agentIds: ["11111111-1111-4111-8111-111111111111"], allAgents: false };
+    await mount("claude_local", false, false, false, false, false, { intent, onComplete }, true, "authenticated", false);
+    openProvider();
+    expect(host.textContent).toContain("claude setup-token");
+    expect(host.textContent).not.toContain("This environment does not support browser sign-in");
+    expect(primaryButton("Connect").disabled).toBe(true);
+    // Terminals wrap long tokens; the pasted line breaks are removed.
+    typeInto(host.querySelector('input[type="password"]') as HTMLInputElement, `${SETUP_TOKEN.slice(0, 40)}\n${SETUP_TOKEN.slice(40)}`);
+    expect(primaryButton("Connect").disabled).toBe(false);
+    click("Connect");
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith({ connectionId: "managed-connection", grantId: "managed-grant", method: "subscription" }));
+    expect(managedApi.create).toHaveBeenCalledWith("c1", { ...intent, method: "subscription", setupToken: SETUP_TOKEN });
+    expect(managedApi.startLocalLogin).not.toHaveBeenCalled();
+    expect(mocks.loginPanel).not.toHaveBeenCalled();
+  });
+  it("connects a new agent's Claude subscription with a setup token on an SSH environment", async () => {
+    const { test, connected } = await mount("claude_local", false, false, false, false);
+    openProvider();
+    expect(host.textContent).toContain("claude setup-token");
+    typeInto(host.querySelector('input[type="password"]') as HTMLInputElement, SETUP_TOKEN);
+    click("Connect");
+    const binding = { env: {}, aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } };
+    await vi.waitFor(() => expect(connected).toHaveBeenCalledWith(binding));
+    expect(test).toHaveBeenCalledWith(binding);
+    expect(managedApi.create).toHaveBeenCalledWith("c1", {
+      provider: "anthropic", method: "subscription", name: "My Claude subscription",
+      ownership: "personal", setupToken: SETUP_TOKEN, agentIds: [], allAgents: true,
+    });
+  });
+  it("tests a new agent on the environment's own sign-in when no setup token is pasted", async () => {
+    const { test, connected } = await mount("claude_local", false, false, false, false);
+    openProvider();
+    expect(host.textContent).toContain("Leave it empty");
+    click("Connect");
+    await vi.waitFor(() => expect(connected).toHaveBeenCalledWith({ env: {} }));
+    expect(test).toHaveBeenCalledWith({ env: {} });
+    expect(managedApi.create).not.toHaveBeenCalled();
+  });
+  it("does not offer a server-host command when health disables local login: codex_local", async () => {
+    const adapterType = "codex_local" as const;
+    const onComplete = vi.fn();
+    const intent = { provider: "openai" as const, method: "subscription" as const, name: "Hosted account", ownership: "personal" as const, agentIds: [], allAgents: false };
     await mount(adapterType, false, false, false, false, false, { intent, onComplete }, true, "authenticated", false);
     openProvider();
     expect(host.textContent).toContain("This environment does not support browser sign-in");
@@ -214,7 +266,8 @@ describe("AgentProviderConnection reuse", () => {
     const intent = { provider: adapterType === "claude_local" ? "anthropic" as const : "openai" as const, method: "subscription" as const, name: "Engineering subscription", ownership: "shared" as const, agentIds: ["nova"], allAgents: false };
     const { test } = await mount(adapterType, false, false, false, true, false, { intent, onComplete });
     openProvider();
-    expect(host.textContent).toContain("This environment does not support browser sign-in");
+    // Claude offers the setup token instead; with no token, Connect does nothing.
+    expect(host.textContent).toContain(adapterType === "claude_local" ? "claude setup-token" : "This environment does not support browser sign-in");
     expect(host.textContent).not.toContain("login on this machine");
     click("Connect");
     expect(onComplete).not.toHaveBeenCalled();

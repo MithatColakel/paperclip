@@ -11,6 +11,7 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { AiConnectionPicker } from "./AiConnectionPicker";
 import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
+import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -62,6 +63,10 @@ export function AiConnectionField({
   const [adopting, setAdopting] = useState(false);
   const [pendingAdoption, setPendingAdoption] = useState<AiConnectionBinding>();
   const [connecting, setConnecting] = useState(false);
+  // A new account from an agent's page is for that agent unless the user
+  // chooses their own default. A personal account replaces nothing while
+  // the user already has a default for this provider.
+  const [connectFor, setConnectFor] = useState<"agent" | "personal">(agentId ? "agent" : "personal");
   const changeBinding = (next: AiConnectionBinding) => {
     if (legacy && !value) { if (!connecting) returnFocus.current = document.activeElement as HTMLElement; setPendingAdoption(next); }
     else onChange(next);
@@ -156,22 +161,35 @@ export function AiConnectionField({
           <DialogHeader>
             <DialogTitle>Connect account</DialogTitle>
           </DialogHeader>
+          {agentId && (
+            <ConnectionChoiceList
+              selectedId={connectFor}
+              choices={[
+                { id: "agent", name: `Only ${agentName}`, description: `A company-shared account installed only for ${agentName}. ${agentName} uses it after you save.` },
+                { id: "personal", name: "My account", description: "Saved as your personal account. Agents that use the responsible user’s connection use your default account, and this account becomes your default only if you have none." },
+              ]}
+              onSelect={(id) => setConnectFor(id === "agent" ? "agent" : "personal")}
+            />
+          )}
           <AiConnectionCredentialStep
+            key={connectFor}
             companyId={companyId}
             provider={provider}
             initialMethod={method}
-            name={`My ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
-            ownership="personal"
+            name={`${connectFor === "agent" ? agentName : "My"} ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
+            ownership={connectFor === "agent" ? "shared" : "personal"}
             agentIds={agentId ? [agentId] : []}
             allAgents={false}
             environmentId={environmentId}
             onCancel={() => setConnecting(false)}
-            onComplete={() => {
+            onComplete={(result) => {
               void client.invalidateQueries({
                 queryKey: ["ai-connections", companyId],
               });
               setConnecting(false);
-              changeBinding({ provider, method, mode: "responsible_user" });
+              changeBinding(connectFor === "agent" && agentId
+                ? { provider, method: result.method, mode: "shared", connectionId: result.connectionId, grantId: result.grantId }
+                : { provider, method, mode: "responsible_user" });
             }}
           />
         </DialogContent>

@@ -23,7 +23,7 @@ When you wake up, follow the Paperclip skill — it contains the full heartbeat 
 ## Working rules
 
 - Start actionable work in the same heartbeat. Do not stop at a plan unless the task asks for one.
-- Use child issues for parallel or long delegated work. Do not poll.
+- Do not create or assign tasks unless your instructions name you the coordinator; write follow-up work as proposals. Do not poll.
 - Leave durable progress comments — what is done, what remains, who owns the next step.
 - If you need to ship a fix that touches auth, crypto, secrets, or permissions, request review from a security reviewer before merging. Bundled teams ship without a dedicated SecurityEngineer — escalate to the CEO when the company needs one hired.
 

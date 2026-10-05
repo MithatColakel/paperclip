@@ -84,6 +84,7 @@ export function AgentProviderConnection({
   const [loginPhase, setLoginPhase] = useState<"preparing" | "ready" | "waiting" | "connecting">("preparing");
   const phaseBeforeSubmit = useRef<"ready" | "waiting">("ready");
   const [apiKey, setApiKey] = useState("");
+  const [setupToken, setSetupToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storedConnection, setStoredConnection] =
@@ -123,6 +124,17 @@ export function AgentProviderConnection({
     ownership: "personal", agentIds: [], allAgents: true,
   }, canUseLocalLogin && method === "subscription" && !savedSubscription && !storedLogin.data,
   { allowHostClaude: health.data?.deploymentMode === "local_trusted" });
+  // Where no environment can run the browser sign-in (SSH hosts, hosted
+  // instances), a Claude subscription still connects with a token from
+  // `claude setup-token`, run on any computer signed in to that account.
+  const tokenSubscription =
+    adapterType === "claude_local" &&
+    method === "subscription" &&
+    !canLogin &&
+    !canUseLocalLogin &&
+    !savedSubscription &&
+    !storedLogin.data;
+  const pastedSetupToken = setupToken.replace(/\s+/g, "");
   const auth = useQuery({
     queryKey: queryKeys.agents.authSignal(
       companyId,
@@ -145,6 +157,13 @@ export function AgentProviderConnection({
     setError(null);
     try {
       if (managedAccount) {
+        if (tokenSubscription) {
+          const result = savedManagedAccount.current ?? await aiConnectionsApi.create(companyId, { ...managedAccount.intent, method: "subscription", setupToken: pastedSetupToken });
+          savedManagedAccount.current = result;
+          setSetupToken("");
+          if (run === epoch.current) managedAccount.onComplete({ ...result, method: "subscription" });
+          return;
+        }
         if (method === "subscription" && !canUseLocalLogin) return;
         const result = savedManagedAccount.current ?? await (method === "api"
           ? aiConnectionsApi.create(companyId, { ...managedAccount.intent, method: "api_key", apiKey: apiKey.trim() })
@@ -176,6 +195,14 @@ export function AgentProviderConnection({
             };
       if (method === "subscription" && canUseLocalLogin && !savedSubscription && !storedLogin.data) {
         savedManagedAccount.current ??= await localLogin.connect();
+        connection = { env: {}, aiConnection: { provider: aiProvider, method: "subscription", mode: "responsible_user" } };
+      }
+      if (tokenSubscription && pastedSetupToken) {
+        savedManagedAccount.current ??= await aiConnectionsApi.create(companyId, {
+          provider: aiProvider, method: "subscription", name: `My ${provider} subscription`,
+          ownership: "personal", setupToken: pastedSetupToken, agentIds: [], allAgents: true,
+        });
+        setSetupToken("");
         connection = { env: {}, aiConnection: { provider: aiProvider, method: "subscription", mode: "responsible_user" } };
       }
       if (connection.credentials) {
@@ -355,6 +382,27 @@ export function AgentProviderConnection({
               />
             ) : savedSubscription ? null : canUseLocalLogin && !storedLogin.data ? (
               <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { setError(null); localLogin.retry(); } }} />
+            ) : tokenSubscription ? (
+              <OnboardingLoginCard instruction="Connect a Claude subscription with a setup token">
+                <p className="text-sm text-muted-foreground">
+                  This environment cannot open the Claude sign-in page. On any computer, sign in to the
+                  Claude account and run <code>claude setup-token</code>, then paste the token here.
+                  Paperclip stores it encrypted.{managedAccount ? "" : ` Leave it empty to use the sign-in already set up on this environment.`}
+                </p>
+                <OnboardingCardField
+                  label="Setup token"
+                  masked
+                  autoFocus
+                  value={setupToken}
+                  placeholder="sk-ant-oat01-…"
+                  onChange={(value) => {
+                    setSetupToken(value);
+                    setError(null);
+                  }}
+                  onSubmit={() => void connect()}
+                  disabled={busy}
+                />
+              </OnboardingLoginCard>
             ) : (
               <p className="text-sm text-muted-foreground">
                 {storedLogin.data
@@ -401,7 +449,7 @@ export function AgentProviderConnection({
         }
         primaryDisabled={
           managedAccount?.disabled ||
-          (Boolean(managedAccount) && method === "subscription" && !canLogin && !canUseLocalLogin) ||
+          (Boolean(managedAccount) && method === "subscription" && !canLogin && !canUseLocalLogin && !(tokenSubscription && pastedSetupToken)) ||
           (localEnvironment && health.isPending) || localLogin.preparing || Boolean(localLogin.error) ||
           (!managedAccount && auth.isPending) ||
           savedKeys.loading ||
