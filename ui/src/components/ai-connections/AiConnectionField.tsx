@@ -13,6 +13,7 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { AiConnectionPicker } from "./AiConnectionPicker";
 import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
+import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -70,6 +71,11 @@ export function AiConnectionField({
   const [reconnecting, setReconnecting] = useState<AiManagedConnectionSummary>();
   const [allAgents, setAllAgents] = useState(true);
   const [savedAccount, setSavedAccount] = useState<{ connectionId: string; grantId: string; method: AiAuthMethod }>();
+  // A new account from an agent's page is for that agent unless the user
+  // chooses their own default: a company-shared account installed only for
+  // this agent and selected for it, which changes no one's default.
+  const [connectFor, setConnectFor] = useState<"agent" | "personal">(agentId ? "agent" : "personal");
+  const agentOnly = !reconnecting && connectFor === "agent" && Boolean(agentId);
   const changeBinding = (next: AiRuntimeConnectionBinding) => {
     if (legacy && !value) { if (!connecting) returnFocus.current = document.activeElement as HTMLElement; setPendingAdoption(next); }
     else onChange(next);
@@ -97,6 +103,7 @@ export function AiConnectionField({
   const openConnection = (reconnect?: AiManagedConnectionSummary) => {
     returnFocus.current = document.activeElement as HTMLElement;
     setReconnecting(reconnect);
+    setConnectFor(agentId ? "agent" : "personal");
     setAllAgents(accounts.data?.canManageConnections ?? false);
     setSavedAccount(undefined);
     selectDefault.reset();
@@ -198,10 +205,20 @@ export function AiConnectionField({
           <DialogHeader>
             <DialogTitle>{reconnecting ? "Reconnect account" : "Connect account"}</DialogTitle>
             <DialogDescription>
-              {reconnecting ? "Sign in again to repair your current default account. Its agent access stays the same." : "This account will become your default for this provider. Your tasks will use it; other users keep their own default."}
+              {reconnecting ? "Sign in again to repair your current default account. Its agent access stays the same." : agentOnly ? `This account is shared with the company and installed only for ${agentName}. ${agentName} uses it after you save; no one's default changes.` : "This account will become your default for this provider. Your tasks will use it; other users keep their own default."}
             </DialogDescription>
           </DialogHeader>
-          {!reconnecting && !savedAccount && <label className="flex items-center gap-2 text-sm">
+          {agentId && !reconnecting && !savedAccount && (
+            <ConnectionChoiceList
+              selectedId={connectFor}
+              choices={[
+                { id: "agent", name: `Only ${agentName}`, description: `A company-shared account installed only for ${agentName}. ${agentName} uses it after you save.` },
+                { id: "personal", name: "My account", description: "Saved as your personal account and made your default for this provider. Agents that use the responsible user’s connection use your default account." },
+              ]}
+              onSelect={(id) => setConnectFor(id === "agent" ? "agent" : "personal")}
+            />
+          )}
+          {!reconnecting && !savedAccount && !agentOnly && <label className="flex items-center gap-2 text-sm">
             <Checkbox checked={allAgents} onCheckedChange={(checked) => setAllAgents(checked === true)} />
             Allow all agents in this company to use this account for my tasks
           </label>}
@@ -212,18 +229,27 @@ export function AiConnectionField({
             </> : <p role="status" className="text-sm text-muted-foreground">Selecting your default account…</p>}
           </div> :
           <AiConnectionCredentialStep
+            key={agentOnly ? "agent" : "personal"}
             companyId={companyId}
             provider={provider}
             initialMethod={reconnecting?.method ?? method}
             fixedMethod={Boolean(reconnecting)}
             connectionId={reconnecting?.id}
-            name={reconnecting?.name ?? `My ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
-            ownership="personal"
+            name={reconnecting?.name ?? `${agentOnly ? agentName : "My"} ${provider === "anthropic" ? "Claude" : provider === "openai" ? "OpenAI" : provider === "xai" ? "Grok" : "OpenRouter"} ${method === "subscription" ? "subscription" : "API"}`}
+            ownership={agentOnly ? "shared" : "personal"}
             agentIds={agentId ? [agentId] : []}
-            allAgents={allAgents}
+            allAgents={agentOnly ? false : allAgents}
             environmentId={environmentId}
             onCancel={() => setConnecting(false)}
             onComplete={(result) => {
+              if (agentOnly && agentId) {
+                // An agent-only account is selected for this agent directly;
+                // it never becomes anyone's default.
+                void client.invalidateQueries({ queryKey: ["ai-connections", companyId] });
+                setConnecting(false);
+                changeBinding({ provider, method: result.method, mode: "shared", connectionId: result.connectionId, grantId: result.grantId });
+                return;
+              }
               setSavedAccount(result);
               selectDefault.mutate(result);
             }}

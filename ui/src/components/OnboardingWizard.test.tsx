@@ -900,6 +900,42 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       await act(async () => root.unmount());
     });
 
+    describe("a Claude setup token pasted on the step", () => {
+      const SETUP_TOKEN = `sk-ant-oat01-${"Ab3_-".repeat(19)}`;
+
+      it("is stored as a personal subscription that the hire references", async () => {
+        const { root, clickByText } = await openConnectStep();
+        expect(document.body.textContent).toContain("claude setup-token");
+        const field = document.body.querySelector(
+          'input[type="password"]',
+        ) as HTMLInputElement;
+        await act(async () => {
+          setControlledValue(field, SETUP_TOKEN);
+        });
+        await flushReact();
+        await clickByText((t) => isArcPrimary(t));
+
+        expect(managedApi.create).toHaveBeenCalledTimes(1);
+        expect(managedApi.create).toHaveBeenCalledWith("company-new", { provider: "anthropic", method: "subscription", name: "My Claude subscription", ownership: "personal", setupToken: SETUP_TOKEN, agentIds: [], allAgents: true });
+        const hireBody = (mockAgentsApi.hire.mock.calls.at(-1) as unknown[])[1] as { runtimeConfig: { aiConnection: unknown } };
+        expect(hireBody.runtimeConfig.aiConnection).toEqual({ provider: "anthropic", method: "subscription", mode: "responsible_user" });
+        expect(JSON.stringify(hireBody)).not.toContain(SETUP_TOKEN);
+
+        await act(async () => root.unmount());
+      });
+
+      it("hires on the environment's own sign-in when no token is pasted", async () => {
+        const { root, clickByText } = await openConnectStep();
+        expect(document.body.textContent).toContain("Leave it empty");
+        await clickByText((t) => isArcPrimary(t));
+
+        expect(managedApi.create).not.toHaveBeenCalled();
+        expect(mockAgentsApi.hire).toHaveBeenCalledTimes(1);
+
+        await act(async () => root.unmount());
+      });
+    });
+
     describe("an API key typed on the step", () => {
       const KEY = "sk-ant-typed-by-the-customer";
 

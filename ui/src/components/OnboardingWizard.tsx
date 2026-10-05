@@ -684,6 +684,7 @@ function OnboardingWizardInner({
    * `localStorage`, and a provider key does not belong there.
    */
   const [apiKey, setApiKey] = useState("");
+  const [setupToken, setSetupToken] = useState("");
   // The owner's stored Claude subscription login, read right before the hire
   // (see handleGiveHeartbeat). Onboarding applies it with no extra control,
   // so nothing else reads this state yet.
@@ -1226,6 +1227,12 @@ function OnboardingWizardInner({
   const connectProgress = adapterEnvLoading ? "Testing connection…" : loading ? "Connecting…" : null;
   const hasSavedSubscription = Boolean(savedSubscription || savedKeys.storedLogin.data ||
     (credentialMode !== "api" && managedBindingForStep()));
+  // Where no environment can run the browser sign-in (SSH hosts, hosted
+  // instances), a Claude subscription still connects with a token from
+  // `claude setup-token`, run on any computer signed in to that account.
+  const tokenSubscription = adapterType === "claude_local" && managedProvider === "anthropic" &&
+    connectStepHasNoSandbox && !canUseLocalLogin && !hasSavedSubscription;
+  const pastedSetupToken = setupToken.replace(/\s+/g, "");
   const connectHasCard = credentialMode === "api" || connectStepNeedsLogin || connectStepHasNoSandbox || Boolean(connectProgress);
   const connectCardLive =
     connectHasCard &&
@@ -2098,6 +2105,14 @@ function OnboardingWizardInner({
         if (!isCurrent()) return;
         managedSubscriptionRef.current = { companyId: createdCompanyId, binding: { provider: managedProvider, method: "subscription", mode: "responsible_user" } };
       }
+      if (tokenSubscription && pastedSetupToken) {
+        await aiConnectionsApi.create(createdCompanyId, { provider: "anthropic", method: "subscription", name: `My ${CONNECT_SOURCE_NAMES[adapterType] ?? "Claude"} subscription`, ownership: "personal", setupToken: pastedSetupToken, agentIds: [], allAgents: true });
+        // Remember the saved account before the attempt check, so a retry
+        // reuses it instead of storing the token a second time.
+        managedSubscriptionRef.current = { companyId: createdCompanyId, binding: { provider: "anthropic", method: "subscription", mode: "responsible_user" } };
+        setSetupToken("");
+        if (!isCurrent()) return;
+      }
       const managedBinding = managedBindingForStep();
       const baseAdapterConfig = buildAdapterConfig(apiKeyStored);
       let storedClaudeLogin: ClaudeOAuthTokenStatusResponse | null = null;
@@ -2891,6 +2906,26 @@ function OnboardingWizardInner({
                     ) : hasSavedSubscription || localLogin.status === "ready" ? null : connectStepHasNoSandbox ? (
                       canUseLocalLogin && managedProvider ? (
                         <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { autoConnectStartedRef.current = false; setError(null); localLogin.retry(); } }} />
+                      ) : tokenSubscription ? (
+                        <OnboardingLoginCard instruction="Connect a Claude subscription with a setup token">
+                          <p className="text-sm text-muted-foreground">
+                            This environment cannot open the Claude sign-in page. On any computer, sign in to the
+                            Claude account and run <code>claude setup-token</code>, then paste the token here.
+                            Paperclip stores it encrypted. Leave it empty to use the sign-in already set up on this environment.
+                          </p>
+                          <OnboardingCardField
+                            label="Setup token"
+                            placeholder="sk-ant-oat01-…"
+                            masked
+                            autoFocus
+                            value={setupToken}
+                            onChange={(value) => {
+                              setSetupToken(value);
+                              setError(null);
+                            }}
+                            onSubmit={() => handleConnectStepPrimary()}
+                          />
+                        </OnboardingLoginCard>
                       ) : <p className="text-xs text-muted-foreground">This environment does not support browser sign-in. Choose another sign-in environment or connect with an API key.</p>
                     ) : null}
                   </motion.div>

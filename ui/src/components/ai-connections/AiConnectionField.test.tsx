@@ -36,16 +36,16 @@ async function settle() {
     flushSync(() => {});
   }
 }
-async function mount(connections: AiManagedConnectionSummary[], canManageConnections = true) {
+async function mount(connections: AiManagedConnectionSummary[], canManageConnections = true, agentId: string | null = "agent") {
   mocks.list.mockResolvedValue({ currentUserId: "owner", connections, canManageConnections });
   flushSync(() => root.render(<QueryClientProvider client={client}>
-    <AiConnectionField companyId="company" agentId="agent" agentName="Nova" adapterType="claude_local"
+    <AiConnectionField companyId="company" agentId={agentId ?? undefined} agentName="Nova" adapterType="claude_local"
       value={{ provider: "anthropic", method: "subscription", mode: "responsible_user" }} onChange={onChange} />
   </QueryClientProvider>));
   await settle();
 }
 function click(label: string) {
-  const button = Array.from(document.querySelectorAll("button")).find(item => item.textContent === label);
+  const button = Array.from(document.querySelectorAll("button")).find(item => item.textContent === label || item.getAttribute("aria-label") === label);
   expect(button, `Missing button: ${label}`).toBeDefined();
   flushSync(() => button!.click());
 }
@@ -73,6 +73,7 @@ it("reconnects the unavailable personal default in place", async () => {
 it("selects the returned new grant and actual method before adopting the personal default", async () => {
   await mount([account()]);
   click("Connect another account");
+  click("My account");
   expect(document.body.textContent).toContain("default");
   expect(credentialProps).toMatchObject({ connectionId: undefined, allAgents: true });
   let resolveDefault!: () => void;
@@ -89,6 +90,7 @@ it("selects the returned new grant and actual method before adopting the persona
 it("lets the owner limit a new personal connection to this agent", async () => {
   await mount([]);
   click("Connect another account");
+  click("My account");
   const checkbox = document.querySelector<HTMLButtonElement>('[role="checkbox"]')!;
   expect(checkbox).not.toBeNull();
   expect(checkbox.getAttribute("aria-checked")).toBe("true");
@@ -99,6 +101,7 @@ it("lets the owner limit a new personal connection to this agent", async () => {
 it("keeps default-update failures visible and retries without another provider login", async () => {
   await mount([account()]);
   click("Connect another account");
+  click("My account");
   mocks.setDefault.mockRejectedValueOnce(new Error("Default update failed"));
   credentialProps!.onComplete({ connectionId: "new-connection", grantId: "new-grant", method: "api_key" });
   await settle();
@@ -118,11 +121,42 @@ it("does not offer reconnection for a healthy default or another owner's account
 it("keeps an ordinary member's new connection scoped to the current agent by default", async () => {
   await mount([], false);
   click("Connect another account");
+  click("My account");
   expect(credentialProps).toMatchObject({ allAgents: false, agentIds: ["agent"] });
 });
 
 it("uses the server's connection-manager permission for company-wide access", async () => {
   await mount([], true);
   click("Connect another account");
+  click("My account");
   expect(credentialProps).toMatchObject({ allAgents: true });
+});
+
+it("connects a new account for this agent only and selects it", async () => {
+  await mount([account()]);
+  click("Connect another account");
+  expect(credentialProps).toMatchObject({ ownership: "shared", agentIds: ["agent"], allAgents: false, name: "Nova Claude subscription", connectionId: undefined });
+  expect(document.querySelector('[role="checkbox"]')).toBeNull();
+  credentialProps!.onComplete({ connectionId: "new-connection", grantId: "new-grant", method: "subscription" });
+  await settle();
+  expect(mocks.setDefault).not.toHaveBeenCalled();
+  expect(onChange).toHaveBeenCalledWith({ provider: "anthropic", method: "subscription", mode: "shared", connectionId: "new-connection", grantId: "new-grant" });
+});
+
+it("keeps the personal account path when the user chooses it", async () => {
+  await mount([]);
+  click("Connect another account");
+  click("My account");
+  expect(credentialProps).toMatchObject({ ownership: "personal", agentIds: ["agent"], name: "My Claude subscription" });
+  credentialProps!.onComplete({ connectionId: "new-connection", grantId: "new-grant", method: "subscription" });
+  await settle();
+  expect(mocks.setDefault).toHaveBeenCalledWith("company", "new-grant");
+  expect(onChange).toHaveBeenCalledWith({ provider: "anthropic", method: "subscription", mode: "responsible_user" });
+});
+
+it("offers no agent-only account before the agent exists", async () => {
+  await mount([], true, null);
+  click("Connect another account");
+  expect(document.body.textContent).not.toContain("Only Nova");
+  expect(credentialProps).toMatchObject({ ownership: "personal", agentIds: [] });
 });
