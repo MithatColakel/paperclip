@@ -193,10 +193,10 @@ export function ConnectionIntentInteractionBody({
       if (binding && previous && result.connectionId !== previous.id) {
         if (binding.mode === "responsible_user") {
           await aiConnectionsApi.setDefault(interaction.companyId, result.grantId);
-        } else {
+        } else if (binding.mode !== "company_pool") {
           const agent = await agentsApi.get(interaction.payload.requestingAgentId, interaction.companyId);
           const current = agent.runtimeConfig.aiConnection;
-          if (!current || current.mode === "responsible_user" || current.connectionId !== previous.id || current.grantId !== previous.grantId) {
+          if (!current || current.mode === "responsible_user" || current.mode === "company_pool" || current.connectionId !== previous.id || current.grantId !== previous.grantId) {
             throw new Error("The agent’s AI connection changed. Reload the task and try again.");
           }
           if (result.generation !== setupGeneration.current) return;
@@ -204,6 +204,7 @@ export function ConnectionIntentInteractionBody({
             runtimeConfig: { ...agent.runtimeConfig, aiConnection: { ...binding, method: result.method, connectionId: result.connectionId, grantId: result.grantId } },
           }, interaction.companyId);
         }
+        // A company_pool binding keeps choosing among the pool's accounts per run.
         await queryClient.invalidateQueries({ queryKey: ["ai-connections", interaction.companyId] });
       }
       if (result.generation === setupGeneration.current) await finishNewConnection(result);

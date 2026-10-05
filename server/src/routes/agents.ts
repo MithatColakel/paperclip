@@ -3370,6 +3370,11 @@ export function agentRoutes(
         && ["ai_connection_default_missing", "ai_connection_missing", "ai_connection_unavailable", "ai_connection_responsible_user_missing"].includes(String(asRecord(error.details)?.code))) {
         return null;
       }
+      // A pool whose accounts are all at their usage limit is still a valid
+      // choice; runs wait for the earliest reset.
+      if (binding.mode === "company_pool" && error instanceof HttpError && asRecord(error.details)?.code === "ai_connection_pool_exhausted") {
+        return null;
+      }
       throw error;
     });
     if (!selection) return undefined;
@@ -3389,7 +3394,8 @@ export function agentRoutes(
         if (selection.connection.config.aiLegacyAdoption === true) await db.update(toolConnections).set({ healthStatus: "ok", config: { ...selection.connection.config, aiLegacyAdoption: false }, updatedAt: new Date() }).where(eq(toolConnections.id, selection.connection.id));
       } finally { try { await managed?.cleanup(); } finally { await target.release("released"); } }
     }
-    return selection.connection.id;
+    // Pool access comes from each account's own agent access, never from one install.
+    return binding.mode === "company_pool" ? undefined : selection.connection.id;
   }
 
   router.post(

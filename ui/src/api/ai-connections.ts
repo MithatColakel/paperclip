@@ -1,4 +1,4 @@
-import type { AiManagedConnectionSummary, CreateAiConnection, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
+import type { AiConnectionPoolSummary, AiManagedConnectionSummary, AiProvider, CreateAiConnection, ReplaceAiConnectionPool, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
 import { api } from "./client";
 export const aiConnectionsApi = {
   startLocalLogin: (companyId: string, input: AiConnectionLoginIntent & { restart?: boolean }) => api.post<LocalAiLoginAttempt>(`/companies/${companyId}/ai-connections/local/attempts`, input),
@@ -9,5 +9,8 @@ export const aiConnectionsApi = {
   list: (companyId: string, agentId?: string) => api.get<{ currentUserId: string; connections: AiManagedConnectionSummary[] }>(`/companies/${companyId}/ai-connections${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ""}`),
   create: (companyId: string, input: CreateAiConnection) => api.post<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections`, input),
   setDefault: (companyId: string, grantId: string) => api.put(`/companies/${companyId}/ai-connections/default`, { grantId }),
+  pool: (companyId: string, provider: AiProvider = "anthropic") => api.get<AiConnectionPoolSummary>(`/companies/${companyId}/ai-connections/pool?provider=${provider}`),
+  replacePool: (companyId: string, input: ReplaceAiConnectionPool) => api.put<AiConnectionPoolSummary>(`/companies/${companyId}/ai-connections/pool`, input),
+  clearPoolLimit: (companyId: string, connectionId: string) => api.post(`/companies/${companyId}/ai-connections/pool/${connectionId}/clear-limit`, {}),
   loginResult: (companyId: string, sessionId: string) => api.get<{ connectionId: string; grantId: string }>(`/companies/${companyId}/ai-connections/login/${encodeURIComponent(sessionId)}`),
 };

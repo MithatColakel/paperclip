@@ -32,7 +32,8 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS, aiConnectionBindingSchema, aiProviderSchema } from "@paperclipai/shared";
+import { aiConnectionPoolRetryAt, aiConnectionPoolService, isAiConnectionPoolExhausted } from "./ai-connection-pool.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
@@ -533,6 +534,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
+  AI_CONNECTION_FAILOVER_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
@@ -1131,6 +1133,11 @@ function readTransientRetryNotBeforeFromRun(
   }
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function readAiConnectionFailoverCount(contextSnapshot: Record<string, unknown>) {
+  const value = contextSnapshot.aiConnectionFailovers;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 function readTransientRecoveryContractFromRun(
@@ -15527,8 +15534,11 @@ export function heartbeatService(
                 executionFailureRetryCount(run),
             }
           : {}),
-        ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
+        ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_FAILOVER_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(retryReason === AI_CONNECTION_FAILOVER_RETRY_REASON
+          ? { aiConnectionFailovers: readAiConnectionFailoverCount(contextSnapshot) + 1 }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -16251,13 +16261,88 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // No code path raises the `ai_connection_busy` error any more. This
-  // function stays because a stored run row can still carry that error code
-  // from an earlier release.
+  // A company-pool account that hit its usage limit is skipped until its reset,
+  // and the run moves to the company's next account at once instead of
+  // waiting. Returns false when the normal bounded retry should handle the
+  // failure (not a pool run, not a usage limit, or too many hand-offs).
+  async function scheduleAiConnectionPoolFailover(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ): Promise<boolean> {
+    const recovery = readTransientRecoveryContractFromRun(run);
+    if (recovery?.errorFamily !== "provider_quota") return false;
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const attribution = parseObject(contextSnapshot.aiConnection);
+    const connectionId = readNonEmptyString(attribution.connectionId);
+    const provider = aiProviderSchema.safeParse(attribution.provider);
+    if (attribution.mode !== "company_pool" || !connectionId || !provider.success) return false;
+    const now = new Date();
+    const until =
+      recovery.retryNotBefore && recovery.retryNotBefore.getTime() > now.getTime()
+        ? recovery.retryNotBefore
+        : new Date(now.getTime() + AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS);
+    const pool = aiConnectionPoolService(db);
+    await pool.markExhausted({
+      companyId: run.companyId,
+      connectionId,
+      until,
+      reason: "provider_quota",
+      source: "run_failure",
+      runId: run.id,
+    });
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "ai_connection.pool_limit_reached",
+      entityType: "tool_connection",
+      entityId: connectionId,
+      agentId: agent.id,
+      runId: run.id,
+      details: { provider: provider.data, exhaustedUntil: until.toISOString(), poolPriority: attribution.poolPriority ?? null },
+    });
+    const members = await pool.members(run.companyId, provider.data);
+    const failovers = readAiConnectionFailoverCount(contextSnapshot);
+    if (failovers >= members.length * 2) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "This task already moved between the company's AI accounts too often; it now waits like any usage-limited run.",
+        payload: { connectionId, failovers },
+      });
+      return false;
+    }
+    // Delay 0: runtime preparation picks the next available account, or waits
+    // for the earliest reset when every account is limited.
+    const retry = await scheduleBoundedRetryForRun(run, agent, {
+      now,
+      retryReason: AI_CONNECTION_FAILOVER_RETRY_REASON,
+      wakeReason: "ai_connection_failover_retry",
+      maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
+      delayMs: 0,
+    });
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: retry.outcome === "scheduled"
+        ? `This AI account reached its usage limit until ${until.toISOString()}. The task continues with the company's next account.`
+        : "This AI account reached its usage limit; the task could not move to another account.",
+      payload: { connectionId, exhaustedUntil: until.toISOString(), retryOutcome: retry.outcome },
+    });
+    return retry.outcome === "scheduled";
+  }
+
+  // Raised today only when every account in a company AI pool is at its usage
+  // limit (`ai_connection_pool_exhausted`, with the earliest reset as the
+  // delay). A stored run row can also still carry `ai_connection_busy` from an
+  // earlier release.
   async function finalizeAiConnectionBusyDeferral(
     run: typeof heartbeatRuns.$inferSelect,
     error: HttpError,
     wasIssueAssignee: boolean,
+    wait?: { delayMs: number; waitMessage: string },
   ) {
     const now = new Date();
     const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
@@ -16278,12 +16363,14 @@ export function heartbeatService(
         const retry = await scheduleBoundedRetryForRun(cancelledRun, agent, {
           now, retryReason: AI_CONNECTION_BUSY_RETRY_REASON, wakeReason: "ai_connection_busy_retry",
           maxAttempts: (cancelledRun.scheduledRetryAttempt ?? 0) + 1,
-          delayMs: computeWorkspaceBusyRetryDelayMs(),
+          delayMs: wait?.delayMs ?? computeWorkspaceBusyRetryDelayMs(),
         });
         scheduled = retry.outcome === "scheduled";
         await appendRunEvent(cancelledRun, {
           eventType: "lifecycle", stream: "system", level: "info",
-          message: scheduled ? "Waiting for the shared AI subscription. This task will retry automatically." : "The AI subscription is busy; this task can no longer retry automatically.",
+          message: scheduled
+            ? wait?.waitMessage ?? "Waiting for the shared AI subscription. This task will retry automatically."
+            : "The AI subscription is busy; this task can no longer retry automatically.",
           payload: { retryScheduled: scheduled },
         });
       }
@@ -21549,14 +21636,19 @@ export function heartbeatService(
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
-          if (isAiConnectionBusy(error) && !persistedNativeExecutionInput) {
+          const poolExhausted = isAiConnectionPoolExhausted(error);
+          if ((isAiConnectionBusy(error) || poolExhausted) && !persistedNativeExecutionInput) {
             // Use the authority recorded by the locked admission gate, never
             // the issue's mutable assignee observed during runtime preparation.
             const authorizedNonAssigneeWake =
               parseObject(run.runnerProfileJson).aiConnectionNonAssigneeCommentWake === true ||
               (run.scheduledRetryReason === AI_CONNECTION_BUSY_RETRY_REASON &&
                 isNonAssigneeWorkspaceBusyRetry(run.scheduledRetryReason, parseObject(run.contextSnapshot)));
-            await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
+            const poolRetryAt = poolExhausted ? aiConnectionPoolRetryAt(error) : null;
+            await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake, poolExhausted ? {
+              delayMs: poolRetryAt ? Math.max(0, poolRetryAt.getTime() - Date.now()) : AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS,
+              waitMessage: `Every account in the company AI pool is at its usage limit. This task resumes${poolRetryAt ? ` at ${poolRetryAt.toISOString()}` : " when an account is available"}.`,
+            } : undefined);
             return;
           }
           if (responsibleUserId && issueId) {
@@ -25666,7 +25758,8 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            if (!(await scheduleAiConnectionPoolFailover(livenessRun, agent)))
+              await scheduleBoundedRetryForRun(livenessRun, agent);
           } else if (
             outcome === "failed" &&
             !legacyExecutionNeedsReconciliation(livenessRun)
@@ -30116,6 +30209,12 @@ export function heartbeatService(
       const agent = await getAgent(run.agentId);
       if (!agent) return { outcome: "missing_agent" as const };
       return scheduleBoundedRetryForRun(run, agent, opts);
+    },
+
+    scheduleAiConnectionPoolFailover: async (runId: string) => {
+      const run = await getRun(runId, { unsafeFullResultJson: true });
+      const agent = run ? await getAgent(run.agentId) : null;
+      return run && agent ? scheduleAiConnectionPoolFailover(run, agent) : false;
     },
 
     reconcileStrandedAssignedIssues,

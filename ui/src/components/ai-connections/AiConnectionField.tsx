@@ -130,6 +130,8 @@ export function AiConnectionField({
           <p className="text-sm">
             {pendingAdoption?.mode === "responsible_user"
               ? `Responsible user’s default. For you: ${accounts.data?.connections.find((account) => account.isDefault && account.provider === provider)?.name ?? "Not connected"}. Other users use their own default.`
+              : pendingAdoption?.mode === "company_pool"
+              ? "Company account pool. Runs use the company’s shared accounts in pool order and move to the next account at a usage limit."
               : accounts.data?.connections.find(
                   (account) => account.id === pendingAdoption?.connectionId,
                 )?.name}

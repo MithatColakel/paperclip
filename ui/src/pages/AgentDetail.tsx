@@ -3373,6 +3373,20 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
   </>;
 }
 
+/** Which company-pool account served the run, and how often it moved past usage-limited accounts. */
+function RunAiPoolAccountBadge({ contextSnapshot }: { contextSnapshot: unknown }) {
+  const snapshot = contextSnapshot && typeof contextSnapshot === "object" ? contextSnapshot as Record<string, unknown> : {};
+  const ai = snapshot.aiConnection && typeof snapshot.aiConnection === "object" ? snapshot.aiConnection as Record<string, unknown> : {};
+  if (ai.mode !== "company_pool" || typeof ai.poolPriority !== "number") return null;
+  const failovers = typeof snapshot.aiConnectionFailovers === "number" ? snapshot.aiConnectionFailovers : 0;
+  return (
+    <Badge variant="outline">
+      AI pool account #{ai.poolPriority + 1}
+      {failovers > 0 ? ` · after ${failovers} switch${failovers === 1 ? "" : "es"}` : ""}
+    </Badge>
+  );
+}
+
 function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown> }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -3597,6 +3611,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 requested={runRequestedProviderTrace(run.contextSnapshot)}
                 showOff
               />
+              <RunAiPoolAccountBadge contextSnapshot={run.contextSnapshot} />
               {(run.status === "running" || run.status === "queued") && (
                 <Button
                   variant="ghost"

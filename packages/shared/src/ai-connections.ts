@@ -53,6 +53,13 @@ export const aiConnectionBindingSchema = z.discriminatedUnion("mode", [
       grantId: z.string().uuid(),
     })
     .strict(),
+  z.object({
+    provider: aiProviderSchema,
+    // Any method in the company pool may serve the run; kept for wire parity.
+    method: aiAuthMethodSchema,
+    // Ordered company-shared accounts; a usage-limited account hands the run to the next one.
+    mode: z.literal("company_pool"),
+  }).strict(),
   z
     .object({
       ...requirement,
@@ -128,7 +135,7 @@ export function isAiConnectionCompatible(
             ? "opencode_local"
             : "unsupported";
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
-  const candidates = "mode" in requirement && requirement.mode === "responsible_user"
+  const candidates = "mode" in requirement && (requirement.mode === "responsible_user" || requirement.mode === "company_pool")
     ? Object.values(methods)
     : requirement.method ? [methods[requirement.method]] : [];
   return (
@@ -145,7 +152,8 @@ export type AiConnectionUnavailableReason =
   | "connection_unavailable"
   | "incompatible"
   | "access_denied"
-  | "credential_missing";
+  | "credential_missing"
+  | "pool_exhausted";
 export interface AiConnectionAttribution {
   connectionId: string;
   grantId: string;
@@ -153,6 +161,8 @@ export interface AiConnectionAttribution {
   method: AiAuthMethod;
   mode: AiConnectionBinding["mode"];
   responsibleUserId: string | null;
+  /** Position of the selected account in the company pool (company_pool only). */
+  poolPriority?: number;
 }
 export type AiConnectionResolution =
   | { ok: true; attribution: AiConnectionAttribution }
@@ -250,3 +260,58 @@ export function aiSubscriptionNeedsIsolatedLogin(config: Record<string, unknown>
     (metadata.data.provider === "openai" || metadata.data.provider === "xai") &&
     config?.aiIsolatedSubscription !== true;
 }
+
+/** Without a provider reset time, a usage-limited account is skipped for this long. */
+export const AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS = 60 * 60 * 1000;
+/** A subscription whose usage window reaches this percentage is skipped before it fails a run. */
+export const AI_CONNECTION_POOL_USAGE_THRESHOLD_PERCENT = 95;
+/** Usage is re-read from the provider at most this often per account. */
+export const AI_CONNECTION_POOL_USAGE_PROBE_TTL_MS = 5 * 60 * 1000;
+export const AI_CONNECTION_POOL_MAX_MEMBERS = 20;
+
+export type AiConnectionQuotaReason = "provider_quota" | "usage_threshold";
+export type AiConnectionQuotaSource = "run_failure" | "usage_probe" | "manual";
+export const AI_CONNECTION_POOL_USAGE_WINDOW_KEYS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] as const;
+export type AiConnectionPoolUsageWindowKey = (typeof AI_CONNECTION_POOL_USAGE_WINDOW_KEYS)[number];
+export interface AiConnectionPoolUsageWindow {
+  key: AiConnectionPoolUsageWindowKey;
+  usedPercent: number | null;
+  resetsAt: string | null;
+}
+
+export interface AiConnectionPoolMemberSummary {
+  connectionId: string;
+  grantId: string;
+  provider: AiProvider;
+  method: AiAuthMethod;
+  priority: number;
+  name: string;
+  accountLabel?: string;
+  status: AiManagedConnectionSummary["status"];
+  exhaustedUntil: string | null;
+  quotaReason: AiConnectionQuotaReason | null;
+  quotaSource: AiConnectionQuotaSource | null;
+  usageCheckedAt: string | null;
+  usageWindows: AiConnectionPoolUsageWindow[];
+}
+export interface AiConnectionPoolSummary {
+  companyId: string;
+  provider: AiProvider;
+  members: AiConnectionPoolMemberSummary[];
+  /** Company-shared accounts of this provider that are not in the pool yet. */
+  candidates: Array<Pick<AiConnectionPoolMemberSummary, "connectionId" | "grantId" | "method" | "name" | "accountLabel" | "status">>;
+}
+
+export const replaceAiConnectionPoolSchema = z
+  .object({
+    provider: aiProviderSchema,
+    members: z
+      .array(z.object({ connectionId: z.string().uuid(), grantId: z.string().uuid() }).strict())
+      .max(AI_CONNECTION_POOL_MAX_MEMBERS),
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    if (new Set(v.members.map((m) => m.connectionId)).size !== v.members.length)
+      ctx.addIssue({ code: "custom", message: "Each account can appear in the pool only once", path: ["members"] });
+  });
+export type ReplaceAiConnectionPool = z.infer<typeof replaceAiConnectionPoolSchema>;
