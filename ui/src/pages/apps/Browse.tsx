@@ -1,5 +1,6 @@
 import { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "@paperclipai/shared";
 import { ManagedAiConnectionRow } from "@/components/ai-connections/ManagedAiConnectionDetails";
+import { AiAccountPoolCard } from "@/components/ai-connections/AiAccountPoolCard";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -653,6 +654,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
           />
         </div>
       </header>
+
+      {selectedCompanyId && <AiAccountPoolCard companyId={selectedCompanyId} />}
 
       {loadFailed ? (
         <div

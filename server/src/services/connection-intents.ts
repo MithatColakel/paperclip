@@ -482,10 +482,12 @@ export function connectionIntentService(db: Db) {
       responsibleUserId: loaded.interaction.addresseeUserId!, serviceSlug: app.slug, purpose: "ai",
     }) : null;
     const aiAccounts = managed ? await aiConnectionService(db).list(loaded.issue.companyId, loaded.interaction.addresseeUserId!) : [];
-    const selectedAiAccount = managed ? aiAccounts.find((account) =>
-      account.provider === managed.binding.provider && (managed.binding.mode === "responsible_user" || account.method === managed.binding.method)
-      && (managed.binding.mode === "responsible_user" ? account.isDefault
-        : account.id === managed.binding.connectionId && account.grantId === managed.binding.grantId)
+    // A company pool has no single selected account; its accounts are managed on the pool.
+    const binding = managed?.binding.mode === "company_pool" ? undefined : managed?.binding;
+    const selectedAiAccount = binding ? aiAccounts.find((account) =>
+      account.provider === binding.provider && (binding.mode === "responsible_user" || account.method === binding.method)
+      && (binding.mode === "responsible_user" ? account.isDefault
+        : account.id === binding.connectionId && account.grantId === binding.grantId)
     ) : undefined;
     const selectedAiGrant = selectedAiAccount
       ? (await access.listConnectionGrants(selectedAiAccount.id, loaded.issue.companyId)).grants.find(grant => grant.id === selectedAiAccount.grantId)

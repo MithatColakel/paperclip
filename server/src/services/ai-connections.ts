@@ -19,6 +19,7 @@ import {
 } from "@paperclipai/db";
 import {
   AI_CONNECTION_CAPABILITIES,
+  AI_CONNECTION_POOL_USAGE_PROBE_TTL_MS,
   aiConnectionMetadataSchema,
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
@@ -29,7 +30,14 @@ import {
   type CreateAiConnection,
   type AiConnectionLoginIntent,
 } from "@paperclipai/shared";
+import { fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
 import { forbidden, notFound, unprocessable } from "../errors.js";
+import {
+  aiConnectionPoolService,
+  claudeUsageToPoolWindows,
+  usageBlockedUntil,
+  type AiConnectionPoolMember,
+} from "./ai-connection-pool.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 
@@ -208,7 +216,7 @@ export function aiConnectionService(db: Db) {
         });
     });
   }
-  async function select(input: {
+  type SelectInput = {
     companyId: string;
     userId: string | null;
     agentId: string;
@@ -220,8 +228,15 @@ export function aiConnectionService(db: Db) {
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     binding: AiConnectionBinding;
-  }) {
-    const { companyId, userId, agentId, binding } = input;
+    /** company_pool: re-validate only this account (the second read of one preparation). */
+    pinnedGrantId?: string;
+    /** company_pool: read provider usage before choosing a subscription (default true). */
+    probeUsage?: boolean;
+    now?: Date;
+  };
+  type AccountRow = Awaited<ReturnType<typeof rows>>[number];
+  async function select(input: SelectInput) {
+    const { companyId, userId, binding } = input;
     if (
       !isAiConnectionCompatible(
         binding,
@@ -242,6 +257,7 @@ export function aiConnectionService(db: Db) {
       );
     if (userId && !(await membership(companyId, userId)))
       throw forbidden("The responsible user is not an active company member");
+    if (binding.mode === "company_pool") return selectFromPool(input, binding);
     const defaultRow =
       binding.mode === "responsible_user"
         ? (
@@ -277,12 +293,97 @@ export function aiConnectionService(db: Db) {
       throw unprocessable("The selected AI connection is unavailable", {
         code: "ai_connection_missing",
       });
+    return checkRow(input, row);
+  }
+  async function selectFromPool(
+    input: SelectInput,
+    binding: Extract<AiConnectionBinding, { mode: "company_pool" }>,
+  ) {
+    const now = input.now ?? new Date();
+    const pool = aiConnectionPoolService(db);
+    const members = await pool.members(input.companyId, binding.provider);
+    if (!members.length)
+      throw unprocessable("Add this company's shared accounts to its AI account pool", {
+        code: "ai_connection_pool_empty",
+      });
+    const accounts = await rows(input.companyId);
+    let limitedUntil: Date | null = null;
+    let lastError: unknown = null;
+    const noteLimit = (until: Date) => {
+      if (!limitedUntil || until.getTime() < limitedUntil.getTime()) limitedUntil = until;
+    };
+    for (const member of members) {
+      if (input.pinnedGrantId && member.grantId !== input.pinnedGrantId) continue;
+      if (member.exhaustedUntil && member.exhaustedUntil.getTime() > now.getTime()) {
+        noteLimit(member.exhaustedUntil);
+        continue;
+      }
+      const row = accounts.find((r) => r.grant.id === member.grantId && r.connection.id === member.connectionId);
+      if (!row) continue;
+      let selected: Awaited<ReturnType<typeof checkRow>>;
+      try {
+        selected = await checkRow(input, row);
+      } catch (error) {
+        // An account this agent cannot use is skipped like a limited one; the pool moves on.
+        lastError = error;
+        continue;
+      }
+      if (input.probeUsage !== false && binding.provider === "anthropic" && selected.attribution.method === "subscription") {
+        const blockedUntil = await probeClaudeUsage(selected, member, input.model, now);
+        if (blockedUntil) {
+          noteLimit(blockedUntil);
+          continue;
+        }
+      }
+      return { ...selected, attribution: { ...selected.attribution, poolPriority: member.priority } };
+    }
+    if (limitedUntil)
+      throw unprocessable("Every account in this company's AI account pool is at its usage limit", {
+        code: "ai_connection_pool_exhausted",
+        retryAt: (limitedUntil as Date).toISOString(),
+      });
+    throw lastError ?? unprocessable("No account in this company's AI account pool can serve this agent", {
+      code: "ai_connection_unavailable",
+    });
+  }
+  /** Reads the account's usage at most once per TTL; an unreadable usage never blocks the account. */
+  async function probeClaudeUsage(
+    selected: Awaited<ReturnType<typeof checkRow>>,
+    member: AiConnectionPoolMember,
+    model: unknown,
+    now: Date,
+  ): Promise<Date | null> {
+    const pool = aiConnectionPoolService(db);
+    const fresh = member.usageCheckedAt &&
+      now.getTime() - member.usageCheckedAt.getTime() < AI_CONNECTION_POOL_USAGE_PROBE_TTL_MS;
+    let windows = member.usageWindows;
+    if (!fresh) {
+      try {
+        windows = claudeUsageToPoolWindows(await fetchClaudeQuota(await credential(selected)));
+      } catch {
+        windows = [];
+      }
+      await pool.recordUsage(selected.connection.companyId, selected.connection.id, windows, now);
+    }
+    const blockedUntil = usageBlockedUntil(windows, model, now);
+    if (blockedUntil && !fresh)
+      await pool.markExhausted({
+        companyId: selected.connection.companyId,
+        connectionId: selected.connection.id,
+        until: blockedUntil,
+        reason: "usage_threshold",
+        source: "usage_probe",
+      });
+    return blockedUntil;
+  }
+  async function checkRow(input: SelectInput, row: AccountRow) {
+    const { companyId, userId, agentId, binding } = input;
     const { connection, grant } = row;
     const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
     if (
       !metadata.success ||
       metadata.data.provider !== binding.provider ||
-      (binding.mode !== "responsible_user" && metadata.data.method !== binding.method) ||
+      (binding.mode !== "responsible_user" && binding.mode !== "company_pool" && metadata.data.method !== binding.method) ||
       !isAiConnectionCompatible(metadata.data, input.adapterType, input.model, input.runnerProvider, input.acpxAgent)
     )
       throw unprocessable("The selected AI connection is incompatible", {
@@ -318,7 +419,7 @@ export function aiConnectionService(db: Db) {
       (grant.kind !== "user" || grant.subjectUserId !== userId)
     )
       throw forbidden("The default must belong to the responsible user");
-    if (binding.mode === "shared" && grant.kind !== "organization")
+    if ((binding.mode === "shared" || binding.mode === "company_pool") && grant.kind !== "organization")
       throw forbidden("Select a company-shared account");
     if (binding.mode === "delegated" && grant.kind !== "user")
       throw forbidden("Select a personal account");
@@ -373,7 +474,7 @@ export function aiConnectionService(db: Db) {
       } satisfies AiConnectionAttribution,
     };
   }
-  async function credential(row: Awaited<ReturnType<typeof select>>) {
+  async function credential(row: Awaited<ReturnType<typeof checkRow>>) {
     const ref = row.grant.credentialSecretRefs.find(
       (r) => r.configPath === "ai.credential",
     );

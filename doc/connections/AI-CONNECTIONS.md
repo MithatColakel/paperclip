@@ -42,6 +42,10 @@ and caller-supplied validation URLs are rejected.
   access; a personal credential remains available only for its owner's tasks.
   New configuration offers personal defaults or shared accounts.
 
+- `company_pool`: use the company's ordered pool of company-shared accounts
+  for the provider (see "Company account pool" below). `method` is a wire
+  hint only; any method in the pool may serve the run.
+
 “Which humans can use this credential?” is the sole permission for whose work
 can use the account. “Just me” means the personal owner; shared accounts allow
 selected company members or every company member. The separate agent-access
@@ -58,6 +62,41 @@ The additive `ai_provider_defaults` table preserves the legacy per-method prefer
 
 Revocation retains the unavailable default; connecting another account does not
 silently replace it. Change it explicitly on the account detail page.
+
+## Company account pool
+
+A company orders its company-shared accounts for a provider in
+`ai_connection_pool_members` (`/:company/apps` → Claude account pool). Only that
+company's own shared accounts can join; composite foreign keys keep every member
+inside its company, and a run never reaches another company's account.
+
+Selection walks the pool in order and applies the same checks as a `shared`
+selection to each account (health, grant status, human audience, agent access).
+An account that fails a check is skipped. Per-account usage state lives in
+`ai_connection_quota_states`:
+
+- **Limit after a failure.** A `company_pool` run that ends with
+  `provider_quota` marks its account limited until the provider's reset time,
+  or for 60 minutes when the provider gives none. A later reset always wins
+  over a shorter one. The run is retried at once with reason
+  `ai_connection_failover`; runtime preparation then picks the next available
+  account. The hand-off does not consume the bounded failure-retry allowance
+  and is capped at twice the pool size per task.
+- **Limit before a run.** For a Claude subscription, selection reads the
+  account's usage (`api/oauth/usage`) at most once per 5 minutes. When the
+  session window, the weekly window, or the weekly window for the agent's model
+  family is at or above 95%, the account is skipped until that window resets.
+  An unreadable usage never blocks the account; API keys are not probed.
+- **Every account limited.** Preparation raises `ai_connection_pool_exhausted`
+  with the earliest reset. The run is deferred through the existing
+  `ai_connection_busy` wait until then; it does not need a reconnect.
+
+A different account is a different credential identity, so the retry starts a
+fresh provider session. Board users with `tools:manage_connections` reorder the
+pool and clear a recorded limit; both write activity (`ai_connection.pool_updated`,
+`ai_connection.pool_limit_cleared`). The heartbeat records
+`ai_connection.pool_limit_reached`. Run detail shows the pool position that
+served the run.
 
 ## Storage and API
 
@@ -76,8 +115,9 @@ Safe provider-reported account identity is optional; secret references, tokens,
 and authentication paths are never account labels.
 
 Company-scoped `/api/companies/:companyId/ai-connections` operations provide list,
-API-key creation/reconnect, personal defaults, completed login references, and
-active-run attribution. Existing Connections operations handle naming, access,
+API-key creation/reconnect, personal defaults, completed login references,
+active-run attribution, and the account pool (`GET`/`PUT .../pool`,
+`POST .../pool/:connectionId/clear-limit`). Existing Connections operations handle naming, access,
 and revocation. Mutation authorization is enforced server-side. OpenAPI documents the new board-only
 operations. Agent-originated configuration and environment tests resolve the
 authenticated request’s responsible user; an agent ID is never a personal-account

@@ -18,6 +18,8 @@ import {
   localAiConnectionSchema,
   localAiLoginStartSchema,
   isAiConnectionCompatible,
+  aiProviderSchema,
+  replaceAiConnectionPoolSchema,
   type AiConnectionLoginIntent,
   type AiProvider,
   type AiConnectionBinding,
@@ -27,6 +29,7 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { aiConnectionPoolService } from "../services/ai-connection-pool.js";
 import { validate } from "../middleware/validate.js";
 
 /** Agent API calls inherit authenticated run identity, never the agent's own ID. */
@@ -130,6 +133,18 @@ export async function canInstallSharedAiConnectionForNewAgent(
   if (!connection) return false;
   return req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true ||
     connection.creator === userId || await accessService(db).hasPermission(companyId, "user", userId, "tools:manage_connections");
+}
+
+/** Ordering a company's AI pool or clearing a limit needs the existing connection-manage authority. */
+async function assertAiPoolManager(db: Db, req: Request, companyId: string) {
+  assertBoard(req);
+  assertCompanyAccess(req, companyId);
+  const member = req.actor.memberships?.find(m => m.companyId === companyId && m.status === "active");
+  if (member?.membershipRole === "viewer") throw forbidden("Viewers cannot change the AI account pool");
+  const userId = getActorInfo(req).actorId;
+  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true ||
+    await accessService(db).hasPermission(companyId, "user", userId, "tools:manage_connections")) return userId;
+  throw forbidden("Managing connections is required to change the AI account pool");
 }
 
 /** Fixed provider endpoints; credentials are never sent to a caller-supplied URL or through a redirect. */
@@ -353,6 +368,32 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       res.json({ ok: true });
     },
   );
+  router.get("/companies/:companyId/ai-connections/pool", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+    const provider = aiProviderSchema.safeParse(req.query.provider ?? "anthropic");
+    if (!provider.success) throw unprocessable("Choose a supported AI provider");
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await aiConnectionPoolService(db).summary(companyId, provider.data));
+  });
+  router.put(
+    "/companies/:companyId/ai-connections/pool",
+    validate(replaceAiConnectionPoolSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const userId = await assertAiPoolManager(db, req, companyId);
+      res.json(await aiConnectionPoolService(db).replace(companyId, userId, req.body));
+    },
+  );
+  router.post("/companies/:companyId/ai-connections/pool/:connectionId/clear-limit", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const userId = await assertAiPoolManager(db, req, companyId);
+    const connectionId = req.params.connectionId as string;
+    if (!z.string().uuid().safeParse(connectionId).success) throw unprocessable("Invalid connection ID");
+    await aiConnectionPoolService(db).clearLimit(companyId, userId, connectionId);
+    res.json({ ok: true });
+  });
   router.get(
     "/companies/:companyId/ai-connections/login/:sessionId",
     async (req, res) => {

@@ -82,7 +82,7 @@ export function AiConnectionPicker({
         <h3 className="text-sm font-semibold">AI connection</h3>
         <p className="text-xs text-muted-foreground">
           {AI_PROVIDERS[requirement.provider].name}
-          {value && value.mode !== "responsible_user" && ` · ${aiMethodLabel(value.provider, value.method)}`}
+          {value && value.mode !== "responsible_user" && value.mode !== "company_pool" && ` · ${aiMethodLabel(value.provider, value.method)}`}
         </p>
         </div>
       </div>
@@ -105,12 +105,16 @@ export function AiConnectionPicker({
         <>
           <ConnectionChoiceList
             disabled={readOnly}
-            selectedId={value?.mode === "responsible_user" ? "responsible_user" : value?.connectionId}
+            selectedId={value?.mode === "responsible_user" || value?.mode === "company_pool" ? value.mode : value?.connectionId}
             choices={[
               { id: "responsible_user", name: "Responsible user’s connection", description: <>
                 <span className="block">For you: {personalDefault?.name ?? "Not connected"}</span>
                 <span className="block">Other users’ tasks use their own {AI_PROVIDERS[requirement.provider].name} connection.</span>
               </> },
+              ...(compatible.some((connection) => connection.ownership === "shared") ? [{
+                id: "company_pool", name: "Company account pool",
+                description: <>Uses this company’s shared {AI_PROVIDERS[requirement.provider].name} accounts in pool order and moves to the next account when one reaches its usage limit.</>,
+              }] : []),
               ...compatible.filter((connection) => connection.ownership === "shared").map((connection) => ({
                 id: connection.id, name: connection.name,
                 disabled: Boolean(aiConnectionProblem(connection)),
@@ -119,6 +123,7 @@ export function AiConnectionPicker({
             ]}
             onSelect={(id) => {
               if (id === "responsible_user") onChange({provider: requirement.provider, method: personalDefault?.method ?? requirement.method ?? (requirement.provider === "openrouter" ? "api_key" : "subscription"), mode: "responsible_user"});
+              else if (id === "company_pool") onChange({provider: requirement.provider, method: requirement.method ?? (requirement.provider === "openrouter" ? "api_key" : "subscription"), mode: "company_pool"});
               else { const connection = compatible.find((item) => item.id === id)!; select("shared", connection); }
             }}
           />

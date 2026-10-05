@@ -5,7 +5,8 @@ export function executionFailureRetryCount(run: {
   contextSnapshot?: Record<string, unknown> | null;
 }): number {
   if (run.scheduledRetryReason === "max_turns_continuation") return 0;
-  if (run.scheduledRetryReason === "ai_connection_busy") {
+  // An account failover is not a failure retry; it keeps the count from before it.
+  if (run.scheduledRetryReason === "ai_connection_busy" || run.scheduledRetryReason === "ai_connection_failover") {
     const count = run.contextSnapshot?.failureRetriesBeforeAiConnectionWait;
     if (typeof count === "number" && Number.isInteger(count) && count >= 0) return count;
   }

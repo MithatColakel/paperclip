@@ -92,13 +92,18 @@ export function bindingProblem(
 ) {
   if (
     binding.provider !== requirement.provider ||
-    (binding.mode !== "responsible_user" && requirement.method !== undefined && binding.method !== requirement.method)
+    (binding.mode !== "responsible_user" && binding.mode !== "company_pool" && requirement.method !== undefined && binding.method !== requirement.method)
   )
     return "Choose a connection compatible with this provider and sign-in method.";
   if (binding.mode === "responsible_user")
     return aiConnectionProblem(
       personalAiDefault(connections, requirement, userId),
     );
+  if (binding.mode === "company_pool")
+    return connections.some((item) =>
+      item.ownership === "shared" && item.provider === binding.provider && !aiConnectionProblem(item))
+      ? null
+      : "Connect a company-shared account and add it to the AI account pool.";
   const connection = connections.find(
     (item) =>
       item.id === binding.connectionId &&
