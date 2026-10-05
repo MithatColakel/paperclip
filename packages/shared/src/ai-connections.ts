@@ -173,6 +173,9 @@ export interface AiManagedConnectionSummary {
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
 }
+/** A long-lived Claude subscription token printed by `claude setup-token`. */
+export const CLAUDE_SETUP_TOKEN_PATTERN = /^sk-ant-oat01-[A-Za-z0-9_-]{80,}$/;
+
 export const createAiConnectionSchema = z
   .object({
     ...requirement,
@@ -180,6 +183,10 @@ export const createAiConnectionSchema = z
     ownership: z.enum(["personal", "shared"]),
     apiKey: z.string().trim().min(1).max(32768).optional(),
     loginSessionId: z.string().max(128).optional(),
+    // Lets a Claude subscription connect where no environment can run the
+    // browser sign-in (SSH hosts, hosted instances): the user runs
+    // `claude setup-token` anywhere and pastes the result.
+    setupToken: z.string().trim().min(1).max(4096).optional(),
     connectionId: z.string().uuid().optional(),
     agentIds: z.array(z.string().uuid()).max(1000).default([]),
     allAgents: z.boolean().default(false),
@@ -188,16 +195,22 @@ export const createAiConnectionSchema = z
   .superRefine((v, ctx) => {
     if (!AI_CONNECTION_CAPABILITIES[v.provider].methods[v.method])
       ctx.addIssue({ code: "custom", message: "Unsupported sign-in method" });
+    const credentials = [v.apiKey, v.loginSessionId, v.setupToken].filter(Boolean).length;
     if (
-      v.method === "api_key"
-        ? !v.apiKey || Boolean(v.loginSessionId)
-        : !v.loginSessionId || Boolean(v.apiKey)
+      credentials !== 1 ||
+      (v.method === "api_key" ? !v.apiKey : Boolean(v.apiKey))
     ) {
       ctx.addIssue({
         code: "custom",
         message:
           "Provide exactly the credential for the selected sign-in method",
       });
+    }
+    if (v.setupToken) {
+      if (v.provider !== "anthropic" || v.method !== "subscription")
+        ctx.addIssue({ code: "custom", message: "A setup token only connects a Claude subscription" });
+      else if (!CLAUDE_SETUP_TOKEN_PATTERN.test(v.setupToken))
+        ctx.addIssue({ code: "custom", message: "This is not a Claude setup token. Run `claude setup-token` and paste the whole token." });
     }
   });
 export type CreateAiConnection = z.infer<typeof createAiConnectionSchema>;

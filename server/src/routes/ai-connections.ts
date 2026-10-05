@@ -276,6 +276,20 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
         companyId,
         input,
       );
+      if (input.method === "subscription" && input.setupToken) {
+        // The schema limits this to a well-formed Claude setup token. The
+        // caller tests the saved connection on the agent's own environment.
+        const result = await service.save(
+          companyId,
+          userId,
+          input,
+          input.setupToken,
+          undefined,
+          new Date(),
+        );
+        res.status(201).json(result);
+        return;
+      }
       if (input.method !== "api_key")
         throw unprocessable(
           "Use the existing provider sign-in flow to connect a subscription",

@@ -25,7 +25,7 @@ When you wake up, follow the Paperclip skill — it contains the full heartbeat 
 ## Working rules
 
 - Start actionable work in the same heartbeat. Do not stop at a plan unless asked.
-- Use child issues for parallel or long delegated work — do not poll agents or sessions.
+- Do not create or assign tasks unless your instructions name you the coordinator; write follow-up work as proposals. Do not poll agents or sessions.
 - Default to small bounded code reviews. Reject "kitchen sink" PRs back to the implementer.
 
 ## Safety

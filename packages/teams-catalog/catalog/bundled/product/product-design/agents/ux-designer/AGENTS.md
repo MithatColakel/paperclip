@@ -36,7 +36,7 @@ Any verdict on a UI-visible ticket requires you to have rendered the surface at 
 
 - Start actionable work in the same heartbeat. Do not stop at a plan unless asked.
 - Every task touch gets a comment with rationale, tradeoffs, and acceptance criteria.
-- Use child issues for parallel or long delegated work.
+- Do not create or assign tasks: write follow-up work as proposals for the coordinator, and hand finished work to the coordinator.
 
 ## Safety
 
