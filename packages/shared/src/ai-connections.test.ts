@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { createAiConnectionSchema } from "./ai-connections.js";
+import {
+  AI_CONNECTION_POOL_MAX_MEMBERS,
+  aiConnectionBindingSchema,
+  createAiConnectionSchema,
+  isAiConnectionCompatible,
+  replaceAiConnectionPoolSchema,
+} from "./ai-connections.js";
 
 const token = `sk-ant-oat01-${"Ab3_-".repeat(19)}`;
 const base = { name: "Claude account", ownership: "personal" as const };
@@ -24,5 +30,21 @@ describe("createAiConnectionSchema credentials", () => {
     ["no credential", { provider: "anthropic", method: "subscription" }],
   ])("rejects %s", (_label, input) => {
     expect(createAiConnectionSchema.safeParse({ ...base, ...input }).success).toBe(false);
+  });
+});
+
+describe("company account pool contract", () => {
+  const member = (n: number) => ({ connectionId: `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, grantId: `10000000-0000-4000-8000-${String(n).padStart(12, "0")}` });
+  it("binds an agent to the pool without naming an account", () => {
+    const binding = { provider: "anthropic", method: "subscription", mode: "company_pool" } as const;
+    expect(aiConnectionBindingSchema.parse(binding)).toEqual(binding);
+    expect(aiConnectionBindingSchema.safeParse({ ...binding, connectionId: member(1).connectionId }).success).toBe(false);
+    expect(isAiConnectionCompatible({ ...binding, method: "api_key" }, "claude_local")).toBe(true);
+  });
+  it("accepts an ordered list of distinct accounts up to the limit", () => {
+    expect(replaceAiConnectionPoolSchema.safeParse({ provider: "anthropic", members: [member(1), member(2)] }).success).toBe(true);
+    expect(replaceAiConnectionPoolSchema.safeParse({ provider: "anthropic", members: [member(1), member(1)] }).success).toBe(false);
+    const tooMany = Array.from({ length: AI_CONNECTION_POOL_MAX_MEMBERS + 1 }, (_, i) => member(i));
+    expect(replaceAiConnectionPoolSchema.safeParse({ provider: "anthropic", members: tooMany }).success).toBe(false);
   });
 });

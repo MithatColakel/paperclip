@@ -11,7 +11,9 @@ export type AiRuntimeConnectionBinding = z.infer<typeof aiRuntimeConnectionBindi
 
 export const aiConnectionPoolMemberSchema = z.object({
   id: z.string().uuid(),
-  binding: aiConnectionBindingSchema.refine((v) => v.mode !== "responsible_user", "Select an explicit account grant"),
+  // A pool member names one account grant; the company account pool
+  // (\`company_pool\`) is a binding of its own and never a member.
+  binding: aiConnectionBindingSchema.refine((v) => v.mode !== "responsible_user" && v.mode !== "company_pool", "Select an explicit account grant"),
   profile: z.object({
     provider: z.enum(["codex", "acpx", "opencode"]),
     acpxAgent: z.enum(["claude", "grok"]).optional(),

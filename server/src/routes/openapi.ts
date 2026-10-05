@@ -8,6 +8,8 @@ import { z } from "zod";
 import {
   createAiConnectionSchema,
   aiConnectionPoolConfigSchema,
+  aiProviderSchema,
+  replaceAiConnectionPoolSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -1359,6 +1361,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/ai-connection-pools",
   "DELETE /api/companies/{companyId}/ai-connection-pools/{poolId}",
   "GET /api/companies/{companyId}/ai-connection-pools/{poolId}/inspection",
+  "GET /api/companies/{companyId}/ai-connections/pool",
+  "PUT /api/companies/{companyId}/ai-connections/pool",
+  "POST /api/companies/{companyId}/ai-connections/pool/{connectionId}/clear-limit",
 
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
@@ -10475,6 +10480,32 @@ registerCurrentRoute({
   path: "/api/companies/{companyId}/ai-connections/login/{sessionId}",
   tags: ["ai-connections"],
   summary: "Get the connection saved by an owned completed login",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections/pool",
+  tags: ["ai-connections"],
+  summary: "List the company's ordered AI account pool with usage-limit state",
+  query: z.object({ provider: aiProviderSchema.optional() }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/companies/{companyId}/ai-connections/pool",
+  tags: ["ai-connections"],
+  summary: "Replace the order of the company's shared AI accounts in its pool",
+  body: replaceAiConnectionPoolSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/pool/{connectionId}/clear-limit",
+  tags: ["ai-connections"],
+  summary: "Make a usage-limited pool account available again",
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 

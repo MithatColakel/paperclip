@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/shared";
 import { AssistantConnectionCard, useAssistantConnections } from "./AssistantConnection";
 import { ManagedAiConnectionRow } from "@/components/ai-connections/ManagedAiConnectionDetails";
+import { AiAccountPoolCard } from "@/components/ai-connections/AiAccountPoolCard";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -862,6 +863,8 @@ export function Browse({ renderAccountDetails = (connection) => connection.conne
         </div>
         <CatalogSourceFilters source={source} onChange={value => { setSource(value); setExpandedSearch(false); setPage(1); }} />
       </header>
+
+      {selectedCompanyId && <AiAccountPoolCard companyId={selectedCompanyId} />}
 
       {loadFailed ? (
         <div

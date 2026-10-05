@@ -65,6 +65,13 @@ describe("AI connection selection presentation", () => {
       ),
     ).toContain("Revoked");
   });
+  it("accepts a company pool while a healthy shared account exists, for any sign-in method", () => {
+    const pool: AiConnectionBinding = { provider: "anthropic", method: "api_key", mode: "company_pool" };
+    const shared = { ...account, ownership: "shared" as const, isDefault: false };
+    expect(bindingProblem(pool, requirement, [shared], "bob", "agent")).toBeNull();
+    expect(bindingProblem(pool, requirement, [account], "alice", "agent")).toContain("company-shared");
+    expect(bindingProblem(pool, requirement, [{ ...shared, status: "revoked" }], "alice", "agent")).toContain("company-shared");
+  });
   it("does not select another user’s account", () => {
     expect(
       bindingProblem(binding, requirement, [account], "bob", "agent"),
