@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
@@ -190,6 +190,25 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 
 const LOCK_STALE_MS = 30_000;
 
+const LOCK_OWNER_BOOT_ID_KEY = Symbol.for("paperclip.directoryMergeLock.ownerBootId");
+
+/**
+ * Names this process's lifetime in a lock owner record. A pid alone cannot:
+ * a container restart gives the server the same pid again, so a lock the
+ * previous container left behind would read as held by a live process and
+ * every later acquirer would time out on it. The id lives on a global symbol
+ * so every copy of this module loaded into one process writes and checks the
+ * same value.
+ */
+function currentLockOwnerBootId(): string {
+  const store = globalThis as unknown as Record<symbol, string | undefined>;
+  const existing = store[LOCK_OWNER_BOOT_ID_KEY];
+  if (existing) return existing;
+  const created = randomUUID();
+  store[LOCK_OWNER_BOOT_ID_KEY] = created;
+  return created;
+}
+
 /**
  * The stable `code` a lock-timeout error carries, so a caller can identify it
  * without matching on the error message text (the message embeds the lock
@@ -254,11 +273,18 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
 async function isLockStale(lockDir: string): Promise<boolean> {
   try {
     const raw = await fs.readFile(path.join(lockDir, "owner.json"), "utf8");
-    const owner = JSON.parse(raw) as { pid?: unknown };
+    const owner = JSON.parse(raw) as { pid?: unknown; bootId?: unknown };
     const pid = typeof owner.pid === "number" && Number.isFinite(owner.pid) && owner.pid > 0 ? owner.pid : null;
     if (pid === null) {
       // Owner record is unparseable / missing pid — treat as stale.
       return true;
+    }
+    if (pid === process.pid) {
+      // The record names this very process, so `process.kill` would always
+      // report it alive. It is live only if this process wrote it; a record
+      // with another boot id (or none, from before boot ids) was left by an
+      // earlier process that had the same pid.
+      return owner.bootId !== currentLockOwnerBootId();
     }
     try {
       process.kill(pid, 0);
@@ -286,7 +312,7 @@ async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise
       await fs.mkdir(lockDir);
       await fs.writeFile(
         path.join(lockDir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({ pid: process.pid, bootId: currentLockOwnerBootId(), createdAt: new Date().toISOString() })}\n`,
         "utf8",
       );
       return async () => {
