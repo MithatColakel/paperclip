@@ -11,6 +11,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
 import { approvalLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "../components/ApprovalPayload";
 import { PageSkeleton } from "../components/PageSkeleton";
+import { HireApprovalEnvironmentField } from "../components/HireApprovalEnvironmentField";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { CheckCircle2, ChevronRight, Sparkles } from "lucide-react";
@@ -27,6 +28,8 @@ export function ApprovalDetail() {
   const [commentBody, setCommentBody] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showRawPayload, setShowRawPayload] = useState(false);
+  // Hire approvals: the approver's environment pick. Undefined keeps the request's.
+  const [hireEnvironmentId, setHireEnvironmentId] = useState<string | null | undefined>(undefined);
 
   const { data: approval, isLoading } = useQuery({
     queryKey: queryKeys.approvals.detail(approvalId!),
@@ -86,7 +89,12 @@ export function ApprovalDetail() {
   };
 
   const approveMutation = useMutation({
-    mutationFn: () => approvalsApi.approve(approvalId!),
+    mutationFn: () =>
+      approvalsApi.approve(
+        approvalId!,
+        undefined,
+        hireEnvironmentId !== undefined ? { defaultEnvironmentId: hireEnvironmentId } : undefined,
+      ),
     onSuccess: () => {
       setError(null);
       refresh();
@@ -221,6 +229,21 @@ export function ApprovalDetail() {
             </div>
           )}
           <ApprovalPayloadRenderer type={approval.type} payload={payload} />
+          {approval.type === "hire_agent" && isActionable && (
+            <HireApprovalEnvironmentField
+              companyId={approval.companyId}
+              adapterType={typeof payload.adapterType === "string" ? payload.adapterType : null}
+              value={
+                hireEnvironmentId !== undefined
+                  ? hireEnvironmentId
+                  : typeof payload.defaultEnvironmentId === "string"
+                    ? payload.defaultEnvironmentId
+                    : null
+              }
+              onChange={setHireEnvironmentId}
+              disabled={approveMutation.isPending}
+            />
+          )}
           <button
             type="button"
             className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors mt-2"

@@ -130,6 +130,7 @@ export const environmentsApi = {
     driver: "local" | "ssh" | "sandbox" | "plugin";
     config?: Record<string, unknown>;
     metadata?: Record<string, unknown> | null;
+    companyId?: string | null;
   }) => api.post<Environment>(`/companies/${companyId}/environments`, body),
   update: (environmentId: string, body: {
     name?: string;
@@ -141,6 +142,8 @@ export const environmentsApi = {
     // write floor admits envVars-only patches there).
     envVars?: Environment["envVars"];
     metadata?: Record<string, unknown> | null;
+    /** Owning company; null shares the environment with every company. */
+    companyId?: string | null;
     // Secret-context company for env var / config writes. Without it the
     // server can only infer a company from existing bindings or a
     // single-membership actor, and fails closed otherwise — a fresh

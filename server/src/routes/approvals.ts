@@ -3,7 +3,9 @@ import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
+  approveApprovalSchema,
   createApprovalSchema,
+  supportedEnvironmentDriversForAdapter,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -20,6 +22,9 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
+import { unprocessable } from "../errors.js";
+import { environmentService } from "../services/environments.js";
+import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
@@ -283,7 +288,7 @@ export function approvalRoutes(
     res.json(issues);
   });
 
-  router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
+  router.post("/approvals/:id/approve", validate(approveApprovalSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     if (!(await requireApprovalAccess(req, id))) {
@@ -291,7 +296,37 @@ export function approvalRoutes(
       return;
     }
     const decidedByUserId = req.actor.userId ?? "board";
-    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    let payloadPatch: Record<string, unknown> | undefined;
+    const pending = await svc.getById(id);
+    if (req.body.defaultEnvironmentId !== undefined && pending?.type !== "hire_agent") {
+      throw unprocessable("An environment can only be chosen when approving a hire.");
+    }
+    if (pending?.type === "hire_agent") {
+      // The approver may pick where the hired agent runs; the pick is written
+      // into the approved payload, which activation applies to the agent.
+      // Whatever environment the hire ends up with is checked here, including
+      // one the requester put in the payload.
+      const payload = pending.payload as Record<string, unknown>;
+      const environmentId =
+        req.body.defaultEnvironmentId !== undefined
+          ? req.body.defaultEnvironmentId
+          : typeof payload.defaultEnvironmentId === "string"
+            ? payload.defaultEnvironmentId
+            : null;
+      const adapterType = typeof payload.adapterType === "string" ? payload.adapterType : "process";
+      await assertEnvironmentSelectionForCompany(
+        environmentService(db),
+        pending.companyId,
+        environmentId,
+        { allowedDrivers: supportedEnvironmentDriversForAdapter(adapterType) },
+      );
+      if (req.body.defaultEnvironmentId !== undefined) {
+        payloadPatch = { defaultEnvironmentId: req.body.defaultEnvironmentId };
+      }
+    }
+    const { approval, applied } = payloadPatch
+      ? await svc.approve(id, decidedByUserId, req.body.decisionNote, { payloadPatch })
+      : await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);

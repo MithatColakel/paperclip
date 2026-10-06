@@ -65,6 +65,8 @@ import {
   workTimelineService,
 } from "../services/index.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { environmentService } from "../services/environments.js";
+import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -1256,6 +1258,10 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     if (!existingCompany) {
       res.status(404).json({ error: "Company not found" });
       return;
+    }
+
+    if (req.actor.type !== "agent" && typeof body.defaultEnvironmentId === "string") {
+      await assertEnvironmentSelectionForCompany(environmentService(db), companyId, body.defaultEnvironmentId);
     }
 
     if (req.actor.type !== "agent") {

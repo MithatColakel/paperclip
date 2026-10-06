@@ -841,6 +841,7 @@ export const ManagementMatrix: Story = {};
 
 const managedKubernetesEnvironment: Environment = {
   id: "env-k8s-storybook",
+  companyId: null,
   name: "Kubernetes Sandbox",
   description: "Managed Kubernetes sandbox environment for hosted tenant execution.",
   driver: "sandbox",

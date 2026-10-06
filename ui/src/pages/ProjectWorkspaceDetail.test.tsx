@@ -127,6 +127,7 @@ function project(overrides: Partial<Project> = {}): Project {
   const workspace = projectWorkspace();
   return {
     id: "project-1",
+    defaultEnvironmentId: null,
     companyId: "company-1",
     urlKey: "paperclip-app",
     goalId: null,

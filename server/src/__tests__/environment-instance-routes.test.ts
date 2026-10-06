@@ -21,6 +21,9 @@ const mockEnvironmentService = vi.hoisted(() => ({
   list: vi.fn(),
   getById: vi.fn(),
   create: vi.fn(),
+  update: vi.fn(),
+  hasUnresolvedPendingCleanupLeases: vi.fn(),
+  countReferencesOutsideCompany: vi.fn(),
 }));
 
 const mockEnvironmentCustomImageService = vi.hoisted(() => ({
@@ -128,6 +131,8 @@ function createApp(actor: Record<string, unknown>) {
   return app;
 }
 
+const OWNER_COMPANY_ID = "11111111-1111-4111-8111-111111111111";
+
 describe("environment instance routes", () => {
   beforeEach(() => {
     mockIssueService.clearExecutionWorkspaceEnvironmentSelection.mockReset();
@@ -138,6 +143,16 @@ describe("environment instance routes", () => {
     mockEnvironmentService.list.mockReset();
     mockEnvironmentService.getById.mockReset();
     mockEnvironmentService.create.mockReset();
+    mockEnvironmentService.update.mockReset();
+    mockEnvironmentService.hasUnresolvedPendingCleanupLeases.mockReset();
+    mockEnvironmentService.hasUnresolvedPendingCleanupLeases.mockResolvedValue(false);
+    mockEnvironmentService.countReferencesOutsideCompany.mockReset();
+    mockEnvironmentService.countReferencesOutsideCompany.mockResolvedValue({
+      agents: 0,
+      projects: 0,
+      companies: 0,
+      instanceDefault: false,
+    });
     Object.values(mockEnvironmentCustomImageService).forEach((mock) => mock.mockReset());
     mockEnvironmentCustomImageService.getOverview.mockResolvedValue({
       activeTemplate: null,
@@ -179,7 +194,8 @@ describe("environment instance routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
-    expect(mockEnvironmentService.list).toHaveBeenCalledWith({
+    // With a company the catalog is the shared environments plus the company's own.
+    expect(mockEnvironmentService.list).toHaveBeenCalledWith("company-1", {
       status: undefined,
       driver: "local",
     });
@@ -201,6 +217,39 @@ describe("environment instance routes", () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(mockEnvironmentService.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows members the sandbox provider but not another company's environment", async () => {
+    const member = {
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", membershipRole: "member", status: "active" }],
+      isInstanceAdmin: false,
+    };
+    mockEnvironmentService.getById.mockResolvedValue(createEnvironment({
+      id: "env-mac",
+      name: "Build Mac",
+      driver: "sandbox",
+      companyId: "company-1",
+      config: { provider: "mac-fleet", deviceId: "device-1", apiKey: "secret" },
+      metadata: { note: "private" },
+    }));
+    const own = await request(createApp(member)).get("/api/environments/env-mac");
+    expect(own.status).toBe(200);
+    // Pickers need the provider to know an adapter can run there; nothing else leaks.
+    expect(own.body.config).toEqual({ provider: "mac-fleet" });
+    expect(own.body.metadata).toBeNull();
+
+    mockEnvironmentService.getById.mockResolvedValue(createEnvironment({
+      id: "env-other",
+      driver: "sandbox",
+      companyId: "company-2",
+      config: { provider: "mac-fleet" },
+    }));
+    const other = await request(createApp(member)).get("/api/environments/env-other");
+    expect(other.status).toBe(404);
   });
 
   it("rejects company agents from enumerating the shared environment catalog", async () => {
@@ -279,6 +328,76 @@ describe("environment instance routes", () => {
     );
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
     expect(mockLogActivity.mock.calls.map((call) => call[1].companyId)).toEqual(["company-1", "company-2"]);
+  });
+
+  it("creates a company-only environment and logs it only to that company", async () => {
+    mockEnvironmentService.create.mockResolvedValue(createEnvironment({
+      id: "env-mac",
+      name: "Build Mac",
+      driver: "ssh",
+      companyId: OWNER_COMPANY_ID,
+      config: { host: "mac.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
+      metadata: null,
+    }));
+    const app = createApp({ type: "board", userId: "board-1", source: "local_implicit", isInstanceAdmin: true });
+
+    const res = await request(app)
+      .post(`/api/companies/${OWNER_COMPANY_ID}/environments`)
+      .send({
+        name: "Build Mac",
+        driver: "ssh",
+        companyId: OWNER_COMPANY_ID,
+        config: { host: "mac.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockEnvironmentService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ companyId: OWNER_COMPANY_ID }),
+      undefined,
+      { db: expect.anything() },
+    );
+    expect(mockLogActivity.mock.calls.map((call) => call[1].companyId)).toEqual([OWNER_COMPANY_ID]);
+  });
+
+  it("refuses to limit an environment to a different company or to limit the local host", async () => {
+    const app = createApp({ type: "board", userId: "board-1", source: "local_implicit", isInstanceAdmin: true });
+
+    const foreign = await request(app)
+      .post(`/api/companies/${OWNER_COMPANY_ID}/environments`)
+      .send({ name: "Build Mac", driver: "ssh", companyId: "22222222-2222-4222-8222-222222222222", config: {} });
+    expect(foreign.status).toBe(422);
+
+    const local = await request(app)
+      .post(`/api/companies/${OWNER_COMPANY_ID}/environments`)
+      .send({ name: "Local", driver: "local", companyId: OWNER_COMPANY_ID, config: {} });
+    expect(local.status).toBe(422);
+    expect(mockEnvironmentService.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses to limit a shared environment while other companies still use it", async () => {
+    mockEnvironmentService.getById.mockResolvedValue(createEnvironment({
+      id: "env-runner",
+      name: "Runner",
+      driver: "ssh",
+      companyId: null,
+      metadata: null,
+    }));
+    mockEnvironmentService.countReferencesOutsideCompany.mockResolvedValue({
+      agents: 2,
+      projects: 0,
+      companies: 0,
+      instanceDefault: false,
+    });
+    const app = createApp({ type: "board", userId: "board-1", source: "local_implicit", isInstanceAdmin: true });
+
+    const res = await request(app)
+      .patch("/api/environments/env-runner")
+      .send({ companyId: OWNER_COMPANY_ID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "environment_used_by_other_companies", agents: 2 });
+    expect(mockEnvironmentService.countReferencesOutsideCompany).toHaveBeenCalledWith("env-runner", OWNER_COMPANY_ID);
+    expect(mockEnvironmentService.update).not.toHaveBeenCalled();
   });
 
   it("normalizes and syncs environment envVars on create", async () => {

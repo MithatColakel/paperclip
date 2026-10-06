@@ -162,6 +162,7 @@ function makeBuiltInAgentState(overrides: Partial<BuiltInAgentState> = {}): Buil
 function makeEnvironment(overrides: Partial<Environment>): Environment {
   return {
     id: "env-1",
+    companyId: null,
     name: "Daytona Sandbox",
     description: null,
     driver: "sandbox",

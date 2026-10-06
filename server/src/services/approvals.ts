@@ -46,6 +46,7 @@ export function approvalService(db: Db) {
     decidedByUserId: string,
     decisionNote: string | null | undefined,
     database: Db = db,
+    payloadPatch?: Record<string, unknown>,
   ): Promise<ResolutionResult> {
     const existing = await getExistingApproval(id, database);
     if (!canResolveStatuses.has(existing.status)) {
@@ -64,6 +65,9 @@ export function approvalService(db: Db) {
         status: targetStatus,
         decidedByUserId,
         decisionNote: decisionNote ?? null,
+        ...(payloadPatch
+          ? { payload: { ...(existing.payload as Record<string, unknown>), ...payloadPatch } }
+          : {}),
         decidedAt: now,
         updatedAt: now,
       })
@@ -140,7 +144,12 @@ export function approvalService(db: Db) {
       return updated;
     },
 
-    approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
+    approve: async (
+      id: string,
+      decidedByUserId: string,
+      decisionNote?: string | null,
+      options?: { payloadPatch?: Record<string, unknown> },
+    ) => {
       const now = new Date();
       const result = await db.transaction(async tx => {
         const txDb = tx as unknown as Db;
@@ -152,6 +161,7 @@ export function approvalService(db: Db) {
           decidedByUserId,
           decisionNote,
           txDb,
+          options?.payloadPatch,
         );
 
         let hireApprovedAgentId: string | null = null;
@@ -177,6 +187,8 @@ export function approvalService(db: Db) {
                   : {},
               budgetMonthlyCents:
                 typeof payload.budgetMonthlyCents === "number" ? payload.budgetMonthlyCents : 0,
+              defaultEnvironmentId:
+                typeof payload.defaultEnvironmentId === "string" ? payload.defaultEnvironmentId : null,
               metadata:
                 typeof payload.metadata === "object" && payload.metadata !== null
                   ? (payload.metadata as Record<string, unknown>)

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -161,6 +161,7 @@ function hasConstraintName(error: unknown, constraintName: string): boolean {
 function toEnvironment(row: EnvironmentRow): Environment {
   return {
     id: row.id,
+    companyId: row.companyId ?? null,
     name: row.name,
     description: row.description ?? null,
     driver: readEnum(row.driver, ENVIRONMENT_DRIVERS, "environment driver") ?? "local",
@@ -181,9 +182,9 @@ type EnvironmentListFilters = {
 function resolveListFilters(
   companyIdOrFilters?: string | EnvironmentListFilters,
   maybeFilters?: EnvironmentListFilters,
-): EnvironmentListFilters {
+): EnvironmentListFilters & { companyId?: string } {
   if (typeof companyIdOrFilters === "string") {
-    return maybeFilters ?? {};
+    return { ...(maybeFilters ?? {}), companyId: companyIdOrFilters };
   }
   return companyIdOrFilters ?? {};
 }
@@ -867,6 +868,10 @@ export function environmentService(db: Db) {
       const conditions = [];
       if (filters.status) conditions.push(eq(environments.status, filters.status));
       if (filters.driver) conditions.push(eq(environments.driver, filters.driver));
+      // With a company, list the shared environments plus the ones it owns.
+      if (filters.companyId) {
+        conditions.push(or(isNull(environments.companyId), eq(environments.companyId, filters.companyId))!);
+      }
       const rows = await db
         .select()
         .from(environments)
@@ -1074,6 +1079,7 @@ export function environmentService(db: Db) {
       const row = await (options?.db ?? db)
         .insert(environments)
         .values({
+          companyId: input.companyId ?? null,
           name: input.name,
           description: input.description ?? null,
           driver: input.driver,
@@ -1114,6 +1120,7 @@ export function environmentService(db: Db) {
       if (patch.description !== undefined) values.description = patch.description ?? null;
       if (patch.driver !== undefined) values.driver = patch.driver;
       if (patch.status !== undefined) values.status = patch.status;
+      if (patch.companyId !== undefined) values.companyId = patch.companyId ?? null;
       if (patch.config !== undefined) values.config = patch.config;
       if ("envVars" in patch && patch.envVars !== undefined) {
         values.envVars = (patch.envVars ?? {}) as Record<string, unknown>;
@@ -1217,6 +1224,38 @@ export function environmentService(db: Db) {
       return countFromRows(rows) > 0;
     },
 
+    /**
+     * Count what would lose access if the environment were limited to one
+     * company: other companies' agents, projects and company defaults that
+     * point at it, and the instance default (which must stay shared).
+     */
+    countReferencesOutsideCompany: async (id: string, companyId: string) => {
+      const [agentRows, projectRows, companyRows, instanceRows] = await Promise.all([
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(agents)
+          .where(and(eq(agents.defaultEnvironmentId, id), ne(agents.companyId, companyId))),
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(projects)
+          .where(and(eq(projects.defaultEnvironmentId, id), ne(projects.companyId, companyId))),
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(companies)
+          .where(and(eq(companies.defaultEnvironmentId, id), ne(companies.id, companyId))),
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(instanceSettings)
+          .where(eq(instanceSettings.defaultEnvironmentId, id)),
+      ]);
+      return {
+        agents: countFromRows(agentRows),
+        projects: countFromRows(projectRows),
+        companies: countFromRows(companyRows),
+        instanceDefault: countFromRows(instanceRows) > 0,
+      };
+    },
+
     getDeleteBlastRadius: async (id: string): Promise<EnvironmentDeleteBlastRadius | null> => {
       const environment = await db
         .select({
@@ -1259,7 +1298,10 @@ export function environmentService(db: Db) {
         db
           .select({ count: sql<number>`count(*)::int` })
           .from(projects)
-          .where(sql`${projects.executionWorkspacePolicy} ->> 'environmentId' = ${id}`),
+          .where(or(
+            eq(projects.defaultEnvironmentId, id),
+            sql`${projects.executionWorkspacePolicy} ->> 'environmentId' = ${id}`,
+          )),
         db
           .select({ count: sql<number>`count(*)::int` })
           .from(companySecretBindings)

@@ -33,6 +33,7 @@ const storybookWorktreeRoot = `${storybookRepoRoot}/.paperclip/worktrees`;
 export const storybookCompanies: Company[] = [
   {
     id: "company-storybook",
+    defaultEnvironmentId: null,
     name: "Paperclip Storybook",
     description: "Fixture company for isolated UI review.",
     status: "active",
@@ -56,6 +57,7 @@ export const storybookCompanies: Company[] = [
   },
   {
     id: "company-research",
+    defaultEnvironmentId: null,
     name: "Research Bureau",
     description: "A second active company for rail and switcher state coverage.",
     status: "active",
@@ -79,6 +81,7 @@ export const storybookCompanies: Company[] = [
   },
   {
     id: "company-paused",
+    defaultEnvironmentId: null,
     name: "Launch Ops",
     description: "Paused company for inactive switcher treatment.",
     status: "paused",
@@ -613,6 +616,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
   const id = overrides.id ?? "project-board-ui";
   return {
     id,
+    defaultEnvironmentId: null,
     companyId: "company-storybook",
     urlKey: "board-ui",
     goalId: "goal-company",

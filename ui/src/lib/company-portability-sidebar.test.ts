@@ -37,6 +37,7 @@ function makeAgent(id: string, name: string): Agent {
 function makeProject(id: string, name: string): Project {
   return {
     id,
+    defaultEnvironmentId: null,
     companyId: "company-1",
     goalId: null,
     urlKey: name.toLowerCase(),

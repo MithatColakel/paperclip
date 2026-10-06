@@ -29,6 +29,66 @@ import {
   ToggleField,
 } from "../components/agent-config-primitives";
 import { InstanceGeneralSettings } from "./InstanceGeneralSettings";
+import { EnvironmentSelect } from "../components/EnvironmentSelect";
+import { useEnvironmentChoices } from "../hooks/useEnvironmentChoices";
+import {
+  hasRemoteEnvironmentChoice,
+  inheritedEnvironmentLabel,
+  resolveInheritedEnvironment,
+} from "../lib/environment-defaults";
+
+/**
+ * The company's default environment: where its agents run unless the agent
+ * or its project picks one. Hidden while the local host is the only option.
+ */
+function CompanyDefaultEnvironmentSection({
+  companyId,
+  value,
+}: {
+  companyId: string;
+  value: string | null;
+}) {
+  const queryClient = useQueryClient();
+  const choices = useEnvironmentChoices(companyId);
+  const mutation = useMutation({
+    mutationFn: (defaultEnvironmentId: string | null) =>
+      companiesApi.update(companyId, { defaultEnvironmentId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    },
+  });
+  if (!choices.ready || (!hasRemoteEnvironmentChoice(choices.environments) && !value)) return null;
+  return (
+    <div className="max-w-2xl space-y-4" data-testid="company-settings-environment-section">
+      <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+        Where agents run
+      </div>
+      <Field
+        label="Default environment"
+        hint="Agents run here unless the agent or its project picks another environment."
+      >
+        <EnvironmentSelect
+          aria-label="Company default environment"
+          environments={choices.environments}
+          value={value}
+          disabled={mutation.isPending}
+          onChange={(next) => mutation.mutate(next)}
+          inheritLabel={inheritedEnvironmentLabel(
+            resolveInheritedEnvironment({
+              environments: choices.environments,
+              instanceDefaultEnvironmentId: choices.instanceDefaultEnvironmentId,
+            }),
+          )}
+        />
+      </Field>
+      {mutation.isError && (
+        <p role="alert" className="text-xs text-destructive">
+          {mutation.error instanceof Error ? mutation.error.message : "Failed to save"}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function CompanySettings() {
   const {
@@ -353,6 +413,11 @@ export function CompanySettings() {
           />
         </div>
       </div>
+
+      <CompanyDefaultEnvironmentSection
+        companyId={selectedCompany.id}
+        value={selectedCompany.defaultEnvironmentId ?? null}
+      />
 
       {/* Interaction governance */}
       <InteractionGovernancePanel

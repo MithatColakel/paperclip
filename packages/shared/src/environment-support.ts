@@ -102,6 +102,35 @@ export function isEnvironmentDriverSupportedForAdapter(
   return supportedEnvironmentDriversForAdapter(adapterType).includes(driver as EnvironmentDriver);
 }
 
+/**
+ * True when a company may select or run in the environment: a shared
+ * environment (no owning company) or one the company owns.
+ */
+export function isEnvironmentAvailableToCompany(
+  environment: { companyId?: string | null },
+  companyId: string,
+): boolean {
+  return !environment.companyId || environment.companyId === companyId;
+}
+
+/**
+ * True when an agent with this adapter can run in the environment: it is
+ * active, its driver is supported, and a sandbox names a real provider (the
+ * built-in `fake` provider is probe-only).
+ */
+export function isEnvironmentRunnableForAdapter(
+  environment: { driver: string; status?: string | null; config?: Record<string, unknown> | null },
+  adapterType: string,
+): boolean {
+  if (environment.status && environment.status !== "active") return false;
+  if (!isEnvironmentDriverSupportedForAdapter(adapterType, environment.driver)) return false;
+  if (environment.driver === "sandbox") {
+    const provider = typeof environment.config?.provider === "string" ? environment.config.provider : "";
+    if (!provider || provider === "fake") return false;
+  }
+  return true;
+}
+
 export function isSandboxProviderSupportedForAdapter(
   adapterType: string,
   provider: string | null | undefined,

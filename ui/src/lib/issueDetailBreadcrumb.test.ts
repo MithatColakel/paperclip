@@ -73,6 +73,7 @@ describe("issueDetailBreadcrumb", () => {
       hiddenAt: null,
       project: {
         id: "project-1",
+        defaultEnvironmentId: null,
         companyId: "company-1",
         urlKey: "paperclip-app",
         goalId: null,

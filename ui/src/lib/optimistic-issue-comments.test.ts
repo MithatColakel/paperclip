@@ -647,6 +647,7 @@ describe("optimistic issue comments", () => {
         blocks: [],
         project: {
           id: "project-1",
+          defaultEnvironmentId: null,
           companyId: "company-1",
           urlKey: "project-one",
           goalId: null,

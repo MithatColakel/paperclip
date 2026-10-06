@@ -553,6 +553,39 @@ describe("execution workspace policy helpers", () => {
     });
   });
 
+  it("keeps the agent's pin over project and company defaults", () => {
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: "agent-env",
+        projectDefaultEnvironmentId: "project-env",
+        companyDefaultEnvironmentId: "company-env",
+        instanceDefaultEnvironmentId: "instance-env",
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({ environmentId: "agent-env", source: "agent" });
+  });
+
+  it("uses the project default, then the company default, before the instance default", () => {
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: null,
+        projectDefaultEnvironmentId: "project-env",
+        companyDefaultEnvironmentId: "company-env",
+        instanceDefaultEnvironmentId: "instance-env",
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({ environmentId: "project-env", source: "project" });
+    expect(
+      resolveExecutionWorkspaceEnvironmentId({
+        agentDefaultEnvironmentId: null,
+        projectDefaultEnvironmentId: null,
+        companyDefaultEnvironmentId: "company-env",
+        instanceDefaultEnvironmentId: "instance-env",
+        localDefaultEnvironmentId: "local-env",
+      }),
+    ).toEqual({ environmentId: "company-env", source: "company" });
+  });
+
   it("falls back to the built-in local environment when neither agent nor instance selects one", () => {
     expect(
       resolveExecutionWorkspaceEnvironmentId({

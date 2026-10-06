@@ -23,9 +23,12 @@ export class ManagedSandboxUnavailableForTestError extends Error {
  * Which environment should an adapter "Test" probe?
  *
  * The resolution mirrors the server run-time resolution
- * (`resolveExecutionWorkspaceEnvironmentId`) across all three tiers: the
- * agent's own environment wins, otherwise the instance default, otherwise the
- * instance local-default environment. The server always resolves a run to one
+ * (`resolveExecutionWorkspaceEnvironmentId`): the agent's own environment
+ * wins, otherwise the company default (pass it only when the adapter can run
+ * there — the server skips it otherwise; see `resolveInheritedEnvironment`),
+ * otherwise the instance default, otherwise the instance local-default
+ * environment. A project default does not apply: tests and sign-in happen for
+ * the agent, outside any project. The server always resolves a run to one
  * of these three tiers, so the Test must probe the same target. Without the
  * local-default tier the Test would send no environment id and probe the
  * Paperclip host, even though a real run resolves to the local-default
@@ -52,6 +55,7 @@ export class ManagedSandboxUnavailableForTestError extends Error {
  */
 export function resolveAdapterTestEnvironmentId(input: {
   agentDefaultEnvironmentId: string | null | undefined;
+  companyDefaultEnvironmentId?: string | null | undefined;
   instanceDefaultEnvironmentId: string | null | undefined;
   localDefaultEnvironmentId: string | null | undefined;
   managedSandboxOnly?: boolean;
@@ -60,6 +64,7 @@ export function resolveAdapterTestEnvironmentId(input: {
 }): string | null {
   const resolved =
     input.agentDefaultEnvironmentId ||
+    input.companyDefaultEnvironmentId ||
     input.instanceDefaultEnvironmentId ||
     input.localDefaultEnvironmentId ||
     null;

@@ -11,6 +11,7 @@ import {
 function makeEnvironment(overrides: Partial<Environment>): Environment {
   return {
     id: "env-id",
+    companyId: null,
     name: "Env",
     description: null,
     driver: "sandbox",

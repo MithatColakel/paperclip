@@ -237,6 +237,7 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
 function makeEnvironment(overrides: Partial<Environment>): Environment {
   return {
     id: "env-1",
+    companyId: null,
     name: "Local",
     description: null,
     driver: "local",

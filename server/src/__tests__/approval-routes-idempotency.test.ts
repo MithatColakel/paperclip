@@ -29,6 +29,7 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockEnvironmentService = vi.hoisted(() => ({ getById: vi.fn() }));
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
@@ -41,6 +42,9 @@ function registerModuleMocks() {
     issueApprovalService: () => mockIssueApprovalService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
+  }));
+  vi.doMock("../services/environments.js", () => ({
+    environmentService: () => mockEnvironmentService,
   }));
 }
 
@@ -260,6 +264,75 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status).toBe(200);
     expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-4", "user-1", "ship it");
+  });
+
+  it("lets the approver pick where a hired agent runs", async () => {
+    const environmentId = "11111111-1111-4111-8111-111111111111";
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-env",
+      companyId: "company-1",
+      type: "hire_agent",
+      status: "pending",
+      payload: { adapterType: "claude_local", defaultEnvironmentId: null },
+      requestedByAgentId: null,
+    });
+    mockEnvironmentService.getById.mockResolvedValue({
+      id: environmentId,
+      companyId: "company-1",
+      driver: "sandbox",
+      status: "active",
+      config: { provider: "mac-fleet" },
+    });
+    mockApprovalService.approve.mockResolvedValue({
+      approval: { id: "approval-env", companyId: "company-1", type: "hire_agent", status: "approved", payload: {} },
+      applied: false,
+    });
+
+    const res = await request(await createApp())
+      .post("/api/approvals/approval-env/approve")
+      .send({ defaultEnvironmentId: environmentId });
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-env", "user-1", undefined, {
+      payloadPatch: { defaultEnvironmentId: environmentId },
+    });
+  });
+
+  it("refuses another company's environment or a non-hire approval", async () => {
+    const environmentId = "11111111-1111-4111-8111-111111111111";
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-env",
+      companyId: "company-1",
+      type: "hire_agent",
+      status: "pending",
+      payload: { adapterType: "claude_local" },
+      requestedByAgentId: null,
+    });
+    mockEnvironmentService.getById.mockResolvedValue({
+      id: environmentId,
+      companyId: "company-2",
+      driver: "sandbox",
+      status: "active",
+      config: { provider: "mac-fleet" },
+    });
+    const foreign = await request(await createApp())
+      .post("/api/approvals/approval-env/approve")
+      .send({ defaultEnvironmentId: environmentId });
+    expect(foreign.status).toBe(422);
+
+    mockApprovalService.getById.mockResolvedValue({
+      id: "approval-budget",
+      companyId: "company-1",
+      type: "approve_ceo_strategy",
+      status: "pending",
+      payload: {},
+      requestedByAgentId: null,
+    });
+    const notHire = await request(await createApp())
+      .post("/api/approvals/approval-budget/approve")
+      .send({ defaultEnvironmentId: environmentId });
+    expect(notHire.status).toBe(422);
+    expect(mockApprovalService.approve).not.toHaveBeenCalled();
   });
 
   it("derives approval attribution from the authenticated actor on reject", async () => {
