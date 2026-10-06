@@ -2,6 +2,7 @@ import path from "node:path";
 import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
 import {
   type SshRemoteExecutionSpec,
+  type SshTransferProcessRegistrar,
   prepareWorkspaceForSshExecution,
   runSshCommand,
   restoreWorkspaceFromSshExecution,
@@ -86,6 +87,40 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+// Escapes a literal for a POSIX extended regular expression (pkill -f).
+function escapeExtendedRegex(value: string): string {
+  return value.replace(/[\\.^$|?*+()[\]{}]/g, "\\$&");
+}
+
+/**
+ * Removes a run's scratch directory on the SSH host (its copied workspace or
+ * its runtime assets) and stops any process still running from it, such as an
+ * orphaned callback-bridge server. Best effort: a failure only leaves files
+ * behind. The path is split across shell variables so the process match never
+ * matches this cleanup command itself.
+ */
+export async function removeRemoteRunScratchDir(
+  spec: SshRemoteExecutionSpec,
+  scratchDir: string,
+  runId: string,
+): Promise<void> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId) || path.posix.basename(scratchDir) !== runId) return;
+  const parentDir = path.posix.dirname(scratchDir);
+  if (!path.posix.isAbsolute(parentDir) || parentDir === "/") return;
+  const pattern = `[${scratchDir[0]}]${escapeExtendedRegex(scratchDir.slice(1))}/`;
+  const script = [
+    `parent=${shellQuote(parentDir)}`,
+    `run=${shellQuote(runId)}`,
+    'dir="$parent/$run"',
+    '[ -d "$dir" ] || exit 0',
+    `pkill -TERM -f ${shellQuote(pattern)} >/dev/null 2>&1 || true`,
+    'rm -rf -- "$dir"',
+  ].join("\n");
+  await runSshCommand(spec, script, { timeoutMs: 120_000, maxBuffer: 64 * 1024 }).catch((error) => {
+    console.warn(`[paperclip] Could not remove the run's remote scratch directory ${scratchDir}: ${String(error)}`);
+  });
+}
+
 async function readRemoteFile(spec: SshRemoteExecutionSpec, remotePath: string): Promise<Buffer> {
   const result = await runSshCommand(spec, `base64 < ${shellQuote(remotePath)}`, {
     maxBuffer: 1024 * 1024,
@@ -133,34 +168,52 @@ export async function prepareRemoteManagedRuntime(input: {
   // Upload progress sink. Threaded for the byte-counting transport rewrite; the
   // child task wires it into the workspace/asset transfers.
   onProgress?: RuntimeProgressSink;
+  /**
+   * A per-run directory for the runtime assets, outside the workspace. A device
+   * workspace that stays on the host between runs must not collect copied
+   * credentials and skills inside its git worktree. Removed after the restore.
+   */
+  runtimeRemoteDir?: string;
+  /** Exposes each upload process to the run's cancellation for its duration. */
+  registerTransferProcess?: SshTransferProcessRegistrar;
 }): Promise<PreparedRemoteManagedRuntime> {
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const syncWorkspace = input.syncWorkspace !== false;
+  // A copied workspace lives in its own per-run directory; nothing else uses
+  // it once the run's changes are back, so it is removed after the restore.
+  const runScratchDir = syncWorkspace
+    ? path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs", input.runId)
+    : input.runtimeRemoteDir ?? null;
   const workspaceRemoteDir = syncWorkspace
-    ? path.posix.join(
-        baseWorkspaceRemoteDir,
-        ".paperclip-runtime",
-        "runs",
-        input.runId,
-        "workspace",
-      )
+    ? path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs", input.runId, "workspace")
     : baseWorkspaceRemoteDir;
-  const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  const runtimeRootDir = input.runtimeRemoteDir
+    ? path.posix.join(input.runtimeRemoteDir, input.adapterKey)
+    : path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
 
-  const preparedWorkspace = syncWorkspace
-    ? await prepareWorkspaceForSshExecution({
+  let preparedWorkspace: Awaited<ReturnType<typeof prepareWorkspaceForSshExecution>> | null = null;
+  if (syncWorkspace) {
+    try {
+      preparedWorkspace = await prepareWorkspaceForSshExecution({
         spec: input.spec,
         localDir: input.workspaceLocalDir,
         remoteDir: workspaceRemoteDir,
         onProgress: input.onProgress,
         workspaceFileMode: input.workspaceFileMode,
         workspaceExclude: input.workspaceExclude,
-      })
-    : null;
+        registerTransferProcess: input.registerTransferProcess,
+      });
+    } catch (error) {
+      // Nothing ran there yet, so a partial upload holds no work to keep.
+      if (runScratchDir) await removeRemoteRunScratchDir(input.spec, runScratchDir, input.runId);
+      throw error;
+    }
+  }
+  const ignoredPaths = preparedWorkspace?.ignoredPaths ?? [];
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES]
+          ? [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES, ...ignoredPaths]
           : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
       })
     : null;
@@ -178,6 +231,7 @@ export async function prepareRemoteManagedRuntime(input: {
         exclude: asset.exclude,
         onProgress: input.onProgress,
         progressLabel: asset.key,
+        registerTransferProcess: input.registerTransferProcess,
       });
     }
   } catch (error) {
@@ -187,10 +241,12 @@ export async function prepareRemoteManagedRuntime(input: {
         localDir: input.workspaceLocalDir,
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
+        ignoredPaths,
         restoreGitHistory: preparedWorkspace.gitBacked,
         onProgress: input.onProgress,
       });
     }
+    if (runScratchDir) await removeRemoteRunScratchDir(input.spec, runScratchDir, input.runId);
     throw error;
   }
 
@@ -249,14 +305,25 @@ export async function prepareRemoteManagedRuntime(input: {
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
       if (preparedWorkspace && baselineSnapshot) {
-        await restoreWorkspaceFromSshExecution({
-          spec: input.spec,
-          localDir: input.workspaceLocalDir,
-          remoteDir: workspaceRemoteDir,
-          baselineSnapshot,
-          restoreGitHistory: preparedWorkspace.gitBacked,
-          onProgress,
-        });
+        try {
+          await restoreWorkspaceFromSshExecution({
+            spec: input.spec,
+            localDir: input.workspaceLocalDir,
+            remoteDir: workspaceRemoteDir,
+            baselineSnapshot,
+            ignoredPaths,
+            restoreGitHistory: preparedWorkspace.gitBacked,
+            onProgress,
+          });
+        } catch (error) {
+          // The remote copy may now hold the run's only copy of its work.
+          if (runScratchDir) {
+            console.warn(
+              `[paperclip] Workspace restore failed; the run's remote copy stays at ${input.spec.username}@${input.spec.host}:${runScratchDir}.`,
+            );
+          }
+          throw error;
+        }
       }
       for (const asset of input.assets ?? []) {
         if (!asset.restore) continue;
@@ -265,6 +332,7 @@ export async function prepareRemoteManagedRuntime(input: {
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
       }
+      if (runScratchDir) await removeRemoteRunScratchDir(input.spec, runScratchDir, input.runId);
     },
   };
 }

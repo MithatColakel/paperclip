@@ -71,11 +71,18 @@ import {
   type DuplexObservabilityRecorder,
   type Http2TelemetryEventName,
 } from "./duplex-observability.js";
-import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
+import {
+  createSshCommandManagedRuntimeRunner,
+  parseSshRemoteExecutionSpec,
+  runSshCommand,
+  shellQuote,
+  type SshTransferProcessRegistrar,
+} from "./ssh.js";
 import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
+  runningProcesses,
   type RunProcessResult,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
@@ -1424,6 +1431,21 @@ export function readAdapterExecutionTarget(input: {
   );
 }
 
+// While an SSH upload runs, no agent process exists yet, so a cancelled run
+// had nothing to stop and its upload kept going. Registering the transfer's
+// ssh process as the run's process lets the existing cancel and shutdown paths
+// stop it; the transport treats the resulting broken pipe as a failed transfer.
+function registerRunTransferProcess(runId: string): SshTransferProcessRegistrar {
+  return (child) => {
+    if (runningProcesses.has(runId)) return () => undefined;
+    const entry = { child, graceSec: 5, processGroupId: null };
+    runningProcesses.set(runId, entry);
+    return () => {
+      if (runningProcesses.get(runId) === entry) runningProcesses.delete(runId);
+    };
+  };
+}
+
 export async function prepareAdapterExecutionTargetRuntime(input: {
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
@@ -1457,6 +1479,11 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   // so the host pack time rides one `pack` span under the `stage.sync` step. The
   // SSH and local lanes ignore it. The default is a no-op.
   runtimeSpan?: RuntimeSpanRunner;
+  /**
+   * SSH only: a per-run directory for runtime assets outside the workspace,
+   * for a device workspace that stays on the host (`in_place`).
+   */
+  runtimeRemoteDir?: string;
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
   const target = input.target ?? { kind: "local" as const };
   if (target.kind === "local") {
@@ -1485,6 +1512,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       assets: input.assets,
       additionalSources: input.additionalSources,
       onProgress: input.onProgress,
+      runtimeRemoteDir: input.runtimeRemoteDir,
+      registerTransferProcess: registerRunTransferProcess(input.runId),
     });
     return {
       target,
