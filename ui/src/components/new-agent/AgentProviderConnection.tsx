@@ -23,6 +23,8 @@ import { CredentialModeLink } from "../onboarding/CredentialModeLink";
 import { FooterNav } from "../onboarding/FooterNav";
 import { MAKE_ROOM, CARD_ENTER } from "../onboarding/onboarding-motion";
 import { buildFixedClaudeOAuthBinding } from "../environment-variables-editor/model";
+import { ClaudeTokenSourcePicker, type ClaudeTokenSource } from "../ai-connections/ClaudeTokenSourcePicker";
+import { useMacClaudeToken } from "../ai-connections/useMacClaudeToken";
 import type { EnvBinding } from "@paperclipai/shared";
 
 export type ProviderConnection = {
@@ -87,6 +89,7 @@ export function AgentProviderConnection({
   const phaseBeforeSubmit = useRef<"ready" | "waiting">("ready");
   const [apiKey, setApiKey] = useState("");
   const [setupToken, setSetupToken] = useState("");
+  const [tokenSource, setTokenSource] = useState<ClaudeTokenSource | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storedConnection, setStoredConnection] =
@@ -150,6 +153,12 @@ export function AgentProviderConnection({
     !savedSubscription &&
     !storedLogin.data;
   const pastedSetupToken = setupToken.replace(/\s+/g, "");
+  // A Mac's token connects as soon as it arrives; the board user already asked for it.
+  const macToken = useMacClaudeToken(companyId, (token) => {
+    setSetupToken(token);
+    void connect(token);
+  }, Boolean(managedAccount) && tokenSubscription);
+  const macWaiting = macToken.status === "requesting" || macToken.status === "pending" || macToken.status === "collecting";
   const auth = useQuery({
     queryKey: queryKeys.agents.authSignal(
       companyId,
@@ -165,7 +174,7 @@ export function AgentProviderConnection({
     retry: false,
     enabled: !managedAccount,
   });
-  async function connect() {
+  async function connect(receivedToken?: string) {
     if (busy || managedAccount?.disabled) return;
     const run = ++epoch.current;
     setBusy(true);
@@ -173,7 +182,7 @@ export function AgentProviderConnection({
     try {
       if (managedAccount && managedIntent) {
         if (tokenSubscription) {
-          const result = savedManagedAccount.current ?? await aiConnectionsApi.create(companyId, { ...managedIntent, method: "subscription", setupToken: pastedSetupToken });
+          const result = savedManagedAccount.current ?? await aiConnectionsApi.create(companyId, { ...managedIntent, method: "subscription", setupToken: receivedToken?.replace(/\s+/g, "") ?? pastedSetupToken });
           savedManagedAccount.current = result;
           setSetupToken("");
           if (run === epoch.current) managedAccount.onComplete({ ...result, method: "subscription" });
@@ -395,6 +404,24 @@ export function AgentProviderConnection({
               />
             ) : savedSubscription ? null : canUseLocalLogin && !storedLogin.data ? (
               <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { setError(null); localLogin.retry(); } }} />
+            ) : tokenSubscription && managedAccount ? (
+              <OnboardingLoginCard instruction="Connect a Claude subscription">
+                <ClaudeTokenSourcePicker
+                  source={tokenSource}
+                  onSourceChange={(next) => {
+                    setTokenSource(next);
+                    setError(null);
+                  }}
+                  mac={macToken}
+                  token={setupToken}
+                  onTokenChange={(value) => {
+                    setSetupToken(value);
+                    setError(null);
+                  }}
+                  onSubmit={() => void connect()}
+                  disabled={busy}
+                />
+              </OnboardingLoginCard>
             ) : tokenSubscription ? (
               <OnboardingLoginCard instruction="Connect a Claude subscription with a setup token">
                 <p className="text-sm text-muted-foreground">
@@ -453,6 +480,8 @@ export function AgentProviderConnection({
               : `Sign in to ${provider}`
             : busy
             ? "Connecting"
+            : managedAccount && tokenSubscription && tokenSource === "mac"
+              ? macWaiting ? "Waiting for the Mac" : "Request from Mac"
             : method === "subscription" &&
                 (storedLogin.data || savedSubscription)
               ? "Use saved subscription"
@@ -462,7 +491,9 @@ export function AgentProviderConnection({
         }
         primaryDisabled={
           managedAccount?.disabled ||
-          (Boolean(managedAccount) && method === "subscription" && !canLogin && !canUseLocalLogin && !(tokenSubscription && pastedSetupToken)) ||
+          (Boolean(managedAccount) && method === "subscription" && !canLogin && !canUseLocalLogin && !(tokenSubscription && (
+            tokenSource === "token" ? pastedSetupToken : tokenSource === "mac" && macToken.deviceId && !macWaiting
+          ))) ||
           (localEnvironment && health.isPending) || localLogin.preparing || Boolean(localLogin.error) ||
           (!managedAccount && auth.isPending) ||
           savedKeys.loading ||
@@ -481,7 +512,8 @@ export function AgentProviderConnection({
             if (!authorizationUrl || loginPhase !== "ready") return;
             window.open(authorizationUrl, "_blank", "noreferrer,noopener");
             setLoginPhase("waiting");
-          } else void connect();
+          } else if (managedAccount && tokenSubscription && tokenSource === "mac") void macToken.start();
+          else void connect();
         }}
       />
     </div>
