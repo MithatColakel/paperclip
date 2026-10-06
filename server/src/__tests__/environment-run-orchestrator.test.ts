@@ -17,9 +17,13 @@ vi.mock("../services/environment-execution-target.js", () => ({
   resolveEnvironmentExecutionTransport: vi.fn().mockResolvedValue(null),
 }));
 
-vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
-  adapterExecutionTargetToRemoteSpec: mockAdapterExecutionTargetToRemoteSpec,
-}));
+vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/execution-target")>();
+  return {
+    adapterExecutionTargetToRemoteSpec: mockAdapterExecutionTargetToRemoteSpec,
+    overrideAdapterExecutionTargetRemoteCwd: actual.overrideAdapterExecutionTargetRemoteCwd,
+  };
+});
 
 vi.mock("../services/workspace-realization.js", () => ({
   buildWorkspaceRealizationRequest: mockBuildWorkspaceRealizationRequest,
@@ -336,6 +340,50 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
         pathAliases: [],
         outboundRestorePaths: [],
       },
+    }));
+  });
+
+  it("moves the SSH spec to an in-place root too, so the agent process starts there", async () => {
+    const deviceWorktree = "/device/root/.paperclip-device/worktrees/company-1/ew-1";
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+      kind: "remote",
+      transport: "ssh",
+      remoteCwd: "/device/root",
+      spec: {
+        host: "device",
+        port: 22,
+        username: "fixture",
+        remoteWorkspacePath: "/device/root",
+        remoteCwd: "/device/root",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: deviceWorktree,
+        metadata: {
+          workspaceRealization: {
+            version: 1,
+            mode: "in_place",
+            authoritativeRoot: deviceWorktree,
+            pathAliases: [],
+            outboundRestorePaths: [],
+          },
+        },
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const result = await orchestrator.realizeForRun(
+      makeRealizeInput({ environment: makeEnvironment("sandbox") }),
+    );
+
+    expect(result.executionTarget).toEqual(expect.objectContaining({
+      transport: "ssh",
+      remoteCwd: deviceWorktree,
+      spec: expect.objectContaining({ remoteCwd: deviceWorktree, remoteWorkspacePath: "/device/root" }),
     }));
   });
 

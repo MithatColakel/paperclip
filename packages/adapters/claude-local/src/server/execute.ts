@@ -53,6 +53,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
+import { isDeviceWorktreePath } from "@paperclipai/adapter-utils/device-workspace";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -608,11 +609,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const claudeConfigSeedDir = useManagedRemoteClaudeConfig
     ? config.managedAiConnection ? sharedClaudeConfigDir : await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
     : null;
+  // SSH device mode: the workspace already lives on the host, so only the
+  // runtime assets move and the run ends with a push instead of a restore.
+  const deviceWorkspaceRoot = executionTarget?.kind === "remote"
+    && executionTarget.workspaceRealization?.mode === "in_place"
+    && isDeviceWorktreePath(executionTarget.workspaceRealization.authoritativeRoot)
+    ? executionTarget.workspaceRealization.authoritativeRoot
+    : null;
   const preparedExecutionTargetRuntime = executionTargetIsRemote
     ? await (async () => {
         await onLog(
           "stdout",
-          `[paperclip] Syncing workspace and Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+          deviceWorkspaceRoot
+            ? `[paperclip] Using the device workspace ${deviceWorkspaceRoot}; syncing Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`
+            : `[paperclip] Syncing workspace and Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
         );
         return await prepareAdapterExecutionTargetRuntime({
           runId,
@@ -1366,7 +1376,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (restoreRemoteWorkspace) {
       await onLog(
         "stdout",
-        `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+        deviceWorkspaceRoot
+          ? `[paperclip] Finishing the device workspace run on ${describeAdapterExecutionTarget(executionTarget)}.\n`
+          : `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       );
       await restoreRemoteWorkspace();
     }
