@@ -324,6 +324,60 @@ describe("remote managed runtime", () => {
     }
   });
 
+  it("removes the run's copied workspace after a restore, and keeps it when the restore fails", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-scratch-"));
+    cleanupDirs.push(workspaceDir);
+    const target = {
+      host: "127.0.0.1",
+      port: 2222,
+      username: "fixture",
+      remoteWorkspacePath: "/remote",
+      remoteCwd: "/remote",
+      privateKey: null,
+      knownHosts: null,
+      strictHostKeyChecking: true,
+    };
+    prepareWorkspaceForSshExecution.mockResolvedValue({ gitBacked: true, ignoredPaths: ["Package/.build"] } as never);
+    const scratchRemovals = () => runSshCommand.mock.calls
+      .filter((call) => String((call as unknown[])[1]).includes('rm -rf -- "$dir"'));
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: target,
+      runId: "run-1",
+      adapterKey: "claude",
+      workspaceLocalDir: workspaceDir,
+    });
+    await prepared.restoreWorkspace();
+
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/remote/.paperclip-runtime/runs/run-1/workspace",
+      ignoredPaths: ["Package/.build"],
+      baselineSnapshot: expect.objectContaining({
+        exclude: expect.arrayContaining(["Package/.build", ".paperclip-runtime"]),
+      }),
+    }));
+    expect(scratchRemovals()).toHaveLength(1);
+    expect(String((scratchRemovals()[0] as unknown[])[1])).toContain("parent='/remote/.paperclip-runtime/runs'");
+
+    runSshCommand.mockClear();
+    restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("Connection closed") as never);
+    const failing = await prepareRemoteManagedRuntime({
+      spec: target,
+      runId: "run-2",
+      adapterKey: "claude",
+      workspaceLocalDir: workspaceDir,
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(failing.restoreWorkspace()).rejects.toThrow("Connection closed");
+    } finally {
+      warnSpy.mockRestore();
+    }
+    expect(scratchRemovals()).toHaveLength(0);
+    prepareWorkspaceForSshExecution.mockReset();
+    prepareWorkspaceForSshExecution.mockImplementation(async () => ({ gitBacked: false }) as never);
+  });
+
   it("keeps nested repository .git entries that a git-backed upload never sends", async () => {
     const localDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-local-"));
     const remoteCopyDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-copy-"));
