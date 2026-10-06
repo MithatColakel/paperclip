@@ -143,6 +143,7 @@ Human auth tables (`users`, `sessions`, and provider-specific auth artifacts) ar
 - `budget_monthly_cents` int not null default 0
 - `spent_monthly_cents` int not null default 0
 - `require_board_approval_for_new_agents` boolean not null default false
+- `default_environment_id` uuid fk `environments.id` null (on delete set null)
 - feedback sharing consent fields
 
 Invariant: every business record belongs to exactly one company.
@@ -212,6 +213,7 @@ Invariant: at least one root `company` level goal per company.
 - `lead_agent_id` uuid fk `agents.id` null
 - `target_date` date null
 - `env` jsonb null (same secret-aware env binding format used by agent config)
+- `default_environment_id` uuid fk `environments.id` null (on delete set null)
 
 Invariant:
 
@@ -473,6 +475,28 @@ The current implementation includes additional V1-control-plane tables beyond th
 - Execution and workspace control: `execution_workspaces`, `project_workspaces`, `workspace_runtime_services`, `workspace_operations`, `environments`, `environment_leases`, `agent_task_sessions`, `agent_runtime_state`, `agent_wakeup_requests`, heartbeat events, and watchdog decision tables.
 - Plugins and routines: `plugins`, plugin config/state/entities/jobs/logs/webhooks, plugin database namespaces/migrations, plugin company settings, `routines`, `routine_revisions`, `routine_triggers`, and `routine_runs`.
 - Access and operations: company memberships, instance roles, principal permission grants, invites, join requests, board API keys, CLI auth challenges, budget policies/incidents, feedback exports/votes, company skills, sidebar preferences, and company logos.
+
+Execution environments (`environments`) are instance rows with an optional
+`company_id`. A null `company_id` shares the environment with every company; a
+company id limits selection, runs, and its activity log entries to that company.
+The local host and platform-managed environments are always shared. An
+environment can be limited to one company only while no other company's agents,
+projects, or company default (and not the instance default) point at it.
+
+A run's environment is resolved in this order:
+
+1. the agent's own `default_environment_id` (a pin);
+2. the project's `default_environment_id`, for runs in that project;
+3. the company's `default_environment_id`;
+4. the instance default environment;
+5. the local host.
+
+Project and company defaults are inherited, so a default the agent cannot use
+(archived, owned by another company, or a driver its adapter does not support)
+is skipped rather than failing the run. Managed-sandbox-only and forced
+Kubernetes execution still apply after this resolution. The board picks the
+environment when creating an agent (before connecting its model), when creating
+a project, in company settings, and when approving a hire.
 
 Decision-desk triage uses company-scoped sidecars rather than adding queue fields to every attention source:
 

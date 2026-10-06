@@ -377,6 +377,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
   };
   return {
     id: "project-1",
+    defaultEnvironmentId: null,
     companyId: "company-1",
     urlKey: "project-1",
     goalId: null,

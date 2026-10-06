@@ -38,6 +38,7 @@ describe("resolvePaperclipRunnerTransitionModel", () => {
 function makeEnvironment(overrides: Partial<Environment>): Environment {
   return {
     id: "env-1",
+    companyId: null,
     name: "Env",
     description: null,
     driver: "local",

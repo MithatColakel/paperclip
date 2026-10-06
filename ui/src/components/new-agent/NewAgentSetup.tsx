@@ -21,7 +21,7 @@ import type {
   Agent,
   EnvBinding,
 } from "@paperclipai/shared";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, isEnvironmentRunnableForAdapter } from "@paperclipai/shared";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { agentsApi } from "@/api/agents";
 import { adaptersApi } from "@/api/adapters";
@@ -41,6 +41,12 @@ import {
 } from "@/lib/adapter-test-environment";
 import { resolveForcedKubernetesEnvironment } from "@/lib/forced-kubernetes-environment";
 import { environmentDisplayLabel } from "@/lib/managed-sandbox-environment";
+import {
+  hasRemoteEnvironmentChoice,
+  inheritedEnvironmentLabel,
+  resolveInheritedEnvironment,
+} from "@/lib/environment-defaults";
+import { EnvironmentSelect } from "../EnvironmentSelect";
 import { buildNewAgentRuntimeConfig } from "@/lib/new-agent-runtime-config";
 import {
   PROVIDER_ENV_KEYS,
@@ -107,6 +113,7 @@ function Setup({
 }) {
   const navigate = useNavigate();
   const cache = useQueryClient();
+  const { companies } = useCompany();
   const { openNewIssue } = useDialogActions();
   const appearanceDraft = useAgentAppearanceDraft(`${companyId}:new-agent`);
   const isRunner = adapterType === "paperclip_runner";
@@ -234,6 +241,13 @@ function Setup({
     envs.data ?? [],
   );
   const managedOnly = experimental.data?.enableManagedSandboxOnly === true;
+  // A new agent with no pick of its own follows the company default, when
+  // this adapter can run there (the server skips it otherwise).
+  const companyDefaultEnvironment = (() => {
+    const id = companies.find((entry) => entry.id === companyId)?.defaultEnvironmentId;
+    const env = id ? envs.data?.find((entry) => entry.id === id) : undefined;
+    return env && isEnvironmentRunnableForAdapter(env, adapterType) ? env : null;
+  })();
   let environmentId: string | null = null;
   let environmentError: string | null = null;
   try {
@@ -241,6 +255,7 @@ function Setup({
       ? (forced.kubernetesEnvironment?.id ?? null)
       : resolveAdapterTestEnvironmentId({
           agentDefaultEnvironmentId: environmentOverride || null,
+          companyDefaultEnvironmentId: companyDefaultEnvironment?.id ?? null,
           instanceDefaultEnvironmentId:
             settings.data?.defaultEnvironmentId ?? null,
           localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(
@@ -616,6 +631,34 @@ function Setup({
         : confirmationEnvironment
           ? environmentDisplayLabel(confirmationEnvironment)
           : "Local machine";
+  const showEnvironmentPicker = !["cursor_cloud", "hermes_gateway"].includes(adapterType);
+  // Ask where the agent runs before connecting a model: the sign-in and the
+  // connection test happen in that environment.
+  const askEnvironmentBeforeConnect =
+    showEnvironmentPicker && hasRemoteEnvironmentChoice(envs.data ?? [], adapterType);
+  const renderEnvironmentPicker = (id: string) => (
+    <EnvironmentSelect
+      id={id}
+      environments={envs.data ?? []}
+      adapterType={adapterType}
+      value={environmentOverride || null}
+      disabled={forced.forced || managedOnly}
+      inheritLabel={inheritedEnvironmentLabel(
+        resolveInheritedEnvironment({
+          environments: envs.data ?? [],
+          companyDefaultEnvironmentId: companyDefaultEnvironment?.id ?? null,
+          instanceDefaultEnvironmentId: settings.data?.defaultEnvironmentId ?? null,
+          adapterType,
+        }),
+      )}
+      onChange={(next) => {
+        setEnvironmentOverride(next ?? "");
+        setConnection(null);
+        resetTest();
+        if (connectionAdapter) setScreen("connect");
+      }}
+    />
+  );
   const setupError =
     adapters.error ??
     envs.error ??
@@ -717,6 +760,21 @@ function Setup({
                         center
                       />
                     </div>
+                    {askEnvironmentBeforeConnect && (
+                      <div className="mb-8 space-y-2">
+                        <label
+                          htmlFor="new-agent-environment-connect"
+                          className="text-sm font-medium"
+                        >
+                          Where will {name} run?
+                        </label>
+                        {renderEnvironmentPicker("new-agent-environment-connect")}
+                        <p className="text-xs text-muted-foreground">
+                          The model sign-in and the connection test run on this
+                          machine.
+                        </p>
+                      </div>
+                    )}
                     <AgentProviderConnection
                       key={environmentId ?? "local"}
                       companyId={companyId}
@@ -1097,34 +1155,10 @@ function Setup({
                           </div>
                         )}
                       </section>
-                      {!["cursor_cloud", "hermes_gateway"].includes(
-                        adapterType,
-                      ) && (
+                      {showEnvironmentPicker && (
                         <section className="space-y-5">
                           <h3 className="text-sm font-semibold">Environment</h3>
-                          <select
-                            aria-label="Environment"
-                            className={controlClass}
-                            value={environmentOverride}
-                            disabled={forced.forced || managedOnly}
-                            onChange={(event) => {
-                              setEnvironmentOverride(event.target.value);
-                              setConnection(null);
-                              resetTest();
-                              if (connectionAdapter) setScreen("connect");
-                            }}
-                          >
-                            <option value="">
-                              Default: {environmentLabel}
-                            </option>
-                            {(envs.data ?? [])
-                              .filter((env) => env.status === "active")
-                              .map((env) => (
-                                <option key={env.id} value={env.id}>
-                                  {environmentDisplayLabel(env)}
-                                </option>
-                              ))}
-                          </select>
+                          {renderEnvironmentPicker("new-agent-environment")}
                         </section>
                       )}
                     </fieldset>

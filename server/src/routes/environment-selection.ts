@@ -4,12 +4,13 @@ export async function assertEnvironmentSelectionForCompany(
   environmentsSvc: {
     getById(environmentId: string): Promise<{
       id: string;
+      companyId?: string | null;
       driver: string;
       status?: string | null;
       config: Record<string, unknown> | null;
     } | null>;
   },
-  _companyId: string,
+  companyId: string,
   environmentId: string | null | undefined,
   options?: {
     allowedDrivers?: string[];
@@ -23,6 +24,9 @@ export async function assertEnvironmentSelectionForCompany(
   }
   if (environment.status === "archived") {
     throw unprocessable("Environment is archived.");
+  }
+  if (environment.companyId && environment.companyId !== companyId) {
+    throw unprocessable("Environment belongs to another company.");
   }
   if (options?.allowedDrivers && !options.allowedDrivers.includes(environment.driver)) {
     throw unprocessable(

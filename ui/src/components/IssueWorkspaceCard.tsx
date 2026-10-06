@@ -171,6 +171,7 @@ interface IssueWorkspaceCardProps {
       defaultProjectWorkspaceId?: string | null;
       environmentId?: string | null;
     } | null;
+    defaultEnvironmentId?: string | null;
     workspaces?: Array<{ id: string; isPrimary: boolean }>;
   } | null;
   onUpdate: (data: Record<string, unknown>) => void;
@@ -252,7 +253,7 @@ export function IssueWorkspaceCard({
   const [draftSelection, setDraftSelection] = useState(currentSelection);
   const [draftExecutionWorkspaceId, setDraftExecutionWorkspaceId] = useState(issue.executionWorkspaceId ?? "");
   const projectEnvironmentId = environmentsEnabled
-    ? project?.executionWorkspacePolicy?.environmentId ?? null
+    ? project?.defaultEnvironmentId ?? project?.executionWorkspacePolicy?.environmentId ?? null
     : null;
   const currentReusableEnvironmentId = selectedReusableExecutionWorkspace?.config?.environmentId ?? null;
   const currentEnvironmentId = environmentsEnabled

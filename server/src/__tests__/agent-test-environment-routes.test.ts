@@ -93,6 +93,11 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
 }));
 
+const mockResolveInheritedEnvironmentDefaults = vi.hoisted(() => vi.fn());
+vi.mock("../services/environment-defaults.js", () => ({
+  resolveInheritedEnvironmentDefaults: mockResolveInheritedEnvironmentDefaults,
+}));
+
 const testEnvironmentSpy = vi.fn();
 
 const externalAdapter: ServerAdapterModule = {
@@ -183,6 +188,10 @@ describe("agent test-environment route", () => {
     vi.resetModules();
     vi.clearAllMocks();
     mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: null });
+    mockResolveInheritedEnvironmentDefaults.mockResolvedValue({
+      projectDefaultEnvironmentId: null,
+      companyDefaultEnvironmentId: null,
+    });
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableManagedSandboxOnly: false });
     mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
     mockAccessService.decide.mockResolvedValue({
@@ -259,6 +268,55 @@ describe("agent test-environment route", () => {
     expect(mockEnvironmentRuntime.acquireRunLease).toHaveBeenCalled();
     expect(testEnvironmentSpy).toHaveBeenCalledWith(expect.objectContaining({ executionTarget: target }));
     expect(mockReleaseRunLease).toHaveBeenCalled();
+  });
+
+  it("refuses to pin an agent to another company's environment without revealing it", async () => {
+    const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    mockAgentService.getById.mockResolvedValue({
+      id: agentId, companyId: "company-1", adapterType: "external_test",
+      adapterConfig: {}, runtimeConfig: {}, defaultEnvironmentId: null, status: "idle",
+    });
+    mockEnvironmentService.getById.mockResolvedValue({
+      id: "55555555-5555-4555-8555-555555555555",
+      companyId: "company-2",
+      name: "Other company Mac",
+      driver: "sandbox",
+      status: "active",
+      config: { provider: "mac-fleet" },
+    });
+    const app = await createApp();
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ defaultEnvironmentId: "55555555-5555-4555-8555-555555555555" });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("Environment belongs to another company.");
+  });
+
+  it("tests the company default ahead of the instance default when the agent inherits", async () => {
+    const companyDefaultId = "44444444-4444-4444-8444-444444444444";
+    mockInstanceSettingsService.get.mockResolvedValue({ defaultEnvironmentId: "11111111-1111-4111-8111-111111111111" });
+    mockResolveInheritedEnvironmentDefaults.mockResolvedValue({
+      projectDefaultEnvironmentId: null,
+      companyDefaultEnvironmentId: companyDefaultId,
+    });
+    mockEnvironmentService.getById.mockImplementation(async (id) => ({
+      id, name: "Company Mac", driver: "sandbox", status: "active", config: { provider: "fake-plugin" },
+    }));
+    const target = { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "daytona", runner: { execute: vi.fn() } };
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(target);
+    const app = await createApp();
+    const res = await request(app)
+      .post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({ adapterConfig: {}, environmentId: null });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockResolveInheritedEnvironmentDefaults).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      { companyId: "company-1", adapterType: "external_test" },
+    );
+    expect(mockEnvironmentRuntime.acquireRunLease).toHaveBeenCalledWith(expect.objectContaining({
+      environment: expect.objectContaining({ id: companyDefaultId }),
+    }));
   });
 
   it.each([

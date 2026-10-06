@@ -65,6 +65,7 @@ async function act(callback: () => void | Promise<void>) {
 function makeProject(overrides: Partial<Project>): Project {
   return {
     id: "project-a",
+    defaultEnvironmentId: null,
     companyId: "company-1",
     urlKey: "alpha",
     goalId: null,

@@ -568,9 +568,10 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
-import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import { extractSkillMentionIds, isEnvironmentAvailableToCompany, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
+import { resolveInheritedEnvironmentDefaults } from "./environment-defaults.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 import {
@@ -20469,6 +20470,7 @@ export function heartbeatService(
                   )),
               ).mapWith(Boolean),
               env: projects.env,
+              defaultEnvironmentId: projects.defaultEnvironmentId,
               updatedAt: projects.updatedAt,
             })
             .from(projects)
@@ -20997,8 +20999,17 @@ export function heartbeatService(
       const managedSandboxEnvironment = managedSandboxOnly
         ? await environmentsSvc.findManagedSandboxEnvironment(agent.companyId)
         : null;
+      const inheritedEnvironmentDefaults = agent.defaultEnvironmentId
+        ? { projectDefaultEnvironmentId: null, companyDefaultEnvironmentId: null }
+        : await resolveInheritedEnvironmentDefaults(db, environmentsSvc, {
+            companyId: agent.companyId,
+            adapterType: agent.adapterType,
+            projectDefaultEnvironmentId:
+              projectContext?.defaultEnvironmentId ?? null,
+          });
       const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+        ...inheritedEnvironmentDefaults,
         instanceDefaultEnvironmentId:
           resolvedInstanceSettings.defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: localEnvironment.id,
@@ -21093,6 +21104,15 @@ export function heartbeatService(
           : selectedEnvironmentId
             ? await environmentsSvc.getById(selectedEnvironmentId)
             : null;
+      if (
+        selectedEnvironmentForConfig &&
+        !isEnvironmentAvailableToCompany(selectedEnvironmentForConfig, agent.companyId)
+      ) {
+        throw new Error(
+          `Environment "${selectedEnvironmentForConfig.name}" belongs to another company. ` +
+            "Pick one of this company's environments for the agent and retry.",
+        );
+      }
       const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
         adapterType: agent.adapterType,
         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
