@@ -27,6 +27,7 @@ import { githubBotRequest } from "./chat-github-client.js";
 import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
+import { resolveInheritedEnvironmentDefaults } from "./environment-defaults.js";
 
 export function githubChatManagementService(db: Db, fetchImpl = fetch) {
   async function endpoint(id: string) {
@@ -499,6 +500,12 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
           : null;
         const selected = resolveExecutionWorkspaceEnvironmentId({
           agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+          ...(agent.defaultEnvironmentId
+            ? {}
+            : await resolveInheritedEnvironmentDefaults(db, environments, {
+                companyId: bot.companyId,
+                adapterType: agent.adapterType,
+              })),
           instanceDefaultEnvironmentId:
             (await settings.get()).defaultEnvironmentId ?? null,
           localDefaultEnvironmentId: local.id,

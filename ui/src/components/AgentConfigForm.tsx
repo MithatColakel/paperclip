@@ -19,7 +19,7 @@ import type {
   EnvSecretRefBinding,
   Environment,
 } from "@paperclipai/shared";
-import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter, isValidBrowserCode, ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
+import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter, isEnvironmentRunnableForAdapter, isValidBrowserCode, ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import type { AdapterModel } from "../api/agents";
 import { agentsApi } from "../api/agents";
 import { ApiError } from "../api/client";
@@ -348,7 +348,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const showCreateRunPolicySection = props.showCreateRunPolicySection ?? true;
   const hideInstructionsFile = props.hideInstructionsFile ?? false;
   const canConfigureProviderTrace = props.canConfigureProviderTrace === true;
-  const { selectedCompanyId } = useCompany();
+  const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
   const environmentVariablesEditorRef = useRef<EnvironmentVariablesEditorHandle | null>(null);
 
@@ -404,7 +404,6 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     }
     return next;
   }, [disabledTypes, experimentalSettings?.enableNativeRunner]);
-  const environmentsEnabled = experimentalSettings?.enableEnvironments === true;
   // Managed-sandbox-only policy: every agent runs in the platform-managed
   // environment, so the form hides each host filesystem path and each
   // execution-engine choice. Declared here because the field gates below and
@@ -434,12 +433,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const { data: environments = [] } = useQuery<Environment[]>({
     queryKey: selectedCompanyId ? queryKeys.environments.list(selectedCompanyId) : ["environments", "none"],
     queryFn: () => environmentsApi.list(selectedCompanyId!),
-    // Load environments when the picker is enabled OR when execution is forced
-    // onto Kubernetes (so we can resolve and default to the managed K8s env even
-    // when the experimental environments picker is otherwise hidden).
-    enabled:
-      Boolean(selectedCompanyId) &&
-      (environmentsEnabled || generalSettings?.executionMode === "kubernetes"),
+    enabled: Boolean(selectedCompanyId),
   });
 
   // Setting-driven: resolve whether the instance forces Kubernetes execution and
@@ -788,6 +782,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     () => environments.find((environment) => environment.id === instanceDefaultEnvironmentId) ?? null,
     [environments, instanceDefaultEnvironmentId],
   );
+  // The company default applies only when this adapter can run there; the
+  // server skips it otherwise and falls through to the instance default.
+  const companyDefaultEnvironment = useMemo(() => {
+    const environment = environments.find((entry) => entry.id === selectedCompany?.defaultEnvironmentId) ?? null;
+    return environment && isEnvironmentRunnableForAdapter(environment, adapterType) ? environment : null;
+  }, [environments, selectedCompany?.defaultEnvironmentId, adapterType]);
 
   // The environment a login session runs in. It mirrors the Test resolution: the
   // agent's own environment wins, otherwise the instance default, otherwise the
@@ -808,6 +808,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     try {
       return resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
+        companyDefaultEnvironmentId: companyDefaultEnvironment?.id ?? null,
         instanceDefaultEnvironmentId: instanceSettings?.defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environments),
         managedSandboxOnly: experimentalSettings?.enableManagedSandboxOnly === true,
@@ -823,6 +824,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     }
   }, [
     rawCurrentDefaultEnvironmentId,
+    companyDefaultEnvironment,
     instanceSettings?.defaultEnvironmentId,
     environments,
     experimentalSettings?.enableManagedSandboxOnly,
@@ -876,16 +878,17 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // `runnableEnvironments` excludes the always-available Local environment, so a
   // single entry already means the user has more than one environment configured
   // (Local + that environment) and the override selector is meaningful.
-  const showEnvironmentOverrideControl = environmentsEnabled && (
+  const showEnvironmentOverrideControl =
     forcedKubernetes ||
     currentDefaultEnvironmentId.length > 0 ||
-    runnableEnvironments.length >= 1
-  );
-  const inheritedEnvironmentLabel = instanceDefaultEnvironment
-    ? environmentDisplayLabel(instanceDefaultEnvironment)
-    : managedSandboxOnly
-      ? "Paperclip Computer"
-      : "Local";
+    runnableEnvironments.length >= 1;
+  const inheritedEnvironmentLabel = companyDefaultEnvironment
+    ? `${environmentDisplayLabel(companyDefaultEnvironment)} (company default)`
+    : instanceDefaultEnvironment
+      ? environmentDisplayLabel(instanceDefaultEnvironment)
+      : managedSandboxOnly
+        ? "Paperclip Computer"
+        : "Local";
 
   const runnerProvider = adapterType === "paperclip_runner"
     ? String(isCreate ? props.values.adapterSchemaValues?.provider ?? "codex"
@@ -1049,6 +1052,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       // surfaces as a fail-closed error rather than a local host probe.
       const environmentId = resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
+        companyDefaultEnvironmentId: companyDefaultEnvironment?.id ?? null,
         instanceDefaultEnvironmentId: settings?.defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environmentList),
         managedSandboxOnly,

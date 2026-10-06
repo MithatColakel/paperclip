@@ -54,7 +54,7 @@ import {
   type ReadyPluginWorkerRecovery,
 } from "../services/plugin-environment-driver.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { assertBoardOrgAccess, assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -373,9 +373,54 @@ export function environmentRoutes(
     }
   }
 
+  /**
+   * Validate a change to which company owns an environment. The local host
+   * and platform-managed rows stay shared, and an environment cannot be
+   * limited to one company while another company (or the instance default)
+   * still points at it.
+   */
+  async function assertEnvironmentOwnershipChange(
+    req: Request,
+    environment: { id: string | null; driver: string; metadata: Record<string, unknown> | null },
+    nextCompanyId: string | null,
+  ) {
+    if (nextCompanyId === null) return;
+    assertCompanyAccess(req, nextCompanyId);
+    if (environment.driver === "local") {
+      throw unprocessable("The local environment is shared by every company and cannot be limited to one.");
+    }
+    if (environment.metadata?.managedByPaperclip === true) {
+      throw unprocessable("Platform-managed environments are shared by every company and cannot be limited to one.");
+    }
+    if (!environment.id) return;
+    const refs = await svc.countReferencesOutsideCompany(environment.id, nextCompanyId);
+    if (refs.agents > 0 || refs.projects > 0 || refs.companies > 0 || refs.instanceDefault) {
+      throw conflict(
+        "Other companies or the instance default still use this environment. Move them to another environment first.",
+        { code: "environment_used_by_other_companies", ...refs },
+      );
+    }
+  }
+
   function canReadFullInstanceEnvironment(req: Request) {
     return req.actor.type === "board"
       && (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin);
+  }
+
+  /**
+   * True when the actor may see this environment: instance admins see all;
+   * other board members see shared environments and those owned by a company
+   * they belong to.
+   */
+  function canActorSeeEnvironment(req: Request, environment: { companyId?: string | null }) {
+    if (canReadFullInstanceEnvironment(req)) return true;
+    if (!environment.companyId) return true;
+    return (req.actor.companyIds ?? []).includes(environment.companyId);
+  }
+
+  function canActorSeeLease(req: Request, lease: { companyId: string }) {
+    if (canReadFullInstanceEnvironment(req)) return true;
+    return (req.actor.companyIds ?? []).includes(lease.companyId);
   }
 
   function redactEnvironmentForRestrictedView<T extends {
@@ -383,11 +428,19 @@ export function environmentRoutes(
     envVars?: Record<string, unknown> | null;
     metadata: Record<string, unknown> | null;
   }>(environment: T): T {
+    // Keep the non-secret fields pickers need to tell where an agent can run:
+    // the sandbox provider name and the local/managed markers.
+    const provider = typeof environment.config?.provider === "string" ? environment.config.provider : null;
+    const markers = Object.fromEntries(
+      (["defaultForInstance", "managedByPaperclip"] as const)
+        .filter((key) => environment.metadata?.[key] === true)
+        .map((key) => [key, true]),
+    );
     return {
       ...environment,
-      config: {},
+      config: provider ? { provider } : {},
       ...(Object.prototype.hasOwnProperty.call(environment, "envVars") ? { envVars: {} } : {}),
-      metadata: null,
+      metadata: Object.keys(markers).length > 0 ? markers : null,
     };
   }
 
@@ -429,8 +482,17 @@ export function environmentRoutes(
     action: string;
     entityId: string;
     details: Record<string, unknown>;
+    /**
+     * Owners of the environment (before and after the change). A shared
+     * environment (null owner) is logged to every company; a company-owned
+     * one only to its owner, so other companies never see it.
+     */
+    owners?: Array<string | null | undefined>;
   }) {
-    const companyIds = await instanceSettings.listCompanyIds();
+    const owners = (input.owners ?? [null]).map((owner) => owner ?? null);
+    const companyIds = owners.includes(null)
+      ? await instanceSettings.listCompanyIds()
+      : [...new Set(owners.filter((owner): owner is string => owner !== null))];
     await Promise.all(
       companyIds.map((companyId) =>
         logActivity(db, {
@@ -554,6 +616,7 @@ export function environmentRoutes(
       name: string;
       driver: string;
       status: string;
+      companyId?: string | null;
     },
   ): Record<string, unknown> {
     const details: Record<string, unknown> = {
@@ -563,6 +626,7 @@ export function environmentRoutes(
     if (patch.name !== undefined) details.name = environment.name;
     if (patch.driver !== undefined) details.driver = environment.driver;
     if (patch.status !== undefined) details.status = environment.status;
+    if (patch.companyId !== undefined) details.companyId = environment.companyId ?? null;
     if (patch.description !== undefined) details.descriptionChanged = true;
     if (patch.config !== undefined) {
       details.configChanged = true;
@@ -700,8 +764,10 @@ export function environmentRoutes(
   }
 
   router.get("/companies/:companyId/environments", async (req, res) => {
+    const companyId = req.params.companyId as string;
     assertCanReadInstanceEnvironments(req);
-    const rows = await svc.list({
+    assertCompanyAccess(req, companyId);
+    const rows = await svc.list(companyId, {
       status: req.query.status as string | undefined,
       driver: req.query.driver as string | undefined,
     });
@@ -1015,6 +1081,14 @@ export function environmentRoutes(
     const companyId = req.params.companyId as string;
     assertCanAccessInstanceEnvironments(req);
     assertNoClientPlatformProvisionedMarkers(req.body.metadata);
+    if (req.body.companyId && req.body.companyId !== companyId) {
+      throw unprocessable("An environment can only be limited to the company it is created in.");
+    }
+    await assertEnvironmentOwnershipChange(
+      req,
+      { id: null, driver: req.body.driver, metadata: req.body.metadata ?? null },
+      req.body.companyId ?? null,
+    );
     if (req.body.driver === "local") {
       const existingLocal = await svc.list({ driver: "local" });
       if (existingLocal.length > 0) {
@@ -1064,10 +1138,12 @@ export function environmentRoutes(
       actor,
       action: "environment.created",
       entityId: environment.id,
+      owners: [environment.companyId],
       details: {
         name: environment.name,
         driver: environment.driver,
         status: environment.status,
+        companyId: environment.companyId,
       },
     });
     res.status(201).json(presentEnvironmentForRead(req, environment));
@@ -1076,7 +1152,11 @@ export function environmentRoutes(
   router.get("/environments/:id", async (req, res) => {
     assertCanReadInstanceEnvironments(req);
     const environment = await svc.getById(req.params.id as string);
-    if (!environment || (environment.driver === "local" && (await isManagedSandboxOnlyInstance()))) {
+    if (
+      !environment ||
+      !canActorSeeEnvironment(req, environment) ||
+      (environment.driver === "local" && (await isManagedSandboxOnlyInstance()))
+    ) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
@@ -1102,20 +1182,20 @@ export function environmentRoutes(
   router.get("/environments/:id/leases", async (req, res) => {
     assertCanReadInstanceEnvironments(req);
     const environment = await svc.getById(req.params.id as string);
-    if (!environment) {
+    if (!environment || !canActorSeeEnvironment(req, environment)) {
       res.status(404).json({ error: "Environment not found" });
       return;
     }
     const leases = await svc.listLeases(environment.id, {
       status: req.query.status as string | undefined,
     });
-    res.json(leases);
+    res.json(leases.filter((lease) => canActorSeeLease(req, lease)));
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {
     assertCanReadInstanceEnvironments(req);
     const lease = await svc.getLeaseById(req.params.leaseId as string);
-    if (!lease) {
+    if (!lease || !canActorSeeLease(req, lease)) {
       res.status(404).json({ error: "Environment lease not found" });
       return;
     }
@@ -1137,6 +1217,13 @@ export function environmentRoutes(
         }),
     });
     assertNoClientPlatformProvisionedMarkers(req.body.metadata);
+    if (req.body.companyId !== undefined && (req.body.companyId ?? null) !== existing.companyId) {
+      await assertEnvironmentOwnershipChange(
+        req,
+        { id: existing.id, driver: req.body.driver ?? existing.driver, metadata: existing.metadata },
+        req.body.companyId ?? null,
+      );
+    }
     // The durable `pending_cleanup` lease row stores the provider, the provider
     // lease id, and the immutable config metadata for an orphan sandbox. The
     // teardown retry reads that row alone and never reads the current environment
@@ -1250,6 +1337,7 @@ export function environmentRoutes(
       actor,
       action: "environment.updated",
       entityId: environment.id,
+      owners: [existing.companyId, environment.companyId],
       details: summarizeEnvironmentUpdate(patch as Record<string, unknown>, environment),
     });
     const presented = presentEnvironmentForRead(req, environment);
@@ -1364,6 +1452,7 @@ export function environmentRoutes(
       actor,
       action: "environment.deleted",
       entityId: removed.id,
+      owners: [removed.companyId],
       details: {
         name: removed.name,
         driver: removed.driver,
@@ -1408,6 +1497,7 @@ export function environmentRoutes(
       actor,
       action: "environment.probed",
       entityId: environment.id,
+      owners: [environment.companyId],
       details: {
         driver: environment.driver,
         ok: probe.ok,

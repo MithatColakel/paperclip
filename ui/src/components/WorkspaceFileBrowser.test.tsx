@@ -147,6 +147,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
   const workspace = createWorkspace();
   return {
     id: "project-content",
+    defaultEnvironmentId: null,
     companyId: "company-1",
     urlKey: "paperclip-content",
     goalId: null,

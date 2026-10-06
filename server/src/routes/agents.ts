@@ -49,6 +49,7 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  isEnvironmentAvailableToCompany,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
   startAdapterAuthSessionRequestSchema,
@@ -240,6 +241,7 @@ import {
 import { buildOnboardingFirstAgentInstructionsBundle } from "../services/onboarding-first-task-assets.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { resolveInheritedEnvironmentDefaults } from "../services/environment-defaults.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
@@ -1177,11 +1179,21 @@ export function agentRoutes(
     return rows.filter((_, index) => decisions[index]?.allowed);
   }
 
-  // A null agent override inherits the instance default, just like dispatch.
-  // Resolve this before secrets or probes so a default remote environment can
-  // never accidentally validate the account on the control-plane host.
-  async function resolveAdapterTestEnvironmentId(companyId: string, environmentId: string | null | undefined) {
+  // A null agent override inherits the company default, then the instance
+  // default, just like dispatch. Resolve this before secrets or probes so a
+  // default remote environment can never accidentally validate the account on
+  // the control-plane host.
+  async function resolveAdapterTestEnvironmentId(
+    companyId: string,
+    environmentId: string | null | undefined,
+    adapterType: string,
+  ) {
     if (environmentId) return environmentId;
+    const { companyDefaultEnvironmentId } = await resolveInheritedEnvironmentDefaults(db, environmentsSvc, {
+      companyId,
+      adapterType,
+    });
+    if (companyDefaultEnvironmentId) return companyDefaultEnvironmentId;
     const settings = await instanceSettings.get();
     if (settings.defaultEnvironmentId) return settings.defaultEnvironmentId;
     if ((await instanceSettings.getExperimental()).enableManagedSandboxOnly === true) {
@@ -2286,6 +2298,11 @@ export function agentRoutes(
     if (!environment) {
       throw unprocessable("Selected environment was not found");
     }
+    // Check ownership before anything else so another company's environment
+    // is refused without revealing its driver or provider.
+    if (!isEnvironmentAvailableToCompany(environment, companyId)) {
+      throw unprocessable("Environment belongs to another company.");
+    }
     if (options?.allowedDrivers && !options.allowedDrivers.includes(environment.driver)) {
       throw unprocessable(`Environment driver "${environment.driver}" is not allowed here`);
     }
@@ -3379,7 +3396,7 @@ export function agentRoutes(
     });
     if (!selection) return undefined;
     if (test) {
-      const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId);
+      const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId, adapterType);
       if (testEnvironmentId) await assertAdapterTestEnvironmentForCompany(companyId, testEnvironmentId);
       const target = await resolveAdapterTestExecutionContext({ companyId, adapterType, environmentId: testEnvironmentId });
       let managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
@@ -3427,6 +3444,7 @@ export function agentRoutes(
         req.body.environmentId === undefined
           ? savedAgent?.defaultEnvironmentId
           : asNonEmptyString(req.body.environmentId),
+        type,
       );
       // Fail closed on a foreign environment before any secret resolution, env
       // merge, target resolution, sandbox lease, or adapter test runs.
@@ -4371,6 +4389,14 @@ export function agentRoutes(
       );
     }
 
+    if (typeof rollbackConfig.defaultEnvironmentId === "string") {
+      await assertAgentEnvironmentSelection(
+        existing.companyId,
+        rollbackAdapterType,
+        rollbackConfig.defaultEnvironmentId,
+      );
+    }
+
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
       agentId: actor.agentId,
@@ -4505,6 +4531,11 @@ export function agentRoutes(
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
     }
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType);
+    await assertAgentEnvironmentSelection(companyId, hireInput.adapterType, hireInput.defaultEnvironmentId);
+    await assertAgentDefaultEnvironmentSelection(companyId, hireInput.defaultEnvironmentId, {
+      allowedDrivers: allowedEnvironmentDriversForAgent(hireInput.adapterType),
+      allowedSandboxProviders: allowedSandboxProvidersForAgent(hireInput.adapterType),
+    });
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
     await assertFreshPaperclipRunnerProvider(
@@ -4694,6 +4725,7 @@ export function agentRoutes(
             adapterType: requestedAdapterType,
             adapterConfig: requestedAdapterConfig,
             runtimeConfig: requestedRuntimeConfig,
+            defaultEnvironmentId: agent.defaultEnvironmentId ?? null,
             budgetMonthlyCents:
               typeof normalizedHireInput.budgetMonthlyCents === "number"
                 ? normalizedHireInput.budgetMonthlyCents

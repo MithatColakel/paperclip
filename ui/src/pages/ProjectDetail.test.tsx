@@ -126,6 +126,7 @@ function project(overrides: Partial<Project> = {}): Project {
   const now = new Date("2026-05-01T00:00:00Z");
   return {
     id: "project-1",
+    defaultEnvironmentId: null,
     companyId: "company-1",
     urlKey: "project-1",
     goalId: null,

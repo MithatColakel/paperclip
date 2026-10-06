@@ -2052,6 +2052,13 @@
       "when": 1791211375441,
       "tag": "0294_faulty_the_executioner",
       "breakpoints": true
+    },
+    {
+      "idx": 295,
+      "version": "7",
+      "when": 1791285564428,
+      "tag": "0295_many_the_fury",
+      "breakpoints": true
     }
   ]
 }

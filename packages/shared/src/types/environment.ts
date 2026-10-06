@@ -80,6 +80,8 @@ export interface EnvironmentProbeResult {
 
 export interface Environment {
   id: string;
+  /** Owning company. Null means every company on the instance can use it. */
+  companyId: string | null;
   name: string;
   description: string | null;
   driver: EnvironmentDriver;

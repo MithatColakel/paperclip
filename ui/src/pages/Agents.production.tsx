@@ -25,7 +25,13 @@ import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, Bot, Plus, List, GitBranch } from "lucide-react";
-import { AGENT_ROLE_LABELS, type Agent, type Environment, type EnvironmentCapabilities } from "@paperclipai/shared";
+import {
+  AGENT_ROLE_LABELS,
+  isEnvironmentRunnableForAdapter,
+  type Agent,
+  type Environment,
+  type EnvironmentCapabilities,
+} from "@paperclipai/shared";
 import {
   isStarred,
   resourceMembershipState,
@@ -158,8 +164,18 @@ function resolveAgentEnvironment(
   environmentsById: Map<string, Environment>,
   instanceDefaultEnvironmentId: string | null,
   capabilities?: EnvironmentCapabilities | null,
+  companyDefaultEnvironmentId: string | null = null,
 ): EnvironmentDescriptor {
-  const environmentId = agent.defaultEnvironmentId ?? instanceDefaultEnvironmentId;
+  // Mirrors run resolution outside a project: the agent's pin, then the
+  // company default when this adapter can run there, then the instance default.
+  const companyDefault = companyDefaultEnvironmentId
+    ? environmentsById.get(companyDefaultEnvironmentId)
+    : undefined;
+  const environmentId =
+    agent.defaultEnvironmentId ??
+    (companyDefault && isEnvironmentRunnableForAdapter(companyDefault, agent.adapterType)
+      ? companyDefault.id
+      : instanceDefaultEnvironmentId);
   if (!environmentId) return localEnvironmentDescriptor;
   const environment = environmentsById.get(environmentId);
   return environment
@@ -189,7 +205,7 @@ function filterOrgTree(nodes: OrgNode[], tab: FilterTab, builtInAgentIds: Set<st
 }
 
 export function Agents() {
-  const { selectedCompanyId } = useCompany();
+  const { selectedCompanyId, selectedCompany } = useCompany();
   const { openNewAgent } = useDialogActions();
   const { setBreadcrumbs } = useBreadcrumbs();
   const navigate = useNavigate();
@@ -311,11 +327,18 @@ export function Agents() {
           environmentsById,
           instanceSettings?.defaultEnvironmentId ?? null,
           environmentCapabilities,
+          selectedCompany?.defaultEnvironmentId ?? null,
         ),
       );
     }
     return map;
-  }, [agents, environmentsById, environmentCapabilities, instanceSettings?.defaultEnvironmentId]);
+  }, [
+    agents,
+    environmentsById,
+    environmentCapabilities,
+    instanceSettings?.defaultEnvironmentId,
+    selectedCompany?.defaultEnvironmentId,
+  ]);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Agents" }]);

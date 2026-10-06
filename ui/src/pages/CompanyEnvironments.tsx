@@ -79,6 +79,8 @@ type EnvironmentFormState = {
   sandboxProvider: string;
   sandboxConfig: Record<string, unknown>;
   envVars: Record<string, EnvBinding>;
+  /** Limit the environment to the selected company instead of sharing it. */
+  companyOnly: boolean;
 };
 
 type CompanyEnvironmentsMode = "list" | "create" | "edit";
@@ -158,6 +160,7 @@ function createEmptyEnvironmentForm(): EnvironmentFormState {
     sandboxProvider: "",
     sandboxConfig: {},
     envVars: {},
+    companyOnly: false,
   };
 }
 
@@ -231,6 +234,7 @@ function createEnvironmentFormFromEnvironment(environment: Environment): Environ
       sshKnownHosts: ssh.knownHosts,
       sshStrictHostKeyChecking: ssh.strictHostKeyChecking,
       envVars: environment.envVars ?? {},
+      companyOnly: Boolean(environment.companyId),
     };
   }
 
@@ -244,6 +248,7 @@ function createEnvironmentFormFromEnvironment(environment: Environment): Environ
       sandboxProvider: sandbox.provider,
       sandboxConfig: sandbox.config,
       envVars: environment.envVars ?? {},
+      companyOnly: Boolean(environment.companyId),
     };
   }
 
@@ -253,6 +258,7 @@ function createEnvironmentFormFromEnvironment(environment: Environment): Environ
     description: environment.description ?? "",
     driver: "local",
     envVars: environment.envVars ?? {},
+    companyOnly: Boolean(environment.companyId),
   };
 }
 
@@ -275,7 +281,7 @@ function stableJsonStringify(value: unknown): string {
 
 /** Payload-level fingerprint so cosmetic form state (whitespace, key order) is not "unsaved". */
 function environmentFormKey(form: EnvironmentFormState): string {
-  return stableJsonStringify(buildEnvironmentPayload(form));
+  return stableJsonStringify({ ...buildEnvironmentPayload(form), companyOnly: form.companyOnly });
 }
 
 function normalizeJsonSchema(schema: unknown): JsonSchema | null {
@@ -1456,13 +1462,21 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
   const environmentMutation = useMutation({
     mutationFn: async (form: EnvironmentFormState) => {
       const body = buildEnvironmentPayload(form);
+      const companyId = form.companyOnly ? selectedCompanyId : null;
 
       if (editingEnvironmentId) {
-        return await environmentsApi.update(editingEnvironmentId, body, selectedCompanyId);
+        // Send ownership only when it changes: the server checks other
+        // companies' references before limiting an environment to one.
+        const ownershipChanged = form.companyOnly !== Boolean(editingEnvironment?.companyId);
+        return await environmentsApi.update(
+          editingEnvironmentId,
+          ownershipChanged ? { ...body, companyId } : body,
+          selectedCompanyId,
+        );
       }
 
       if (!selectedCompanyId) throw new Error("Select a company to create environments");
-      return await environmentsApi.create(selectedCompanyId!, body);
+      return await environmentsApi.create(selectedCompanyId!, companyId ? { ...body, companyId } : body);
     },
     onSuccess: async (environment) => {
       const wasEditing = editingEnvironmentId !== null;
@@ -2025,6 +2039,11 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                           Managed by Paperclip
                         </span>
                       ) : null}
+                      {environment.companyId ? (
+                        <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-xs font-normal text-muted-foreground">
+                          This company only
+                        </span>
+                      ) : null}
                     </div>
                     {environment.description ? (
                       <div className="text-xs text-muted-foreground">{environment.description}</div>
@@ -2231,6 +2250,14 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                   onChange={(e) => setEnvironmentForm((current) => ({ ...current, description: e.target.value }))}
                 />
               </Field>
+              {environmentForm.driver !== "local" ? (
+                <ToggleField
+                  label="Only this company"
+                  hint="Only this company's agents and projects can pick it, and only this company's runs use it. Leave off to share it with every company."
+                  checked={environmentForm.companyOnly}
+                  onChange={(companyOnly) => setEnvironmentForm((current) => ({ ...current, companyOnly }))}
+                />
+              ) : null}
               <Field label="Driver" hint="Sandbox stores plugin-backed provider config on the shared environment seam. SSH stores a remote machine target.">
                 <select
                   className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"

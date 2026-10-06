@@ -926,7 +926,8 @@ export function projectService(db: Db) {
 
       let cleared = 0;
       for (const row of rows) {
-        const policy = parseProjectExecutionWorkspacePolicy(row.executionWorkspacePolicy);
+        // Compare the stored value: the parsed policy drops `environmentId`.
+        const policy = row.executionWorkspacePolicy;
         if (policy?.environmentId !== environmentId) continue;
 
         await db

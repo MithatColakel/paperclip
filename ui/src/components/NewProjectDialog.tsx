@@ -10,6 +10,13 @@ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { ProjectRepositoryInput, repositoryOptionsKey } from "./ProjectRepositoryInput";
 import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow";
+import { EnvironmentSelect } from "./EnvironmentSelect";
+import { useEnvironmentChoices } from "../hooks/useEnvironmentChoices";
+import {
+  hasRemoteEnvironmentChoice,
+  inheritedEnvironmentLabel,
+  resolveInheritedEnvironment,
+} from "../lib/environment-defaults";
 
 export function NewProjectDialog() {
   const { newProjectOpen, closeNewProject } = useDialog();
@@ -23,9 +30,17 @@ export function NewProjectForm({ companyId, onClose }: { companyId: string; onCl
   const [name, setName] = useState("");
   const [repos, setRepos] = useState<ProjectRepository[]>([]);
   const [connecting, setConnecting] = useState(false);
+  const [environmentId, setEnvironmentId] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
+  const choices = useEnvironmentChoices(companyId);
+  const showEnvironment = choices.ready && hasRemoteEnvironmentChoice(choices.environments);
   const create = useMutation({
-    mutationFn: () => projectsApi.create(companyId, { name: name.trim(), status: "planned", repositoryIds: repos.map((repo) => repo.id) }),
+    mutationFn: () => projectsApi.create(companyId, {
+      name: name.trim(),
+      status: "planned",
+      repositoryIds: repos.map((repo) => repo.id),
+      ...(environmentId ? { defaultEnvironmentId: environmentId } : {}),
+    }),
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: queryKeys.projects.all(companyId) });
       onClose();
@@ -52,6 +67,17 @@ export function NewProjectForm({ companyId, onClose }: { companyId: string; onCl
             <input ref={input} aria-label="Project name" value={name} disabled={create.isPending} onChange={(event) => setName(event.target.value)} placeholder="Project name" required
               className="h-10 w-full min-w-0 border-0 bg-transparent text-base outline-none placeholder:text-muted-foreground md:text-sm" />
           </div>
+          {showEnvironment && <div className="flex flex-col gap-1.5">
+            <label htmlFor="new-project-environment" className="text-sm font-medium">Where does this project's work run?</label>
+            <EnvironmentSelect id="new-project-environment" aria-label="Project environment" environments={choices.environments}
+              value={environmentId} onChange={setEnvironmentId} disabled={create.isPending}
+              inheritLabel={inheritedEnvironmentLabel(resolveInheritedEnvironment({
+                environments: choices.environments,
+                companyDefaultEnvironmentId: choices.companyDefaultEnvironmentId,
+                instanceDefaultEnvironmentId: choices.instanceDefaultEnvironmentId,
+              }))} />
+            <p className="text-xs text-muted-foreground">Agents pinned to their own environment keep it.</p>
+          </div>}
         </div>
         <div role="region" aria-label="Source repositories" tabIndex={0} className="min-h-0 overflow-y-auto overscroll-contain px-5 pb-1 outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring">
           <ProjectRepositoryInput companyId={companyId} selected={repos} onChange={setRepos} onConnect={() => setConnecting(true)} disabled={create.isPending} />
