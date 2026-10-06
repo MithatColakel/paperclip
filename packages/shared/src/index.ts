@@ -800,6 +800,7 @@ export type {
   SandboxEnvironmentConfig,
   SandboxEnvironmentProvider,
   SshEnvironmentConfig,
+  SshEnvironmentWorkspaceMode,
   FeedbackVote,
   FeedbackDataSharingPreference,
   FeedbackTargetType,

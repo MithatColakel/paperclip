@@ -41,6 +41,7 @@ import {
 } from "./environment-execution-target.js";
 import {
   adapterExecutionTargetToRemoteSpec,
+  overrideAdapterExecutionTargetRemoteCwd,
   type AdapterExecutionTarget,
   type AdapterRemoteExecutionSpec,
   type AdapterWorkspaceRealization,
@@ -550,11 +551,13 @@ export function environmentRunOrchestrator(
           : [],
       };
       if (executionTarget) {
+        // An in-place root moves the whole remote target, including the SSH
+        // spec the agent process is started with (`cd spec.remoteCwd`).
+        const relocatedTarget = executionTarget.kind === "remote" && realizationMode === "in_place"
+          ? overrideAdapterExecutionTargetRemoteCwd(executionTarget, authoritativeRoot) ?? executionTarget
+          : executionTarget;
         executionTarget = {
-          ...executionTarget,
-          ...(executionTarget.kind === "remote" && realizationMode === "in_place"
-            ? { remoteCwd: authoritativeRoot }
-            : {}),
+          ...relocatedTarget,
           workspaceRealization: workspaceTargetMetadata,
         } as AdapterExecutionTarget;
       }

@@ -527,7 +527,7 @@ async function probeRemoteDirSize(input: {
   }
 }
 
-interface TransferProgress {
+export interface TransferProgress {
   // Backpressure-respecting counter to splice into a transport pipe.
   counter: Transform;
   // Last cumulative byte count observed by the counter.
@@ -688,7 +688,7 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   }
 }
 
-async function streamLocalFileToSsh(input: {
+export async function streamLocalFileToSsh(input: {
   spec: SshConnectionConfig;
   localFile: string;
   remoteScript: string;
@@ -762,7 +762,7 @@ async function streamLocalFileToSsh(input: {
   });
 }
 
-async function streamSshToLocalFile(input: {
+export async function streamSshToLocalFile(input: {
   spec: SshConnectionConfig;
   remoteScript: string;
   localFile: string;

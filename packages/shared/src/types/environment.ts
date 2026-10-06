@@ -20,7 +20,16 @@ export interface SshEnvironmentConfig {
   privateKeySecretRef: EnvSecretRefBinding | null;
   knownHosts: string | null;
   strictHostKeyChecking: boolean;
+  /**
+   * "copy" (default): the server worktree is authoritative and each run copies
+   * it to the host and back. "device": the host keeps its own clone and one
+   * git worktree per execution workspace, fetched from origin, and the run
+   * pushes the issue branch from there.
+   */
+  workspaceMode?: SshEnvironmentWorkspaceMode;
 }
+
+export type SshEnvironmentWorkspaceMode = "copy" | "device";
 
 export type SandboxEnvironmentProvider = "fake" | (string & {});
 

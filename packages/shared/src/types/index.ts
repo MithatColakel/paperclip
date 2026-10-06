@@ -86,6 +86,7 @@ export type {
   SandboxEnvironmentConfig,
   SandboxEnvironmentProvider,
   SshEnvironmentConfig,
+  SshEnvironmentWorkspaceMode,
 } from "./environment.js";
 export type {
   FeedbackVote,
