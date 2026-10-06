@@ -230,6 +230,52 @@ describe.sequential("execution environment route guards", () => {
     expect(mockProjectService.create).toHaveBeenCalled();
   });
 
+  it("rejects another company's environment as a project default", async () => {
+    mockEnvironmentService.getById.mockResolvedValue({
+      id: sandboxEnvironmentId,
+      companyId: "company-2",
+      driver: "sandbox",
+      config: { provider: "fake-plugin" },
+    });
+    const app = createProjectApp();
+
+    const res = await request(app)
+      .post("/api/companies/company-1/projects")
+      .send({ name: "Foreign Device", defaultEnvironmentId: sandboxEnvironmentId });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("another company");
+    expect(mockProjectService.create).not.toHaveBeenCalled();
+  });
+
+  it("carries a legacy policy environment into the project default", async () => {
+    mockEnvironmentService.getById.mockResolvedValue({
+      id: sandboxEnvironmentId,
+      companyId: null,
+      driver: "sandbox",
+      config: { provider: "fake-plugin" },
+    });
+    mockProjectService.create.mockResolvedValue({
+      id: "project-1",
+      companyId: "company-1",
+      name: "Legacy Client",
+      status: "backlog",
+    });
+    const app = createProjectApp();
+
+    await request(app)
+      .post("/api/companies/company-1/projects")
+      .send({
+        name: "Legacy Client",
+        executionWorkspacePolicy: { enabled: false, environmentId: sandboxEnvironmentId },
+      });
+
+    expect(mockProjectService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ defaultEnvironmentId: sandboxEnvironmentId }),
+    );
+  });
+
   it("accepts sandbox environments on project update", async () => {
     mockProjectService.getById.mockResolvedValue({
       id: "project-1",

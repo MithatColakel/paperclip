@@ -94,6 +94,8 @@ export interface Project {
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
+  /** Where the project's work runs for agents that are not pinned to an environment. */
+  defaultEnvironmentId: string | null;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;

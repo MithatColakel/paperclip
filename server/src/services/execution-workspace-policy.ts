@@ -273,6 +273,8 @@ export function selectEnvironmentExecutionWorkspaceSettings(
 
 export type ExecutionWorkspaceEnvironmentSource =
   | "agent"
+  | "project"
+  | "company"
   | "instance"
   | "default"
   | "managed";
@@ -293,8 +295,16 @@ export class ManagedSandboxUnavailableError extends Error {
   }
 }
 
+/**
+ * Where a run executes. The agent's own pin wins, then the project's default,
+ * then the company's, then the instance's, then the local host. Callers pass
+ * project and company defaults only after checking the agent can use them
+ * (`resolveInheritedEnvironmentDefaults`).
+ */
 export function resolveExecutionWorkspaceEnvironmentId(input: {
   agentDefaultEnvironmentId: string | null;
+  projectDefaultEnvironmentId?: string | null;
+  companyDefaultEnvironmentId?: string | null;
   instanceDefaultEnvironmentId: string | null;
   localDefaultEnvironmentId: string;
   /**
@@ -313,6 +323,18 @@ export function resolveExecutionWorkspaceEnvironmentId(input: {
       return {
         environmentId: input.agentDefaultEnvironmentId,
         source: "agent",
+      };
+    }
+    if (input.projectDefaultEnvironmentId) {
+      return {
+        environmentId: input.projectDefaultEnvironmentId,
+        source: "project",
+      };
+    }
+    if (input.companyDefaultEnvironmentId) {
+      return {
+        environmentId: input.companyDefaultEnvironmentId,
+        source: "company",
       };
     }
     if (input.instanceDefaultEnvironmentId) {

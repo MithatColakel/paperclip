@@ -291,6 +291,7 @@ const routineVariables: RoutineVariable[] = [
 
 const storybookProject: Project = {
   id: "project-board-ui",
+  defaultEnvironmentId: null,
   companyId: "company-storybook",
   urlKey: "board-ui",
   goalId: "goal-company",

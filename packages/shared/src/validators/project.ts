@@ -113,6 +113,7 @@ const projectFields = {
   icon: z.enum(PROJECT_ICON_NAMES).optional().nullable(),
   env: envConfigSchema.optional().nullable(),
   executionWorkspacePolicy: projectExecutionWorkspacePolicySchema.optional().nullable(),
+  defaultEnvironmentId: z.string().guid().optional().nullable(),
   archivedAt: z.string().datetime().optional().nullable(),
 };
 

@@ -20,6 +20,8 @@ const environmentFields = {
   config: z.record(z.string(), z.unknown()).optional().default({}),
   envVars: envConfigSchema.optional().default({}),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+  /** Restrict the environment to one company. Null or omitted shares it with every company. */
+  companyId: z.string().guid().optional().nullable(),
 };
 
 export const createEnvironmentSchema = z.object(environmentFields).strict();
@@ -33,6 +35,7 @@ export const updateEnvironmentSchema = z.object({
   config: z.record(z.string(), z.unknown()).optional(),
   envVars: envConfigSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+  companyId: z.string().guid().optional().nullable(),
 }).strict();
 export type UpdateEnvironment = z.infer<typeof updateEnvironmentSchema>;
 

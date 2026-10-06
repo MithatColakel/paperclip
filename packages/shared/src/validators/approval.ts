@@ -17,6 +17,13 @@ export const resolveApprovalSchema = z.object({
 
 export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;
 
+export const approveApprovalSchema = resolveApprovalSchema.extend({
+  /** Hire approvals only: where the hired agent runs. Null inherits the project or company default. */
+  defaultEnvironmentId: z.string().guid().nullable().optional(),
+});
+
+export type ApproveApproval = z.infer<typeof approveApprovalSchema>;
+
 export const requestApprovalRevisionSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
 });

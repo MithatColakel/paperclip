@@ -107,6 +107,19 @@ export function projectRoutes(db: Db) {
     });
   }
 
+  /**
+   * The project's environment lives in `defaultEnvironmentId`. Older clients
+   * still send it inside `executionWorkspacePolicy`; carry that value over
+   * when the new field is absent.
+   */
+  function resolveProjectDefaultEnvironmentId(body: {
+    defaultEnvironmentId?: string | null;
+    executionWorkspacePolicy?: unknown;
+  }): string | null | undefined {
+    if (body.defaultEnvironmentId !== undefined) return body.defaultEnvironmentId;
+    return readProjectPolicyEnvironmentId(body.executionWorkspacePolicy);
+  }
+
   function readProjectPolicyEnvironmentId(policy: unknown): string | null | undefined {
     if (!policy || typeof policy !== "object" || !("environmentId" in policy)) {
       return undefined;
@@ -241,10 +254,11 @@ export function projectRoutes(db: Db) {
     const { workspace, repositoryIds, repositoryUrls, idempotencyKey, ...projectData } = req.body as CreateProjectPayload & { idempotencyKey?: string; repositoryUrls?: string[] };
     const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
       ? await projectToolContext(db, req.actor, true) : null;
-    await assertProjectEnvironmentSelection(
-      companyId,
-      readProjectPolicyEnvironmentId(projectData.executionWorkspacePolicy),
-    );
+    const projectDefaultEnvironmentId = resolveProjectDefaultEnvironmentId(projectData);
+    await assertProjectEnvironmentSelection(companyId, projectDefaultEnvironmentId);
+    if (projectDefaultEnvironmentId !== undefined) {
+      projectData.defaultEnvironmentId = projectDefaultEnvironmentId;
+    }
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       [
@@ -330,10 +344,11 @@ export function projectRoutes(db: Db) {
       req,
       collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
     );
-    await assertProjectEnvironmentSelection(
-      existing.companyId,
-      readProjectPolicyEnvironmentId(body.executionWorkspacePolicy),
-    );
+    const projectDefaultEnvironmentId = resolveProjectDefaultEnvironmentId(body);
+    await assertProjectEnvironmentSelection(existing.companyId, projectDefaultEnvironmentId);
+    if (projectDefaultEnvironmentId !== undefined) {
+      body.defaultEnvironmentId = projectDefaultEnvironmentId;
+    }
     if (typeof body.archivedAt === "string") {
       body.archivedAt = new Date(body.archivedAt);
     }

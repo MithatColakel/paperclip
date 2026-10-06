@@ -39,6 +39,7 @@ import type {
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { resolveExecutionWorkspaceEnvironmentId } from "./execution-workspace-policy.js";
+import { resolveInheritedEnvironmentDefaults } from "./environment-defaults.js";
 import { emailConnectionService } from "./email-connections.js";
 import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
@@ -647,6 +648,12 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         : null;
       const selected = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+        ...(agent.defaultEnvironmentId
+          ? {}
+          : await resolveInheritedEnvironmentDefaults(db, envs, {
+              companyId,
+              adapterType: agent.adapterType,
+            })),
         instanceDefaultEnvironmentId:
           (await settings.get()).defaultEnvironmentId ?? null,
         localDefaultEnvironmentId: local.id,

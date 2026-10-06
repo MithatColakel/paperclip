@@ -411,7 +411,7 @@ describe("environment routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
-    expect(mockEnvironmentService.list).toHaveBeenCalledWith({
+    expect(mockEnvironmentService.list).toHaveBeenCalledWith("company-1", {
       status: undefined,
       driver: "local",
     });

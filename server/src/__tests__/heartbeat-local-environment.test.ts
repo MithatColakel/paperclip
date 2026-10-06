@@ -10,12 +10,15 @@ import {
   createDb,
   environmentLeases,
   environments,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { environmentService } from "../services/environments.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -223,5 +226,73 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       apiKeyPresent: true,
     });
     expect(captured.apiUrl).toEqual(expect.stringMatching(/^https?:\/\//));
+  });
+  async function seedProcessAgent(companyId: string) {
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ProcessAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return agentId;
+  }
+
+  async function seedUnreachableSshEnvironment() {
+    const id = randomUUID();
+    await db.insert(environments).values({
+      id,
+      name: "Unreachable SSH runner",
+      driver: "ssh",
+      status: "active",
+      config: { host: "127.0.0.1", port: 1, username: "nobody", remoteWorkspacePath: "/tmp" },
+    });
+    return id;
+  }
+
+  it("runs on the project default ahead of the instance default", async () => {
+    const companyId = randomUUID();
+    const agentId = await seedProcessAgent(companyId);
+    const local = await environmentService(db).ensureLocalEnvironment(companyId);
+    // Without the project default the run would land on this SSH runner.
+    await instanceSettingsService(db).update({ defaultEnvironmentId: await seedUnreachableSshEnvironment() });
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Local work", defaultEnvironmentId: local.id });
+
+    const queued = await heartbeat.invoke(agentId, "on_demand", { projectId }, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+    const leases = await waitForRunLeasesToRelease(db, queued!.id);
+    expect(leases[0]?.environmentId).toBe(local.id);
+  });
+
+  it("skips a company default the agent's adapter cannot run in", async () => {
+    const companyId = randomUUID();
+    const agentId = await seedProcessAgent(companyId);
+    // The process adapter runs only on the local host, so an SSH company
+    // default is skipped instead of failing the run.
+    await db
+      .update(companies)
+      .set({ defaultEnvironmentId: await seedUnreachableSshEnvironment() })
+      .where(eq(companies.id, companyId));
+
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+    const local = await environmentService(db).ensureLocalEnvironment(companyId);
+    const leases = await waitForRunLeasesToRelease(db, queued!.id);
+    expect(leases[0]?.environmentId).toBe(local.id);
   });
 });

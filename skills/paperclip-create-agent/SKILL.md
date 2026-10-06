@@ -96,6 +96,7 @@ curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt" \
 - `desiredSkills` from the company skill library when this role needs installed skills on day one
 - if any `desiredSkills` or adapter settings expand browser access, external-system reach, filesystem scope, or secret-handling capability, justify each one in the hire comment
 - adapter and runtime config aligned to this environment
+- where the agent runs (`defaultEnvironmentId`): leave it unset so the agent follows its project's or the company's default device. Set it only when the board gave you the environment id for a role that must run on one specific machine (for example a build Mac for iOS work). Otherwise say in the hire comment which machine the role needs; the board picks the device when approving the hire.
 - leave timer heartbeats off by default; only set `runtimeConfig.heartbeat.enabled=true` with an `intervalSec` when the role genuinely needs scheduled recurring work or the user explicitly asked for it
 - if the role may handle private advisories or sensitive disclosures, confirm a confidential workflow exists first (dedicated skill or documented manual process)
 - capabilities

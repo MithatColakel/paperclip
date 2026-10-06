@@ -3,6 +3,7 @@ import type { AgentEnvConfig } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { goals } from "./goals.js";
 import { agents } from "./agents.js";
+import { environments } from "./environments.js";
 
 export const projects = pgTable(
   "projects",
@@ -21,11 +22,13 @@ export const projects = pgTable(
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     executionWorkspacePolicy: jsonb("execution_workspace_policy").$type<Record<string, unknown>>(),
+    defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     companyIdx: index("projects_company_idx").on(table.companyId),
+    companyDefaultEnvironmentIdx: index("projects_company_default_environment_idx").on(table.companyId, table.defaultEnvironmentId),
   }),
 );
