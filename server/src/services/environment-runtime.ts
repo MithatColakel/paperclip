@@ -32,6 +32,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
+import { realizeDeviceWorkspace, type RealizedDeviceWorkspace } from "@paperclipai/adapter-utils/device-workspace";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -80,7 +81,7 @@ import {
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
-import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+import { buildWorkspaceRealizationRecordFromDriverInput, readWorkspaceRealizationRequest } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
   type DeferredOrphanCleanupRecord,
@@ -1176,6 +1177,44 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+// SSH device mode: the host keeps the authoritative git worktree for each
+// execution workspace (see `@paperclipai/adapter-utils/device-workspace`).
+// Only a git worktree workspace with its own branch qualifies; anything else
+// (a shared project checkout, a plain folder) keeps the copy mode.
+async function realizeSshDeviceWorkspace(
+  db: Db,
+  input: EnvironmentDriverRealizeWorkspaceInput,
+): Promise<RealizedDeviceWorkspace | null> {
+  const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, input.environment, {
+    issueId: input.lease.issueId,
+    heartbeatRunId: input.lease.heartbeatRunId,
+  });
+  if (parsed.driver !== "ssh" || parsed.config.workspaceMode !== "device") return null;
+  const request = readWorkspaceRealizationRequest(input.workspace.metadata?.workspaceRealizationRequest);
+  const localDir = input.workspace.localPath?.trim();
+  const branchName = request?.source.branchName?.trim();
+  const workspaceKey = request?.executionWorkspaceId ?? input.lease.executionWorkspaceId;
+  if (!request || request.source.strategy !== "git_worktree" || !branchName || !localDir || !workspaceKey) {
+    logger.info(
+      { environmentId: input.environment.id, leaseId: input.lease.id, strategy: request?.source.strategy ?? null },
+      "SSH device mode needs a git worktree workspace with a branch; using copy mode for this run",
+    );
+    return null;
+  }
+  const remoteWorkspacePath = typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim()
+    ? input.lease.metadata.remoteCwd.trim()
+    : parsed.config.remoteWorkspacePath;
+  return await realizeDeviceWorkspace({
+    spec: { ...parsed.config, remoteWorkspacePath },
+    localDir,
+    repoUrl: request.source.repoUrl,
+    branchName,
+    companyId: input.lease.companyId,
+    workspaceKey,
+    runId: input.lease.heartbeatRunId ?? input.lease.id,
+  });
+}
+
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
 
@@ -1220,14 +1259,29 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async realizeWorkspace(input) {
+      const device = await realizeSshDeviceWorkspace(db, input);
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,
         lease: input.lease,
         workspace: input.workspace,
-        cwd:
+        cwd: device?.worktreePath ?? (
           typeof input.lease.metadata?.remoteCwd === "string" && input.lease.metadata.remoteCwd.trim().length > 0
             ? input.lease.metadata.remoteCwd.trim()
-            : input.workspace.remotePath ?? input.workspace.localPath ?? null,
+            : input.workspace.remotePath ?? input.workspace.localPath ?? null
+        ),
+        providerMetadata: device
+          ? {
+              remoteCwd: device.worktreePath,
+              workspaceRealization: { mode: "in_place", authoritativeRoot: device.worktreePath },
+              device: {
+                branch: device.branch,
+                head: device.head,
+                created: device.created,
+                seeded: device.seeded,
+                messages: device.messages,
+              },
+            }
+          : null,
       });
       return {
         cwd: record.remote.path ?? record.local.path,

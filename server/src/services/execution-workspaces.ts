@@ -1,4 +1,9 @@
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
+import { readDeviceWorkspaceState } from "@paperclipai/adapter-utils/device-workspace";
+import {
+  readDeviceWorkspaceStateForCleanup,
+  removeDeviceWorktreeForArchivedWorkspace,
+} from "./device-workspace-cleanup.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -1739,6 +1744,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         executionWorkspaceId: workspace.id,
         workspaceCwd: workspace.cwd,
       });
+      const deviceState = await readDeviceWorkspaceStateForCleanup(workspace.providerRef ?? workspace.cwd);
       const cleanup = await cleanupExecutionWorkspaceArtifacts({
         workspace,
         projectWorkspace,
@@ -1758,6 +1764,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         runCleanupCommands: false,
         forceWorktreeRemoval: false,
       });
+      if (cleanup.cleaned && deviceState) {
+        cleanup.warnings.push(...await removeDeviceWorktreeForArchivedWorkspace(db, workspace.companyId, deviceState));
+      }
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
           .update(issues)
@@ -2415,6 +2424,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           git.behindCount === 1
             ? `This workspace is 1 commit behind ${git.baseRef ?? "the base ref"}.`
             : `This workspace is ${git.behindCount} commits behind ${git.baseRef ?? "the base ref"}.`,
+        );
+      }
+      // An SSH device workspace is the authoritative copy; work that is not on
+      // origin exists only on that device.
+      const deviceState = workspacePath ? await readDeviceWorkspaceState(workspacePath) : null;
+      if (deviceState && (deviceState.uncommittedCount > 0 || deviceState.unpushedCount > 0)) {
+        const pending = [
+          deviceState.uncommittedCount > 0 ? `${deviceState.uncommittedCount} uncommitted change(s)` : null,
+          deviceState.unpushedCount > 0 ? `${deviceState.unpushedCount} commit(s) not on origin` : null,
+        ].filter(Boolean).join(" and ");
+        blockingReasons.push(
+          `The device workspace ${deviceState.username}@${deviceState.host}:${deviceState.worktreePath} still has ${pending}. Push or discard them on the device before closing.`,
         );
       }
 

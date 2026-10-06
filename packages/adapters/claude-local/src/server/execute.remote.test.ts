@@ -95,6 +95,67 @@ describe("claude remote execution", () => {
     }
   });
 
+  it("runs in an SSH device workspace without moving the workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-device-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const deviceWorktree = "/device/root/.paperclip-device/worktrees/company-1/ew-1";
+    const spec = {
+      host: "127.0.0.1",
+      port: 1,
+      username: "fixture",
+      remoteWorkspacePath: "/device/root",
+      remoteCwd: deviceWorktree,
+      privateKey: null,
+      knownHosts: null,
+      strictHostKeyChecking: false,
+    };
+    const logs: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await execute({
+        runId: "run-1",
+        agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: "claude" },
+        context: {
+          paperclipWorkspace: { cwd: workspaceDir, source: "project_primary", strategy: "git_worktree", worktreePath: workspaceDir },
+        },
+        executionTarget: {
+          kind: "remote",
+          transport: "ssh",
+          remoteCwd: deviceWorktree,
+          spec,
+          workspaceRealization: {
+            mode: "in_place",
+            authoritativeRoot: deviceWorktree,
+            pathAliases: [],
+            outboundRestorePaths: [],
+          },
+        },
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(prepareWorkspaceForSshExecution).not.toHaveBeenCalled();
+    expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+    // Runtime assets go to a per-run directory outside the git worktree.
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/device/root/.paperclip-device/runtime/run-1/claude/skills",
+    }));
+    const call = runChildProcess.mock.calls.at(-1) as unknown as
+      | [string, string, string[], { remoteExecution?: { remoteCwd: string } | null }]
+      | undefined;
+    expect(call?.[3].remoteExecution?.remoteCwd).toBe(deviceWorktree);
+    expect(logs.join("")).toContain(`Using the device workspace ${deviceWorktree}`);
+    expect(logs.join("")).toContain("Finishing the device workspace run");
+  });
+
   it("prepares the workspace, syncs Claude runtime assets, and restores workspace changes for remote SSH execution", async () => {
     vi.stubEnv("CLAUDE_CODE_USE_BEDROCK", "1");
     vi.stubEnv("ANTHROPIC_MODEL", "host-only-model");

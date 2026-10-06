@@ -76,6 +76,8 @@ type EnvironmentFormState = {
   sshPrivateKeySecretId: string;
   sshKnownHosts: string;
   sshStrictHostKeyChecking: boolean;
+  /** SSH `workspaceMode: "device"`: the host keeps the authoritative worktree. */
+  sshDeviceWorkspace: boolean;
   sandboxProvider: string;
   sandboxConfig: Record<string, unknown>;
   envVars: Record<string, EnvBinding>;
@@ -134,6 +136,7 @@ function buildEnvironmentPayload(form: EnvironmentFormState) {
                 : { type: "secret_ref" as const, secretId: form.sshPrivateKeySecretId, version: "latest" as const },
             knownHosts: form.sshKnownHosts.trim() || null,
             strictHostKeyChecking: form.sshStrictHostKeyChecking,
+            workspaceMode: form.sshDeviceWorkspace ? ("device" as const) : ("copy" as const),
           }
         : form.driver === "sandbox"
           ? {
@@ -157,6 +160,7 @@ function createEmptyEnvironmentForm(): EnvironmentFormState {
     sshPrivateKeySecretId: "",
     sshKnownHosts: "",
     sshStrictHostKeyChecking: true,
+    sshDeviceWorkspace: false,
     sandboxProvider: "",
     sandboxConfig: {},
     envVars: {},
@@ -203,6 +207,7 @@ function readSshConfig(environment: Environment) {
       typeof config.strictHostKeyChecking === "boolean"
         ? config.strictHostKeyChecking
         : true,
+    deviceWorkspace: config.workspaceMode === "device",
   };
 }
 
@@ -233,6 +238,7 @@ function createEnvironmentFormFromEnvironment(environment: Environment): Environ
       sshPrivateKeySecretId: ssh.privateKeySecretId,
       sshKnownHosts: ssh.knownHosts,
       sshStrictHostKeyChecking: ssh.strictHostKeyChecking,
+      sshDeviceWorkspace: ssh.deviceWorkspace,
       envVars: environment.envVars ?? {},
       companyOnly: Boolean(environment.companyId),
     };
@@ -2376,6 +2382,15 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                       checked={environmentForm.sshStrictHostKeyChecking}
                       onChange={(checked) =>
                         setEnvironmentForm((current) => ({ ...current, sshStrictHostKeyChecking: checked }))}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <ToggleField
+                      label="Keep workspaces on the device"
+                      hint="The device keeps its own clone and one git worktree per task under .paperclip-device in the remote workspace path, fetches from origin with its own GitHub login and pushes the task branch after each run. Only skills and settings move per run, and build caches stay. Use a folder that only Paperclip uses."
+                      checked={environmentForm.sshDeviceWorkspace}
+                      onChange={(checked) =>
+                        setEnvironmentForm((current) => ({ ...current, sshDeviceWorkspace: checked }))}
                     />
                   </div>
                 </div>

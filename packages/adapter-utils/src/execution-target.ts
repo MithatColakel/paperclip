@@ -87,6 +87,7 @@ import {
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { deviceRuntimeDir, finishDeviceWorkspaceRun, isDeviceWorktreePath } from "./device-workspace.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import {
   runWithRuntimeParent,
@@ -1500,19 +1501,29 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   }
 
   if (target.transport === "ssh") {
+    // A device workspace (SSH `workspaceMode: "device"`) is the authoritative
+    // copy on the host: nothing of the workspace moves, the runtime assets go
+    // to a per-run directory outside the git worktree, and the run ends by
+    // pushing the branch and fast-forwarding the server copy.
+    const deviceWorktree = target.workspaceRealization?.mode === "in_place"
+      && isDeviceWorktreePath(target.workspaceRealization.authoritativeRoot)
+      ? target.workspaceRealization.authoritativeRoot
+      : null;
     const prepared = await prepareRemoteManagedRuntime({
       spec: target.spec,
       runId: input.runId,
       adapterKey: input.adapterKey,
       workspaceLocalDir: input.workspaceLocalDir,
-      workspaceRemoteDir: input.workspaceRemoteDir,
-      syncWorkspace: input.syncWorkspace,
+      workspaceRemoteDir: deviceWorktree ?? input.workspaceRemoteDir,
+      syncWorkspace: deviceWorktree ? false : input.syncWorkspace,
       workspaceFileMode: input.workspaceFileMode,
       workspaceExclude: input.workspaceExclude,
       assets: input.assets,
       additionalSources: input.additionalSources,
       onProgress: input.onProgress,
-      runtimeRemoteDir: input.runtimeRemoteDir,
+      runtimeRemoteDir: deviceWorktree
+        ? deviceRuntimeDir(target.spec.remoteWorkspacePath, input.runId)
+        : input.runtimeRemoteDir,
       registerTransferProcess: registerRunTransferProcess(input.runId),
     });
     return {
@@ -1525,7 +1536,19 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       // reports a per-project staging failure.
       additionalSourceFailures: [],
       workspaceSyncSnapshot: null,
-      restoreWorkspace: prepared.restoreWorkspace,
+      restoreWorkspace: deviceWorktree
+        ? async (onProgress?: RuntimeProgressSink) => {
+          await finishDeviceWorkspaceRun({
+            spec: target.spec,
+            environmentId: target.environmentId ?? null,
+            worktreePath: deviceWorktree,
+            localDir: input.workspaceLocalDir,
+            runId: input.runId,
+            onLog: onProgress ?? input.onProgress,
+          });
+          await prepared.restoreWorkspace(onProgress);
+        }
+        : prepared.restoreWorkspace,
     };
   }
 
