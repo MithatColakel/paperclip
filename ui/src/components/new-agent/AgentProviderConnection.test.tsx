@@ -22,6 +22,12 @@ const managedApi = vi.hoisted(() => ({
   create: vi.fn(async () => ({ connectionId: "managed-connection", grantId: "managed-grant" })),
 }));
 vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: managedApi }));
+const pluginApi = vi.hoisted(() => ({
+  list: vi.fn(async () => [] as Array<{ id: string; pluginKey: string }>),
+  bridgeGetData: vi.fn(),
+  bridgePerformAction: vi.fn(),
+}));
+vi.mock("@/api/plugins", () => ({ pluginsApi: pluginApi }));
 vi.mock("@/api/agents", () => ({
   agentsApi: {
     getAdapterAuthSignal: mocks.auth,
@@ -164,8 +170,11 @@ describe("AgentProviderConnection reuse", () => {
     const intent = { provider: "anthropic" as const, method: "subscription" as const, name: "Hosted account", ownership: "shared" as const, agentIds: ["11111111-1111-4111-8111-111111111111"], allAgents: false };
     await mount("claude_local", false, false, false, false, false, { intent, onComplete }, true, "authenticated", false);
     openProvider();
-    expect(host.textContent).toContain("claude setup-token");
+    expect(host.textContent).toContain("From a Mac");
     expect(host.textContent).not.toContain("This environment does not support browser sign-in");
+    expect(primaryButton("Connect").disabled).toBe(true);
+    click("Enter token");
+    expect(host.textContent).toContain("claude setup-token");
     expect(primaryButton("Connect").disabled).toBe(true);
     // Terminals wrap long tokens; the pasted line breaks are removed.
     typeInto(host.querySelector('input[type="password"]') as HTMLInputElement, `${SETUP_TOKEN.slice(0, 40)}\n${SETUP_TOKEN.slice(40)}`);
@@ -176,6 +185,34 @@ describe("AgentProviderConnection reuse", () => {
     expect(managedApi.startLocalLogin).not.toHaveBeenCalled();
     expect(mocks.loginPanel).not.toHaveBeenCalled();
   });
+  it("connects a Claude subscription with the token a company Mac sends back", async () => {
+    pluginApi.list.mockResolvedValue([{ id: "mac-fleet-plugin", pluginKey: "paperclip.mac-fleet" }]);
+    pluginApi.bridgeGetData.mockImplementation(async (_plugin: string, key: string) => key === "claude-token-devices"
+      ? { data: { devices: [
+          { id: "mac-1", name: "Office Mac mini", online: true, claude: { loggedIn: true, subscriptionType: "max", emailMasked: "y***k@gmail.com" } },
+          { id: "mac-2", name: "Away MacBook", online: false, claude: null },
+        ] } }
+      : { data: { status: "fulfilled", expiresAt: "2099-01-01T00:00:00.000Z" } });
+    pluginApi.bridgePerformAction.mockImplementation(async (_plugin: string, key: string) => key === "request-claude-token"
+      ? { data: { requestId: "request-1", expiresAt: "2099-01-01T00:00:00.000Z" } }
+      : { data: { token: SETUP_TOKEN, accountLabel: "Claude Max · y***k@gmail.com" } });
+    const onComplete = vi.fn();
+    const intent = { provider: "anthropic" as const, method: "subscription" as const, name: "Office Max", ownership: "shared" as const, agentIds: [], allAgents: true };
+    await mount("claude_local", false, false, false, false, false, { intent, onComplete }, true, "authenticated", false);
+    openProvider();
+    click("From a Mac");
+    await vi.waitFor(() => expect(host.textContent).toContain("Office Mac mini"));
+    expect(host.textContent).toContain("Claude Max · y***k@gmail.com · online");
+    expect(primaryButton("Request from Mac").disabled).toBe(true);
+    expect(([...host.querySelectorAll('[role="option"]')] as HTMLButtonElement[]).find((b) => b.textContent?.includes("Away MacBook"))!.disabled).toBe(true);
+    click("Office Mac mini");
+    expect(primaryButton("Request from Mac").disabled).toBe(false);
+    click("Request from Mac");
+    await vi.waitFor(() => expect(pluginApi.bridgePerformAction).toHaveBeenCalledWith("mac-fleet-plugin", "request-claude-token", { deviceId: "mac-1" }, "c1"));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith({ connectionId: "managed-connection", grantId: "managed-grant", method: "subscription" }), { timeout: 8000 });
+    expect(pluginApi.bridgePerformAction).toHaveBeenCalledWith("mac-fleet-plugin", "collect-claude-token", { requestId: "request-1" }, "c1");
+    expect(managedApi.create).toHaveBeenCalledWith("c1", { ...intent, method: "subscription", setupToken: SETUP_TOKEN });
+  }, 15000);
   it("connects a new agent's Claude subscription with a setup token on an SSH environment", async () => {
     const { test, connected } = await mount("claude_local", false, false, false, false);
     openProvider();
