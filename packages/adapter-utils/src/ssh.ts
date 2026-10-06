@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -8,13 +8,17 @@ import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
+  disposeGitWorkspaceSnapshot,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   PROJECT_REPOSITORIES_DIR,
+  readGitWorkspaceSnapshot,
   readSanitizedOriginRemoteUrl,
+  type GitWorkspaceSnapshot,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { workspacePaths } from "./workspace-manifest.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -40,6 +44,13 @@ export interface SshCommandResult {
 export interface SshRemoteExecutionSpec extends SshConnectionConfig {
   remoteCwd: string;
 }
+
+/**
+ * Lets a caller expose an in-flight transfer process (for example to the run's
+ * cancellation registry) for as long as the transfer runs. The returned
+ * function unregisters it.
+ */
+export type SshTransferProcessRegistrar = (child: ChildProcess) => () => void;
 
 export function createSshCommandManagedRuntimeRunner(input: {
   spec: SshRemoteExecutionSpec;
@@ -322,6 +333,10 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
+      // A remote that exits before reading stdin turns this write into EPIPE.
+      // The close handler reports the exit; an unheard stream error would
+      // crash the whole host process instead.
+      child.stdin.on("error", () => undefined);
       child.stdin.end(options.stdin);
     }
   });
@@ -381,6 +396,12 @@ async function createSshAuthArgs(
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=10",
+    // Detect a dead tunnel in about a minute instead of hanging a transfer
+    // until the TCP stack gives up.
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
     "-o",
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
   ];
@@ -414,6 +435,23 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
   return combined.flatMap((entry) => ["--exclude", entry]);
 }
 
+// Escapes a literal path for a tar exclude pattern (GNU tar and bsdtar both
+// treat `*`, `?`, `[` and `\` as wildcard syntax in exclusions).
+function escapeTarExcludePattern(entry: string): string {
+  return entry.replace(/\\/g, "\\\\").replace(/([*?[])/g, "\\$1");
+}
+
+// One exclude pattern per line for `tar -X`. Literal paths can be numerous
+// (every git-ignored path of a workspace), so they travel in a file instead of
+// the command line. A path containing a newline cannot be expressed this way
+// and is dropped.
+function tarExcludeFileContents(literalPaths: readonly string[]): string {
+  return literalPaths
+    .filter((entry) => entry.length > 0 && !entry.includes("\n"))
+    .map(escapeTarExcludePattern)
+    .join("\n");
+}
+
 function tarSpawnEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -439,11 +477,13 @@ function tarPatternToRegExp(pattern: string): RegExp {
 async function estimateLocalDirSize(input: {
   localDir: string;
   exclude?: string[];
+  excludeLiterals?: readonly string[];
   followSymlinks?: boolean;
 }): Promise<number> {
   const regexes = ["._*", ...(input.exclude ?? [])].map(tarPatternToRegExp);
+  const literals = new Set(input.excludeLiterals ?? []);
   const isExcluded = (relPath: string, base: string) =>
-    regexes.some((regex) => regex.test(relPath) || regex.test(base));
+    literals.has(relPath) || regexes.some((regex) => regex.test(relPath) || regex.test(base));
 
   let total = 0;
   const walk = async (dir: string, relative: string): Promise<void> => {
@@ -653,6 +693,7 @@ async function streamLocalFileToSsh(input: {
   localFile: string;
   remoteScript: string;
   progress?: TransferProgress;
+  registerTransferProcess?: SshTransferProcessRegistrar;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -663,14 +704,17 @@ async function streamLocalFileToSsh(input: {
     `sh -c ${shellQuote(input.remoteScript)}`,
   ];
 
+  let unregister: () => void = () => undefined;
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
     });
+    unregister = input.registerTransferProcess?.(ssh) ?? unregister;
 
     let sshStderr = "";
     let settled = false;
+    let pipeError: Error | null = null;
 
     const fail = (error: Error) => {
       if (settled) return;
@@ -680,9 +724,17 @@ async function streamLocalFileToSsh(input: {
       reject(error);
     };
 
+    // When ssh dies mid-transfer, writing into its stdin fails with EPIPE.
+    // Stop feeding it and let the close handler report ssh's own error.
+    const onPipeError = (error: Error) => {
+      pipeError ??= error;
+      source.destroy();
+    };
+
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
+    ssh.stdin?.on("error", onPipeError);
     source.on("error", fail);
     ssh.on("error", fail);
     if (input.progress) {
@@ -691,16 +743,23 @@ async function streamLocalFileToSsh(input: {
     } else {
       source.pipe(ssh.stdin ?? null);
     }
-    ssh.on("close", (code) => {
+    ssh.on("close", (code, signal) => {
       if (settled) return;
       settled = true;
-      if ((code ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+      if ((code ?? 0) !== 0 || signal) {
+        reject(new Error(sshStderr.trim() || `ssh exited with ${signal ? `signal ${signal}` : `code ${code ?? -1}`}`));
+        return;
+      }
+      if (pipeError) {
+        reject(pipeError);
         return;
       }
       resolve();
     });
-  }).finally(auth.cleanup);
+  }).finally(async () => {
+    unregister();
+    await auth.cleanup();
+  });
 }
 
 async function streamSshToLocalFile(input: {
@@ -744,6 +803,7 @@ async function streamSshToLocalFile(input: {
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
+    ssh.stdout?.on("error", fail);
     ssh.on("error", fail);
     sink.on("error", fail);
     ssh.on("close", (code) => {
@@ -766,6 +826,7 @@ async function importGitWorkspaceToSsh(input: {
   remoteDir: string;
   snapshot: LocalGitWorkspaceSnapshot;
   onProgress?: RuntimeProgressSink;
+  registerTransferProcess?: SshTransferProcessRegistrar;
 }): Promise<void> {
   const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bundle-"));
   const bundlePath = path.join(bundleDir, "workspace.bundle");
@@ -829,6 +890,7 @@ async function importGitWorkspaceToSsh(input: {
         localFile: bundlePath,
         remoteScript: remoteSetupScript,
         progress: progress ?? undefined,
+        registerTransferProcess: input.registerTransferProcess,
       });
       await progress?.finish();
     } catch (error) {
@@ -1120,8 +1182,11 @@ async function transportGitWorkspaceToSsh(input: {
   remoteDir: string;
   snapshot: LocalGitWorkspaceSnapshot;
   exclude?: string[];
+  /** Exact relative paths (git-ignored paths) to leave out of the upload. */
+  excludeLiterals?: readonly string[];
   onProgress?: RuntimeProgressSink;
   progressLabel: string;
+  registerTransferProcess?: SshTransferProcessRegistrar;
 }): Promise<void> {
   await importGitWorkspaceToSsh({
     spec: input.spec,
@@ -1129,14 +1194,17 @@ async function transportGitWorkspaceToSsh(input: {
     remoteDir: input.remoteDir,
     snapshot: input.snapshot,
     onProgress: input.onProgress,
+    registerTransferProcess: input.registerTransferProcess,
   });
   await syncDirectoryToSsh({
     spec: input.spec,
     localDir: input.localDir,
     remoteDir: input.remoteDir,
     exclude: [".git", ".paperclip-runtime", ...(input.exclude ?? [])],
+    excludeLiterals: input.excludeLiterals,
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
+    registerTransferProcess: input.registerTransferProcess,
   });
   await removeDeletedPathsOnSsh({
     spec: input.spec,
@@ -1404,9 +1472,12 @@ export async function syncDirectoryToSsh(input: {
   localDir: string;
   remoteDir: string;
   exclude?: string[];
+  /** Exact relative paths to leave out (for example git-ignored paths). */
+  excludeLiterals?: readonly string[];
   followSymlinks?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
+  registerTransferProcess?: SshTransferProcessRegistrar;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -1416,6 +1487,9 @@ export async function syncDirectoryToSsh(input: {
     `${input.spec.username}@${input.spec.host}`,
     `sh -c ${shellQuote(`mkdir -p ${shellQuote(input.remoteDir)} && tar -xf - -C ${shellQuote(input.remoteDir)}`)}`,
   ];
+  const excludeFile = input.excludeLiterals && input.excludeLiterals.length > 0
+    ? await withTempFile("paperclip-ssh-tar-exclude-", tarExcludeFileContents(input.excludeLiterals), 0o600)
+    : null;
 
   // tar's archive size isn't known until tar finishes, so estimate it from the
   // local file sizes and clamp the reported percent to 99% until the pipe closes.
@@ -1430,12 +1504,14 @@ export async function syncDirectoryToSsh(input: {
       totalBytes: estimateLocalDirSize({
         localDir: input.localDir,
         exclude: input.exclude,
+        excludeLiterals: input.excludeLiterals,
         followSymlinks: input.followSymlinks,
       }),
       estimated: true,
     })
     : null;
 
+  let unregister: () => void = () => undefined;
   try {
     await new Promise<void>((resolve, reject) => {
     const tarArgs = [
@@ -1443,6 +1519,7 @@ export async function syncDirectoryToSsh(input: {
       "-C",
       input.localDir,
       ...tarExcludeArgs(input.exclude),
+      ...(excludeFile ? ["-X", excludeFile.path] : []),
       "-cf",
       "-",
       ".",
@@ -1454,6 +1531,7 @@ export async function syncDirectoryToSsh(input: {
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
     });
+    unregister = input.registerTransferProcess?.(ssh) ?? unregister;
 
     let tarStderr = "";
     let sshStderr = "";
@@ -1462,18 +1540,25 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let sshSignal: NodeJS.Signals | null = null;
+    let pipeError: Error | null = null;
 
     const maybeFinish = () => {
       if (settled || !tarExited || !sshExited) {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
-        reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
+      // ssh's own error explains a broken pipe better than the EPIPE it caused.
+      if ((sshExitCode ?? 0) !== 0 || sshSignal) {
+        reject(new Error(sshStderr.trim() || `ssh exited with ${sshSignal ? `signal ${sshSignal}` : `code ${sshExitCode ?? -1}`}`));
         return;
       }
-      if ((sshExitCode ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
+      if (pipeError) {
+        reject(pipeError);
+        return;
+      }
+      if ((tarExitCode ?? 0) !== 0) {
+        reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
       resolve();
@@ -1488,6 +1573,17 @@ export async function syncDirectoryToSsh(input: {
       ssh.kill("SIGTERM");
       reject(error);
     };
+
+    // When ssh dies mid-transfer (a dropped tunnel, a cancelled run), writing
+    // into its stdin fails with EPIPE. An unheard stream error would crash the
+    // whole host process, so record it, stop the producer, and let the close
+    // handlers settle the transfer.
+    const onPipeError = (error: Error) => {
+      pipeError ??= error;
+      tar.kill("SIGTERM");
+    };
+    ssh.stdin?.on("error", onPipeError);
+    tar.stdout?.on("error", onPipeError);
 
     if (progress) {
       progress.counter.on("error", fail);
@@ -1509,12 +1605,19 @@ export async function syncDirectoryToSsh(input: {
       tarExitCode = code;
       maybeFinish();
     });
-    ssh.on("close", (code) => {
+    ssh.on("close", (code, signal) => {
       sshExited = true;
       sshExitCode = code;
+      sshSignal = signal;
+      // Nothing reads tar's output any more; make sure it does not linger.
+      if (!tarExited) tar.kill("SIGTERM");
       maybeFinish();
     });
-    }).finally(auth.cleanup);
+    }).finally(async () => {
+      unregister();
+      await auth.cleanup();
+      await excludeFile?.cleanup();
+    });
     await progress?.finish();
   } catch (error) {
     await progress?.fail();
@@ -1527,16 +1630,33 @@ export async function syncDirectoryFromSsh(input: {
   remoteDir: string;
   localDir: string;
   exclude?: string[];
+  /** Exact relative paths to leave on the remote (for example git-ignored paths). */
+  excludeLiterals?: readonly string[];
   preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
-  const remoteTarScript = [
-    `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
-  ].join(" && ");
+  const tarExcludeWords = tarExcludeArgs(input.exclude).map(shellQuote);
+  // Literal excludes can be numerous, so they reach the remote tar as an
+  // exclude file streamed over stdin instead of on the command line.
+  const excludeFileContents = input.excludeLiterals && input.excludeLiterals.length > 0
+    ? `${tarExcludeFileContents(input.excludeLiterals)}\n`
+    : null;
+  const remoteTarScript = excludeFileContents
+    ? [
+      "set -e",
+      'exclude_file=$(mktemp "${TMPDIR:-/tmp}/paperclip-tar-exclude.XXXXXX")',
+      'trap \'rm -f "$exclude_file"\' EXIT',
+      'cat > "$exclude_file"',
+      `cd ${shellQuote(input.remoteDir)}`,
+      `tar ${[...tarExcludeWords, "-X", '"$exclude_file"', "-cf", "-", "."].join(" ")}`,
+    ].join("\n")
+    : [
+      `cd ${shellQuote(input.remoteDir)}`,
+      `tar ${[...tarExcludeWords, "-cf", "-", "."].join(" ")}`,
+    ].join(" && ");
   const sshArgs = [
     ...auth.args,
     "-p",
@@ -1563,7 +1683,7 @@ export async function syncDirectoryFromSsh(input: {
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [excludeFileContents ? "pipe" : "ignore", "pipe", "pipe"],
       });
       const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
         stdio: ["pipe", "ignore", "pipe"],
@@ -1576,21 +1696,41 @@ export async function syncDirectoryFromSsh(input: {
       let sshExited = false;
       let tarExited = false;
       let sshExitCode: number | null = null;
+      let sshSignal: NodeJS.Signals | null = null;
       let tarExitCode: number | null = null;
+      let pipeError: Error | null = null;
 
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
-        if ((sshExitCode ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
+        if ((sshExitCode ?? 0) !== 0 || sshSignal) {
+          reject(new Error(sshStderr.trim() || `ssh exited with ${sshSignal ? `signal ${sshSignal}` : `code ${sshExitCode ?? -1}`}`));
           return;
         }
         if ((tarExitCode ?? 0) !== 0) {
           reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
           return;
         }
+        if (pipeError) {
+          reject(pipeError);
+          return;
+        }
         resolve();
       };
+
+      // A local tar that dies turns the pipe into EPIPE; a remote that exits
+      // early does the same to the exclude-file write. Record it and stop the
+      // producer instead of letting an unheard stream error crash the host.
+      const onPipeError = (error: Error) => {
+        pipeError ??= error;
+        ssh.kill("SIGTERM");
+      };
+      tar.stdin?.on("error", onPipeError);
+      ssh.stdout?.on("error", onPipeError);
+      if (excludeFileContents && ssh.stdin) {
+        ssh.stdin.on("error", onPipeError);
+        ssh.stdin.end(excludeFileContents);
+      }
 
       const fail = (error: Error) => {
         if (settled) return;
@@ -1615,14 +1755,16 @@ export async function syncDirectoryFromSsh(input: {
 
       ssh.on("error", fail);
       tar.on("error", fail);
-      ssh.on("close", (code) => {
+      ssh.on("close", (code, signal) => {
         sshExited = true;
         sshExitCode = code;
+        sshSignal = signal;
         maybeFinish();
       });
       tar.on("close", (code) => {
         tarExited = true;
         tarExitCode = code;
+        if (!sshExited && (code ?? 0) !== 0) ssh.kill("SIGTERM");
         maybeFinish();
       });
     });
@@ -1639,6 +1781,74 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
+// The workspace's git-ignored paths (build output, dependency trees, local
+// secrets): the anchor's relative to `localDir`, and each managed project
+// repository's (`.paperclip-repositories/*`) relative to that repository, which
+// travels as its own git checkout. They never travel to or from an SSH host:
+// the remote rebuilds them, and pulling remote build output back is what grew
+// a 160 MB workspace to 2 GB per run. The anchor list leaves the project
+// repositories out even though `.git/info/exclude` ignores their directory.
+// An unreadable snapshot falls back to sending everything, as before. The
+// snapshot keeps its path lists in a temporary manifest; `--directory`
+// collapses ignored trees, so the lists themselves stay small, and the
+// manifest is disposed before returning.
+async function readWorkspaceIgnoredPaths(
+  localDir: string,
+): Promise<{ anchor: string[]; repositories: Map<string, string[]> }> {
+  let snapshot: GitWorkspaceSnapshot | null = null;
+  try {
+    snapshot = await readGitWorkspaceSnapshot(localDir);
+    if (!snapshot) return { anchor: [], repositories: new Map() };
+    const projectRepositories = snapshot.repositories ?? [];
+    const repositories = new Map(
+      projectRepositories.map((repository) => [repository.path, [...workspacePaths(repository.snapshot.ignoredPaths)]]),
+    );
+    const anchor = [...workspacePaths(snapshot.ignoredPaths)].filter((relative) =>
+      !projectRepositories.some((repository) =>
+        relative === repository.path || relative.startsWith(`${repository.path}/`)));
+    return { anchor, repositories };
+  } catch {
+    return { anchor: [], repositories: new Map() };
+  } finally {
+    await disposeGitWorkspaceSnapshot(snapshot).catch(() => undefined);
+  }
+}
+
+// The remote workspace's own git-ignored paths, so build output an agent
+// created on the host stays there. A path the baseline still covers is kept
+// in the transfer: dropping it would read as a remote deletion.
+async function readRemoteIgnoredPathsOutsideBaseline(input: {
+  spec: SshConnectionConfig;
+  remoteDir: string;
+  baseline: DirectorySnapshot;
+}): Promise<string[]> {
+  let stdout = "";
+  try {
+    stdout = (await runSshScript(
+      input.spec,
+      `cd ${shellQuote(input.remoteDir)} && git ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null || true`,
+      { timeoutMs: 60_000, maxBuffer: 8 * 1024 * 1024 },
+    )).stdout;
+  } catch {
+    return [];
+  }
+  const covered = new Set<string>();
+  for (const [relative] of input.baseline.entries) {
+    covered.add(relative);
+    let slash = relative.lastIndexOf("/");
+    while (slash > 0) {
+      const parent = relative.slice(0, slash);
+      if (covered.has(parent)) break;
+      covered.add(parent);
+      slash = parent.lastIndexOf("/");
+    }
+  }
+  return stdout
+    .split("\0")
+    .map((entry) => entry.replace(/\/+$/, ""))
+    .filter((entry) => entry.length > 0 && !covered.has(entry));
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -1646,38 +1856,58 @@ export async function prepareWorkspaceForSshExecution(input: {
   onProgress?: RuntimeProgressSink;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
-}): Promise<{ gitBacked: boolean; repositories?: string[] }> {
+  registerTransferProcess?: SshTransferProcessRegistrar;
+}): Promise<{
+  gitBacked: boolean;
+  /** The anchor's git-ignored paths, left out of the upload and the pull-back. */
+  ignoredPaths: string[];
+  repositories?: string[];
+  /** Each transported project repository's own git-ignored paths, relative to it. */
+  repositoryIgnoredPaths?: Record<string, string[]>;
+}> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
     const repositories = await listLocalProjectRepositories(input.localDir);
+    const ignored = await readWorkspaceIgnoredPaths(input.localDir);
+    const ignoredPaths = ignored.anchor;
     await transportGitWorkspaceToSsh({
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
       snapshot: gitSnapshot,
       exclude: repositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : [],
+      excludeLiterals: ignoredPaths,
       onProgress: input.onProgress,
       progressLabel: "workspace",
+      registerTransferProcess: input.registerTransferProcess,
     });
     if (repositories.length > 0) {
       await excludeProjectRepositoriesOnSsh(input.spec, remoteDir);
     }
+    const repositoryIgnoredPaths: Record<string, string[]> = {};
     for (const relative of repositories) {
       const localDir = path.join(input.localDir, relative);
       const snapshot = await readLocalGitWorkspaceSnapshot(localDir);
       if (!snapshot) throw new Error(`Cannot read the Git state of project repository: ${relative}`);
+      repositoryIgnoredPaths[relative] = ignored.repositories.get(relative) ?? [];
       await transportGitWorkspaceToSsh({
         spec: input.spec,
         localDir,
         remoteDir: path.posix.join(remoteDir, relative),
         snapshot,
+        excludeLiterals: repositoryIgnoredPaths[relative],
         onProgress: input.onProgress,
         progressLabel: relative,
+        registerTransferProcess: input.registerTransferProcess,
       });
     }
-    return { gitBacked: true, ...(repositories.length > 0 ? { repositories } : {}) };
+    return {
+      gitBacked: true,
+      ignoredPaths,
+      ...(repositories.length > 0 ? { repositories, repositoryIgnoredPaths } : {}),
+    };
   }
 
   await clearRemoteDirectory({
@@ -1692,8 +1922,9 @@ export async function prepareWorkspaceForSshExecution(input: {
     exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
+    registerTransferProcess: input.registerTransferProcess,
   });
-  return { gitBacked: false };
+  return { gitBacked: false, ignoredPaths: [] };
 }
 
 export async function restoreWorkspaceFromSshExecution(input: {
@@ -1701,9 +1932,16 @@ export async function restoreWorkspaceFromSshExecution(input: {
   localDir: string;
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
+  /**
+   * The literal git-ignored paths the upload left out. They are part of
+   * `baselineSnapshot.exclude`, but reach the remote tar escaped, through an
+   * exclude file, together with the remote's own ignored paths.
+   */
+  ignoredPaths?: readonly string[];
   restoreGitHistory?: boolean;
   onProgress?: RuntimeProgressSink;
-  repositories?: Array<{ path: string; baselineSnapshot?: DirectorySnapshot }>;
+  /** Project repositories restored separately, each with its own baseline and git-ignored paths. */
+  repositories?: Array<{ path: string; baselineSnapshot?: DirectorySnapshot; ignoredPaths?: readonly string[] }>;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   const repositories = input.repositories ?? [];
@@ -1731,6 +1969,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
       localDir: path.join(input.localDir, repository.path),
       remoteDir: path.posix.join(remoteDir, repository.path),
       baselineSnapshot: repository.baselineSnapshot,
+      ignoredPaths: repository.ignoredPaths,
       restoreGitHistory: input.restoreGitHistory,
       onProgress: input.onProgress,
       progressLabel: repository.path,
@@ -1741,6 +1980,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
     localDir: input.localDir,
     remoteDir,
     baselineSnapshot: input.baselineSnapshot,
+    ignoredPaths: input.ignoredPaths,
     restoreGitHistory: input.restoreGitHistory,
     onProgress: input.onProgress,
     progressLabel: "workspace",
@@ -1753,6 +1993,8 @@ async function restoreWorkspaceRootFromSsh(input: {
   localDir: string;
   remoteDir: string;
   baselineSnapshot?: DirectorySnapshot;
+  /** The literal git-ignored paths the upload of this root left out. */
+  ignoredPaths?: readonly string[];
   restoreGitHistory?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel: string;
@@ -1775,11 +2017,18 @@ async function restoreWorkspaceRootFromSsh(input: {
           onProgress: input.onProgress,
         })
         : null;
+      const localIgnored = new Set(input.ignoredPaths ?? []);
+      const remoteIgnored = await readRemoteIgnoredPathsOutsideBaseline({
+        spec: input.spec,
+        remoteDir,
+        baseline: input.baselineSnapshot,
+      });
       await syncDirectoryFromSsh({
         spec: input.spec,
         remoteDir,
         localDir: stagingDir,
-        exclude: input.baselineSnapshot.exclude,
+        exclude: input.baselineSnapshot.exclude.filter((entry) => !localIgnored.has(entry)),
+        excludeLiterals: [...new Set([...localIgnored, ...remoteIgnored])],
         onProgress: input.onProgress,
         progressLabel: input.progressLabel,
       });

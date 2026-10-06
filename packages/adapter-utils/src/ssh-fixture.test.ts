@@ -736,7 +736,7 @@ describe("ssh env-lab fixture", () => {
     const config = await buildSshEnvLabFixtureConfig(started);
     const input = { spec: { ...config, remoteCwd: started.workspaceDir }, localDir,
       remoteDir: started.workspaceDir, workspaceFileMode: "all" as const };
-    expect(await prepareWorkspaceForSshExecution(input)).toEqual({ gitBacked: false });
+    expect(await prepareWorkspaceForSshExecution(input)).toEqual({ gitBacked: false, ignoredPaths: [] });
     expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
     await rm(path.join(localDir, "removed.txt"));
     await prepareWorkspaceForSshExecution(input);
@@ -993,7 +993,7 @@ describe("ssh env-lab fixture", () => {
       localDir: localRepo,
       remoteDir: started.workspaceDir,
     });
-    expect(prepared).toEqual({ gitBacked: true, repositories: [nestedRelative] });
+    expect(prepared).toEqual({ gitBacked: true, ignoredPaths: [], repositories: [nestedRelative], repositoryIgnoredPaths: { [nestedRelative]: [] } });
 
     await runSshCommand(
       config,
