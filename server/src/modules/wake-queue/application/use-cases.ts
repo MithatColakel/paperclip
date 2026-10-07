@@ -120,6 +120,14 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /**
+   * Drain a deferred queue that no live execution will drain: the issue has
+   * no execution lock and no live run. `runId` names the latest terminal run
+   * on the issue only as an anchor; its own finishing gates (an acknowledged
+   * stop, a reconciliation hold, the same-agent successor) do not apply, and
+   * an empty queue never escalates recovery from that old run.
+   */
+  orphanedQueue?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -309,6 +317,7 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  if (input.orphanedQueue) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -962,7 +971,7 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      { companyId: input.companyId, runId: input.runId, now: input.now, orphanedQueue: input.orphanedQueue },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 
