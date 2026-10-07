@@ -219,6 +219,9 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
   it("promotes a reassignment wake that carries the stopped run's hand-off comment", async () => {
     const { newAssigneeId, issueId, deferredWakeId } =
       await seedReassignedIssueWithDeferredWake({ withReassignmentComment: true });
+    // The stranded comment sweep rewrites updatedAt on every tick; the grace
+    // period must not depend on it.
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(eq(agentWakeupRequests.id, deferredWakeId));
 
     await heartbeat.resumeQueuedRuns();
 
