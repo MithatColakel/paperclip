@@ -9834,6 +9834,7 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
               })
               .from(executionWorkspaces)
               .where(
@@ -9843,7 +9844,15 @@ export function issueService(db: Db) {
                 ),
               )
               .then((rows) => rows[0] ?? null);
-            if (sourceWorkspace) {
+            // An execution workspace is a checkout of one project workspace's
+            // repository. A child placed in another project workspace (another
+            // repository) must realize its own; reusing the source checkout
+            // fails validation against the child's repository on every run.
+            const sharesSourceRepository =
+              projectWorkspaceId == null ||
+              sourceWorkspace?.projectWorkspaceId == null ||
+              sourceWorkspace.projectWorkspaceId === projectWorkspaceId;
+            if (sourceWorkspace && sharesSourceRepository) {
               executionWorkspaceId = sourceWorkspace.id;
               executionWorkspacePreference = "reuse_existing";
               executionWorkspaceSettings = {

@@ -19462,6 +19462,10 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    // Runs before the stranded sweep below: that sweep advances the cursor of
+    // every assignee comment queue it visits, even one it cannot anchor.
+    await promoteOrphanedDeferredWakes(cutoff);
+
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
@@ -19502,8 +19506,6 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
       });
     }
-
-    await promoteOrphanedDeferredWakes(cutoff);
 
     // The cancellation marker is durable intent. Retry while its exact queue
     // is still deferred, including after a failed cleanup promotion or restart.
