@@ -902,7 +902,7 @@ export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
-/** Normal release paths get this long to promote a deferred wake first. */
+/** Normal release paths get this long to promote a deferred wake first; also the retry backoff per issue. */
 const ORPHANED_DEFERRED_WAKE_GRACE_MS = 2 * 60 * 1000;
 /** Older stranded wakes are left alone rather than replayed long after the fact. */
 const ORPHANED_DEFERRED_WAKE_MAX_AGE_MS = 72 * 60 * 60 * 1000;
@@ -19595,8 +19595,16 @@ export function heartbeatService(
   // the issue, nothing else revisits that queue, so wakes for other agents and
   // for a new assignee stay deferred forever. Drain such a queue through the
   // normal release admission, anchored on the issue's latest terminal run.
+  // Issue id -> last orphaned-queue attempt. Other sweeps rewrite the wake
+  // rows' updatedAt on every tick, so the backoff cannot live in that column.
+  const orphanedQueueAttemptAt = new Map<string, number>();
+
   async function promoteOrphanedDeferredWakes(cutoff: Date | null) {
     const now = Date.now();
+    for (const [issueId, attemptedAt] of orphanedQueueAttemptAt) {
+      if (now - attemptedAt >= ORPHANED_DEFERRED_WAKE_GRACE_MS) orphanedQueueAttemptAt.delete(issueId);
+    }
+    const recentlyAttempted = [...orphanedQueueAttemptAt.keys()];
     const orphans = await db.selectDistinct({ companyId: issues.companyId, issueId: issues.id })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
@@ -19605,8 +19613,9 @@ export function heartbeatService(
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
         notInArray(issues.status, ["done", "cancelled"]),
+        recentlyAttempted.length ? notInArray(issues.id, recentlyAttempted) : undefined,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
-        lte(agentWakeupRequests.updatedAt, new Date(now - ORPHANED_DEFERRED_WAKE_GRACE_MS)),
+        lte(agentWakeupRequests.requestedAt, new Date(now - ORPHANED_DEFERRED_WAKE_GRACE_MS)),
         gte(agentWakeupRequests.requestedAt, new Date(now - ORPHANED_DEFERRED_WAKE_MAX_AGE_MS)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
         sql`not exists (select 1 from ${heartbeatRuns} live where live.company_id = ${issues.companyId}
@@ -19614,18 +19623,19 @@ export function heartbeatService(
           and live.status in ('queued', 'running', 'scheduled_retry'))`))
       .limit(20);
     for (const orphan of orphans) {
-      // Advance the cursor first so a queue that stays blocked is revisited
-      // only after the grace period, not on every scheduler tick.
-      const pending = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.companyId, orphan.companyId),
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        sql`${agentWakeupRequests.payload}->>'issueId' = ${orphan.issueId}`,
-      )).returning({ agentId: agentWakeupRequests.agentId });
+      // A queue that stays blocked is revisited after the grace period, not
+      // on every scheduler tick, and cannot starve other issues of the limit.
+      orphanedQueueAttemptAt.set(orphan.issueId, now);
       if (await getExecutionBlocker(db, orphan.companyId, orphan.issueId)) continue;
       // The drain fails a wake whose agent cannot run. A paused agent's saved
       // input waits for its resume instead of being discarded here.
+      const pending = await db.selectDistinct({ agentId: agentWakeupRequests.agentId })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, orphan.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${orphan.issueId}`));
       let allInvokable = true;
-      for (const agentId of new Set(pending.map((row) => row.agentId))) {
+      for (const { agentId } of pending) {
         if (!(await getAgentInvokability(await getAgent(agentId))).invokable) {
           allInvokable = false;
           break;
