@@ -20,6 +20,22 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
 });
 
+it("does not hold a continuation parked for review, even after repeated park retries", () => {
+  const parked = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "issue_continuation_waiting_on_review", scheduledRetryAttempt: 2,
+    resultJson: {
+      stopReason: "issue_continuation_waiting_on_review",
+      timeoutSource: "stale_queued_run_gate",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    },
+  };
+  expect(legacyExecutionNeedsReconciliation(parked)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...parked, scheduledRetryAttempt: 0 })).toBe(false);
+  // Without the gate's evidence the outcome stays unknown.
+  expect(legacyExecutionNeedsReconciliation({ ...parked, resultJson: { stopReason: "issue_continuation_waiting_on_review" } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...parked, status: "failed" })).toBe(true);
+});
+
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
   const waiting = {
     runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 12,

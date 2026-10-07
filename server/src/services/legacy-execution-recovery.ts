@@ -42,6 +42,10 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // A continuation parked for review is a deliberate wait that disposition
+  // repair owns; the stale gate proves no provider work started.
+  if (run.status === "cancelled" && run.errorCode === "issue_continuation_waiting_on_review" &&
+      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false

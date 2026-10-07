@@ -2610,6 +2610,7 @@ export type ManagedGitWorktreeBranchInspection = {
     | "missing_worktree"
     | "not_a_git_checkout"
     | "not_registered"
+    | "worktree_list_failed"
     | "wrong_repository_root"
     | "branch_mismatch"
     | null;
@@ -2735,6 +2736,9 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
 }
 
+const WORKTREE_LIST_ATTEMPTS = 3;
+const WORKTREE_LIST_RETRY_DELAY_MS = 200;
+
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
   const output = await runGit(["worktree", "list", "--porcelain"], repoRoot);
   const paths = new Set<string>();
@@ -2783,8 +2787,33 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  // A failed `git worktree list` (a concurrent run's git work on the same
+  // repository, a spawn error) says nothing about registration. Retry, and
+  // report a command failure separately so it cannot pose as "not registered".
+  let listedWorktrees: Set<string> | null = null;
+  let listError: unknown = null;
+  for (let attempt = 0; attempt < WORKTREE_LIST_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, WORKTREE_LIST_RETRY_DELAY_MS * attempt));
+    try {
+      listedWorktrees = await listLinkedGitWorktreePaths(repoRoot);
+      listError = null;
+    } catch (error) {
+      listedWorktrees = null;
+      listError = error;
+    }
+    if (listedWorktrees?.has(worktreePath)) break;
+  }
+  if (!listedWorktrees) {
+    const detail = listError instanceof Error ? listError.message : String(listError);
+    return {
+      ...base,
+      valid: false,
+      reason: `\`git worktree list\` failed in "${repoRoot}": ${detail}`,
+      reasonCode: "worktree_list_failed",
+      repoRoot,
+    };
+  }
+  if (!listedWorktrees.has(worktreePath)) {
     return {
       ...base,
       valid: false,
@@ -3747,6 +3776,12 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       worktreePath: reuseWorktreePath,
       expectedBranchName: realized.branchName,
     });
+    if (!validation.valid && validation.reasonCode === "worktree_list_failed") {
+      // A git command failure is not evidence against the workspace: fail
+      // this run as a retryable reuse failure instead of a board-owned
+      // validation recovery that blocks the issue.
+      throw new Error(`Could not verify persisted git worktree "${reuseWorktreePath}" (${validation.reason}).`);
+    }
     if (!validation.valid) {
       throw new WorkspaceRuntimeValidationFailure(
         `Persisted git worktree "${reuseWorktreePath}" is not reusable (${validation.reason}).`,

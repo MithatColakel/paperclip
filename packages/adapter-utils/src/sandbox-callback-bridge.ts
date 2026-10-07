@@ -133,6 +133,13 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { method: "PATCH", path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
 
+  // Granted secrets ("Reading Granted Secrets" in the Paperclip skill). The
+  // controller requires the run-bound agent token the host applies, resolves
+  // only this agent's bindings, and audits every value fetch. Company secret
+  // management routes stay denied.
+  { method: "GET", path: /^\/api\/agents\/me\/secrets$/ },
+  { method: "POST", path: /^\/api\/agents\/me\/secrets\/[^/]+\/value$/ },
+
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
 

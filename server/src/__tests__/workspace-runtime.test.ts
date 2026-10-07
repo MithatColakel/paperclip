@@ -30,6 +30,7 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  inspectManagedGitWorktreeBranch,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -2975,6 +2976,112 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
   }, 15_000);
+
+  describe("when `git worktree list` fails", () => {
+    const originalPath = process.env.PATH;
+
+    afterEach(() => {
+      process.env.PATH = originalPath;
+    });
+
+    // Puts a `git` shim first on PATH that fails `git worktree list` for the
+    // first `failures` calls and passes everything else to the real git.
+    async function shimWorktreeListFailures(failures: number) {
+      const { stdout: realGit } = await execFileAsync("sh", ["-c", "command -v git"]);
+      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const counter = path.join(shimDir, "count");
+      await fs.writeFile(counter, "0", "utf8");
+      await fs.writeFile(
+        path.join(shimDir, "git"),
+        [
+          "#!/bin/sh",
+          'if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then',
+          `  n=$(cat "${counter}")`,
+          `  echo $((n + 1)) > "${counter}"`,
+          `  if [ "$n" -lt ${failures} ]; then echo "fatal: simulated worktree list failure" >&2; exit 128; fi`,
+          "fi",
+          `exec "${realGit.trim()}" "$@"`,
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      process.env.PATH = `${shimDir}${path.delimiter}${originalPath ?? ""}`;
+    }
+
+    async function createRegisteredWorktree(branchName: string) {
+      const repoRoot = await createTempRepo();
+      const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+      return { repoRoot, worktreePath };
+    }
+
+    it("retries a transient failure instead of reporting the worktree as unregistered", async () => {
+      const branchName = "PAP-460-transient-list-failure";
+      const { repoRoot, worktreePath } = await createRegisteredWorktree(branchName);
+      await shimWorktreeListFailures(1);
+
+      const inspection = await inspectManagedGitWorktreeBranch({
+        repoRoot,
+        worktreePath,
+        expectedBranchName: branchName,
+      });
+
+      expect(inspection).toMatchObject({ valid: true, reasonCode: null, actualBranchName: branchName });
+    }, 15_000);
+
+    it("fails a persistent failure as a retryable run error, not a workspace validation recovery", async () => {
+      const branchName = "PAP-460-persistent-list-failure";
+      const { repoRoot, worktreePath } = await createRegisteredWorktree(branchName);
+      await shimWorktreeListFailures(100);
+
+      const inspection = await inspectManagedGitWorktreeBranch({
+        repoRoot,
+        worktreePath,
+        expectedBranchName: branchName,
+      });
+      expect(inspection).toMatchObject({
+        valid: false,
+        reasonCode: "worktree_list_failed",
+        reason: expect.stringContaining("simulated worktree list failure"),
+      });
+
+      const restore = ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-list-failure",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: worktreePath,
+          providerRef: worktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+        },
+        issue: {
+          id: "issue-list-failure",
+          identifier: "PAP-460",
+          title: "Keep a git failure retryable",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+      await expect(restore).rejects.toThrow(/Could not verify persisted git worktree .*simulated worktree list failure/);
+      await expect(restore).rejects.not.toMatchObject({ code: "workspace_validation_failed" });
+    }, 15_000);
+  });
 
   it("adopts an existing persisted git worktree when the checked-out branch is forward of the recorded branch", async () => {
     const repoRoot = await createTempRepo();

@@ -853,6 +853,10 @@ export function createPostgresRunDispatchAdapter(
           resultJson: {
             ...parseObject(run.resultJson),
             stopReason: decision.errorCode,
+            // Every stale-run gate runs before adapter dispatch, so no provider
+            // work started. Without this evidence the stranded-work sweep holds
+            // the issue for legacy reconciliation.
+            executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),

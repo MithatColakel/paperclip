@@ -24,6 +24,7 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -690,6 +691,14 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_continuation_waiting_on_review",
       });
+      // The gate runs before dispatch: the run records that no provider work
+      // started, so the stranded-work sweep does not hold the issue for
+      // legacy reconciliation.
+      const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(cancelled?.resultJson).toMatchObject({
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      });
+      expect(legacyExecutionNeedsReconciliation(cancelled!)).toBe(false);
     });
   });
 

@@ -1109,7 +1109,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue),
         };
-        const preDrain = decidePreDrain(preDrainFacts);
+        // An orphaned queue has no finishing run: the anchor's own stop,
+        // reconciliation, and workspace facts decided its release long ago.
+        const preDrain = input.orphanedQueue
+          ? (issueRow && !issueRow.executionRunId ? { kind: "proceed" as const } : { kind: "released" as const })
+          : decidePreDrain(preDrainFacts);
 
         if (preDrain.kind === "released") {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
@@ -1126,7 +1130,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // agent's review participation retains its separate recovery path.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
+          // Any live run on an orphaned queue's issue will drain it itself.
+          input.orphanedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
           sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
@@ -1167,7 +1172,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           };
         }
 
-        if (await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
+        if (!input.orphanedQueue && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
@@ -1175,7 +1180,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // The finishing conversation may still own its lease until finally cleanup.
         // Allow only bounded retry planning in that case; admission stays gated.
         const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
-        const recoveryOnly = Boolean(executionBlocker &&
+        const recoveryOnly = !input.orphanedQueue && Boolean(executionBlocker &&
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
         if (executionBlocker && !recoveryOnly) {

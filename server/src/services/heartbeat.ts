@@ -873,6 +873,10 @@ export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
+/** Normal release paths get this long to promote a deferred wake first. */
+const ORPHANED_DEFERRED_WAKE_GRACE_MS = 2 * 60 * 1000;
+/** Older stranded wakes are left alone rather than replayed long after the fact. */
+const ORPHANED_DEFERRED_WAKE_MAX_AGE_MS = 72 * 60 * 60 * 1000;
 const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = [
   "scheduled_retry",
@@ -19384,6 +19388,60 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // A release drains at most one deferred wake, and a release that stops early
+  // (an acknowledged stop such as a reassignment, or a blocker still held while
+  // the finishing process cleans up) drains none. Once no live run remains on
+  // the issue, nothing else revisits that queue, so wakes for other agents and
+  // for a new assignee stay deferred forever. Drain such a queue through the
+  // normal release admission, anchored on the issue's latest terminal run.
+  async function promoteOrphanedDeferredWakes(cutoff: Date | null) {
+    const now = Date.now();
+    const orphans = await db.selectDistinct({ companyId: issues.companyId, issueId: issues.id })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        isNull(issues.executionRunId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        lte(agentWakeupRequests.updatedAt, new Date(now - ORPHANED_DEFERRED_WAKE_GRACE_MS)),
+        gte(agentWakeupRequests.requestedAt, new Date(now - ORPHANED_DEFERRED_WAKE_MAX_AGE_MS)),
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+        sql`not exists (select 1 from ${heartbeatRuns} live where live.company_id = ${issues.companyId}
+          and coalesce(live.native_issue_id::text, live.context_snapshot->>'issueId') = ${issues.id}::text
+          and live.status in ('queued', 'running', 'scheduled_retry'))`))
+      .limit(20);
+    for (const orphan of orphans) {
+      // Advance the cursor first so a queue that stays blocked is revisited
+      // only after the grace period, not on every scheduler tick.
+      const pending = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.companyId, orphan.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${orphan.issueId}`,
+      )).returning({ agentId: agentWakeupRequests.agentId });
+      if (await getExecutionBlocker(db, orphan.companyId, orphan.issueId)) continue;
+      // The drain fails a wake whose agent cannot run. A paused agent's saved
+      // input waits for its resume instead of being discarded here.
+      let allInvokable = true;
+      for (const agentId of new Set(pending.map((row) => row.agentId))) {
+        if (!(await getAgentInvokability(await getAgent(agentId))).invokable) {
+          allInvokable = false;
+          break;
+        }
+      }
+      if (!allInvokable) continue;
+      const [anchor] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, orphan.companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${orphan.issueId}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      if (!anchor || !isHeartbeatRunTerminalStatus(anchor.status)) continue;
+      await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, orphanedQueue: true }).catch(err => {
+        logger.warn({ err, issueId: orphan.issueId, anchorRunId: anchor.id }, "failed to promote orphaned deferred wake");
+      });
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19444,6 +19502,8 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
       });
     }
+
+    await promoteOrphanedDeferredWakes(cutoff);
 
     // The cancellation marker is durable intent. Retry while its exact queue
     // is still deferred, including after a failed cleanup promotion or restart.
@@ -26170,7 +26230,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; orphanedQueue?: boolean } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -26178,6 +26238,7 @@ export function heartbeatService(
         runId: run.id,
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
+        orphanedQueue: options.orphanedQueue,
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
     } catch (error) {
