@@ -9,6 +9,10 @@ packages:
   # Keep this smoke fixture installable as a local plugin example without
   # forcing PRs to commit pnpm-lock.yaml for a new workspace importer.
   - "!packages/plugins/examples/plugin-orchestration-smoke-example"
+  # Fork-owned Roadmap plugin: kept out of the workspace so the fork's
+  # pnpm-lock.yaml stays byte-identical to the official image (the prod
+  # overlay build checks lockfile parity and installs with --frozen-lockfile).
+  - "!packages/plugins/roadmap"
   - server
   - ui
   - cli
