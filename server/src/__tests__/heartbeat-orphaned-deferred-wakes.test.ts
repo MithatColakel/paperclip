@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -72,6 +73,7 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
   async function seedReassignedIssueWithDeferredWake(opts: {
     deferredAgeMs?: number;
     newAssigneeStatus?: "idle" | "paused";
+    withReassignmentComment?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const previousAgentId = randomUUID();
@@ -139,6 +141,34 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
     });
+    // The reassignment usually carries a hand-off comment written by the
+    // stopped run, and the wake records the run it interrupted.
+    const commentId = randomUUID();
+    if (opts.withReassignmentComment) {
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId,
+        issueId,
+        authorAgentId: previousAgentId,
+        createdByRunId: stoppedRunId,
+        body: "Reassigning to QA for the code-level check.",
+        createdAt: deferredAt,
+      });
+    }
+    const commentFields = opts.withReassignmentComment
+      ? { commentId, interruptedRunId: stoppedRunId, mutation: "update" }
+      : {};
+    const contextCommentFields = opts.withReassignmentComment
+      ? {
+          commentId,
+          wakeCommentId: commentId,
+          wakeCommentIds: [commentId],
+          interruptedRunId: stoppedRunId,
+          source: "issue.update",
+          wakeSource: "assignment",
+          wakeTriggerDetail: "system",
+        }
+      : {};
     await db.insert(agentWakeupRequests).values({
       id: deferredWakeId,
       companyId,
@@ -151,7 +181,8 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
       requestedByActorId: previousAgentId,
       payload: {
         issueId,
-        _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        ...commentFields,
+        _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_assigned", ...contextCommentFields },
         executionWait: {
           reason: "execution_recovery",
           message: "Waiting for execution recovery. Your message is saved.",
@@ -183,6 +214,16 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
     const promoted = await runsFor(newAssigneeId, issueId);
     expect(promoted).toHaveLength(1);
     expect(promoted[0]?.wakeupRequestId).toBe(deferredWakeId);
+  });
+
+  it("promotes a reassignment wake that carries the stopped run's hand-off comment", async () => {
+    const { newAssigneeId, issueId, deferredWakeId } =
+      await seedReassignedIssueWithDeferredWake({ withReassignmentComment: true });
+
+    await heartbeat.resumeQueuedRuns();
+
+    expect((await readWake(deferredWakeId))?.status).not.toBe("deferred_issue_execution");
+    expect(await runsFor(newAssigneeId, issueId)).toHaveLength(1);
   });
 
   it("leaves the queue to a live run on the issue", async () => {

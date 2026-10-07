@@ -5118,6 +5118,89 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("does not inherit the parent execution workspace into another project workspace", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const backendWorkspaceId = randomUUID();
+    const nodeWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Platform",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values([
+      {
+        id: backendWorkspaceId,
+        companyId,
+        projectId,
+        name: "backend",
+        isPrimary: true,
+        sharedWorkspaceKey: "backend",
+      },
+      {
+        id: nodeWorkspaceId,
+        companyId,
+        projectId,
+        name: "node",
+        isPrimary: false,
+        sharedWorkspaceKey: "node",
+      },
+    ]);
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId: backendWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Backend worktree",
+      status: "active",
+      providerType: "git_worktree",
+      providerRef: `/tmp/${executionWorkspaceId}`,
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId: backendWorkspaceId,
+      title: "Daily check",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+
+    const nodeChild = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      projectWorkspaceId: nodeWorkspaceId,
+      title: "Node check",
+    });
+    expect(nodeChild.projectWorkspaceId).toBe(nodeWorkspaceId);
+    expect(nodeChild.executionWorkspaceId).toBeNull();
+
+    const backendChild = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      projectWorkspaceId: backendWorkspaceId,
+      title: "Backend check",
+    });
+    expect(backendChild.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(backendChild.executionWorkspacePreference).toBe("reuse_existing");
+  });
+
   it("preserves the parent project when a generic child create inherits workspace linkage", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
