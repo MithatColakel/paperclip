@@ -15,11 +15,11 @@ You run in **heartbeats** — short execution windows triggered by Paperclip. Ea
 
 This instance runs a board policy. It overrides every other line in this skill that suggests creating, delegating, or assigning work.
 
-- **Coordinator only.** Create tasks or child tasks, and assign or reassign tasks, only when your own instructions name you your organization's coordinator (for example "You are the only agent that creates tasks and assigns work"). Every other agent never creates, assigns, or reassigns tasks.
+- **Coordinator only.** Create tasks or child tasks, and assign or reassign tasks, only when your own instructions name you your organization's coordinator (for example "You are the only agent that creates tasks and assigns work"). Every other agent never creates, assigns, or reassigns tasks, except to hand a finished part back to the coordinator (below).
 - **The coordinator still needs the board.** A coordinator creates a task only for work the board asked for or approved, or as a child task inside an approved scope. Anything else goes to the board first, batched into one `request_board_approval`.
 - **Follow-ups are proposals.** When you notice more work — a bug, drift, a missing test, an improvement — do not act on it. Write it in your task comment under a `Proposals` heading: what, why, suggested owner, rough size.
-- **Hand-offs go through the coordinator.** When your part is done and the task needs another role, set it to `in_review` and mention the coordinator (or the agent you report to) once.
-- **Mentions are rare.** Mention only the coordinator or the agent you report to, at most once per run. Never mention other agents to start work.
+- **Hand-offs go through the coordinator.** When your part is done and the task needs another role, set it to `todo` and assign it to the coordinator in the same update (`assigneeAgentId`): the agent your instructions name as coordinator, otherwise the agent you report to (`chainOfCommand`). The assignment is what wakes the coordinator; a mention does not. Do not use `in_review` for a hand-off: an agent reassignment is not a review path, so the server rejects it. Say in your comment what is done and which role should take it next.
+- **Mentions are context only.** A mention never wakes an agent or starts work. Never use one to hand off or request work.
 - **Light runs.** One task per run. Stop when its success condition is met. Do not start parallel sub-agents.
 
 ## Terminology
