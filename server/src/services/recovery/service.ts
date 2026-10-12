@@ -5679,6 +5679,86 @@ export function recoveryService(
     return result;
   }
 
+  // The gates that keep the dependency backstop from waking a dependent right
+  // now. They read rows by id, issue or agent, so they are cheap next to the
+  // wake-history lookups. Returns the result counter to bump, or null when the
+  // wake may go ahead.
+  async function getResolvedDependencyWakeSkip(input: {
+    companyId: string;
+    candidate: { id: string; projectId: string | null };
+    agentId: string;
+    unblockedDependent: boolean;
+  }): Promise<
+    | "livePathSkipped"
+    | "interactionSkipped"
+    | "pauseHoldSkipped"
+    | "agentUnavailableSkipped"
+    | null
+  > {
+    const { companyId, candidate, agentId, unblockedDependent } = input;
+    if (
+      (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
+      (await hasQueuedIssueWake(companyId, candidate.id, agentId))
+    ) {
+      return "livePathSkipped";
+    }
+
+    if (await hasPendingWakeInteraction(companyId, candidate.id)) {
+      return "interactionSkipped";
+    }
+
+    if (
+      await isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        companyId,
+        candidate.id,
+        treeControlSvc,
+      )
+    ) {
+      return "pauseHoldSkipped";
+    }
+
+    if (!unblockedDependent) return null;
+
+    // A todo or in_progress dependent's one-shot key is spent by any wake row,
+    // including a skipped one, so do not hand it to an assignee that cannot
+    // run right now. A board-owned recovery action is the human-owned
+    // continuation path, and an execution hold or an inactive company only
+    // records a coalesced execution-wait row under its own key. Enqueuing
+    // would race the board or repeat that write on every sweep, so skip, as
+    // stranded-work recovery does.
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+      companyId,
+      candidate.id,
+    );
+    if (
+      activeRecoveryAction?.ownerType === "board" ||
+      (await getExecutionBlocker(db, companyId, candidate.id))
+    ) {
+      return "livePathSkipped";
+    }
+    const company = await db
+      .select({ status: companies.status })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    const agent = await getAgent(agentId);
+    if (
+      company?.status !== "active" ||
+      !agent ||
+      agent.companyId !== companyId ||
+      !(await isAgentInvokable(agent)) ||
+      !isHeartbeatWakeOnDemandEnabled(agent) ||
+      (await budgets.getInvocationBlock(companyId, agentId, {
+        issueId: candidate.id,
+        projectId: candidate.projectId,
+      }))
+    ) {
+      return "agentUnavailableSkipped";
+    }
+    return null;
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(
     opts?: ResolvedDependencyWakeBackstopOptions,
   ) {
@@ -5856,6 +5936,12 @@ export function recoveryService(
         const unblockedDependent = candidate.status !== "blocked";
         let idempotencyKey: string;
         if (unblockedDependent) {
+          // A scheduled issue monitor is a pending wake, and it is on the
+          // candidate row, so it needs no query.
+          if (candidate.monitorNextCheckAt) {
+            result.livePathSkipped += 1;
+            continue;
+          }
           const resolvedAt = await findLatestIssueBlockerTerminalTransitionAt(
             db,
             { companyId, blockerIssueIds: readiness.blockerIssueIds },
@@ -5878,6 +5964,22 @@ export function recoveryService(
             .then((rows) => rows[0] ?? null);
           if (runSinceResolution) {
             result.alreadyRunSkipped += 1;
+            continue;
+          }
+          // Check the skip gates before the wake-history lookups below. Those
+          // lookups filter agent_wakeup_requests on idempotency_key, which no
+          // index covers for these keys, so each one reads the agent's or the
+          // company's wake rows. A skipped dependent never spends its one-shot
+          // key, so a held or unavailable dependent would pay those scans
+          // again on every sweep.
+          const skip = await getResolvedDependencyWakeSkip({
+            companyId,
+            candidate,
+            agentId,
+            unblockedDependent,
+          });
+          if (skip) {
+            result[skip] += 1;
             continue;
           }
           idempotencyKey = buildIssueBlockersResolvedResolutionWakeKey({
@@ -5929,67 +6031,17 @@ export function recoveryService(
           continue;
         }
 
-        if (
-          (unblockedDependent && candidate.monitorNextCheckAt) ||
-          (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
-          (await hasQueuedIssueWake(companyId, candidate.id, agentId))
-        ) {
-          result.livePathSkipped += 1;
-          continue;
-        }
-
-        if (await hasPendingWakeInteraction(companyId, candidate.id)) {
-          result.interactionSkipped += 1;
-          continue;
-        }
-
-        if (
-          await isAutomaticRecoverySuppressedByPauseHold(
-            db,
+        // A blocked dependent checks the same gates after its wake-history
+        // lookup; a todo or in_progress dependent checked them above.
+        if (!unblockedDependent) {
+          const skip = await getResolvedDependencyWakeSkip({
             companyId,
-            candidate.id,
-            treeControlSvc,
-          )
-        ) {
-          result.pauseHoldSkipped += 1;
-          continue;
-        }
-
-        // The one-shot key is spent by any wake row, including a skipped one,
-        // so do not hand it to an assignee that cannot run right now.
-        if (unblockedDependent) {
-          // A board-owned recovery action is the human-owned continuation
-          // path, and an execution hold or an inactive company only records a
-          // coalesced execution-wait row under its own key. Enqueuing would
-          // race the board or repeat that write on every sweep, so skip, as
-          // stranded-work recovery does.
-          const activeRecoveryAction =
-            await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
-          if (
-            activeRecoveryAction?.ownerType === "board" ||
-            (await getExecutionBlocker(db, companyId, candidate.id))
-          ) {
-            result.livePathSkipped += 1;
-            continue;
-          }
-          const company = await db
-            .select({ status: companies.status })
-            .from(companies)
-            .where(eq(companies.id, companyId))
-            .then((rows) => rows[0] ?? null);
-          const agent = await getAgent(agentId);
-          if (
-            company?.status !== "active" ||
-            !agent ||
-            agent.companyId !== companyId ||
-            !(await isAgentInvokable(agent)) ||
-            !isHeartbeatWakeOnDemandEnabled(agent) ||
-            (await budgets.getInvocationBlock(companyId, agentId, {
-              issueId: candidate.id,
-              projectId: candidate.projectId,
-            }))
-          ) {
-            result.agentUnavailableSkipped += 1;
+            candidate,
+            agentId,
+            unblockedDependent,
+          });
+          if (skip) {
+            result[skip] += 1;
             continue;
           }
         }

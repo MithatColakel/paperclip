@@ -67,6 +67,19 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+// Wraps the real lookup so a test can check that the backstop did not reach it.
+vi.mock("../services/issue-dependency-wakeups.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/issue-dependency-wakeups.ts")>(
+    "../services/issue-dependency-wakeups.ts",
+  );
+  return {
+    ...actual,
+    findExistingIssueBlockersResolvedWakeForReadyState: vi.fn(
+      actual.findExistingIssueBlockersResolvedWakeForReadyState,
+    ),
+  };
+});
+
 import { heartbeatService } from "../services/heartbeat.ts";
 import { attentionService } from "../services/attention.ts";
 import { issueService } from "../services/issues.ts";
@@ -75,6 +88,7 @@ import {
   buildIssueBlockersResolvedResolutionWakeKey,
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
+  findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1382,6 +1396,110 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.companyId, companyId)),
     ).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      label: "a scheduled issue monitor",
+      dependentStatus: "in_progress" as const,
+      counter: "livePathSkipped" as const,
+      hold: async (fixture: { blockedIssueId: string }) => {
+        await db
+          .update(issues)
+          .set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+          .where(eq(issues.id, fixture.blockedIssueId));
+      },
+    },
+    {
+      label: "a paused assignee",
+      dependentStatus: "todo" as const,
+      counter: "agentUnavailableSkipped" as const,
+      hold: async (fixture: { agentId: string }) => {
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agentId));
+      },
+    },
+    {
+      label: "a board-owned recovery action",
+      dependentStatus: "todo" as const,
+      counter: "livePathSkipped" as const,
+      hold: async (fixture: { companyId: string; blockedIssueId: string }) => {
+        await db.insert(issueRecoveryActions).values({
+          companyId: fixture.companyId,
+          sourceIssueId: fixture.blockedIssueId,
+          kind: "configuration_validation",
+          status: "active",
+          ownerType: "board",
+          cause: "configuration_incomplete",
+          fingerprint: `backstop-gate-order:${fixture.blockedIssueId}`,
+          evidence: {},
+          nextAction: "Fix the configuration before continuing.",
+        });
+      },
+    },
+  ])("skips a $dependentStatus dependent behind $label before reading its wake history", async ({
+    dependentStatus,
+    counter,
+    hold,
+  }) => {
+    const fixture = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      dependentStatus,
+    });
+    const { companyId, agentId, blockedIssueId, blockerIssueId } = fixture;
+    const resolvedAt = new Date("2026-10-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ completedAt: resolvedAt, updatedAt: resolvedAt })
+      .where(eq(issues.id, blockerIssueId));
+    // The resolution was already handed over once, so a sweep that read the
+    // wake history first would count this dependent as existingWakeSkipped.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, blockerIssueIds: [blockerIssueId] },
+      status: "failed",
+      requestedAt: new Date("2026-10-01T12:00:05.000Z"),
+      finishedAt: new Date("2026-10-01T12:00:30.000Z"),
+      idempotencyKey: buildIssueBlockersResolvedResolutionWakeKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+        resolvedAt,
+      }),
+    });
+    await hold(fixture);
+    const heartbeat = heartbeatService(db);
+    vi.mocked(findExistingIssueBlockersResolvedWakeForReadyState).mockClear();
+
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      const result = await heartbeat.reconcileResolvedDependencyWakes();
+      expect(result.healed).toBe(0);
+      expect(result[counter]).toBe(1);
+      expect(result.existingWakeSkipped).toBe(0);
+    }
+    expect(findExistingIssueBlockersResolvedWakeForReadyState).not.toHaveBeenCalled();
+    expect(
+      await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)),
+    ).toHaveLength(1);
+  });
+
+  it("still reads the wake history of a blocked dependent before its skip gates", async () => {
+    const { blockedIssueId } = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    vi.mocked(findExistingIssueBlockersResolvedWakeForReadyState).mockClear();
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(1);
+    expect(findExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledTimes(1);
+    expect(findExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ dependentIssueId: blockedIssueId }),
+    );
   });
 
   it("counts null dependency wake returns as deferred instead of enqueue failures", async () => {
