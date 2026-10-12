@@ -212,6 +212,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+              // A wake held by the daily cap (DAILY_CAP_DEFERRAL_KEY) waits for
+              // the heartbeat's cap admission sweep; a drain would only bounce it
+              // off the same cap at dispatch.
+              sql`${agentWakeupRequests.payload} -> 'dailyCapDeferral' is null`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
             ),

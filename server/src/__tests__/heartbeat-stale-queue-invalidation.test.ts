@@ -1391,7 +1391,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
-  it("skips already queued issue runs at the daily run cap and releases the execution lock", async () => {
+  it("holds already queued issue runs at the daily run cap for the next window and releases the execution lock", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         maxDailyRuns: 1,
@@ -1458,7 +1458,11 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, queuedRunId));
     const [wakeup] = await db
-      .select({ status: agentWakeupRequests.status })
+      .select({
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+        payload: agentWakeupRequests.payload,
+      })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
     const [issue] = await db
@@ -1470,7 +1474,21 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       status: "cancelled",
       errorCode: "heartbeat.daily_run_limit",
     });
-    expect(wakeup).toMatchObject({ status: "skipped" });
+    // The issue work is not dropped: the same wake row waits for the next
+    // cap window with the run's context, and the lock is free for others.
+    expect(wakeup).toMatchObject({
+      status: "deferred_issue_execution",
+      runId: null,
+      payload: expect.objectContaining({
+        issueId,
+        dailyCapDeferral: expect.objectContaining({
+          reason: "heartbeat.daily_run_limit",
+          observed: 1,
+          limit: 1,
+        }),
+        _paperclipWakeContext: expect.objectContaining({ issueId }),
+      }),
+    });
     expect(issue?.executionRunId).toBeNull();
   });
 
@@ -1585,6 +1603,199 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
 
     expect(deferred?.status).not.toBe("deferred_issue_execution");
     expect(promotedRun?.agentId).toBe(peerAgentId);
+
+    // The capped holder's own wake waits for its cap; the drain that promoted
+    // the peer did not bounce it back into another queued run.
+    const [held] = await db
+      .select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    expect(held?.status).toBe("deferred_issue_execution");
+    expect(held?.payload).toHaveProperty("dailyCapDeferral");
+    const cappedRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(cappedRuns).toHaveLength(2);
+  });
+
+  describe("daily cap holds issue wakes instead of dropping them", () => {
+    async function seedCappedAssignee(heartbeatConfig: Record<string, unknown> = { maxDailyRuns: 1 }) {
+      const seeded = await seedCompanyAndAgent({ heartbeatConfig });
+      const issueId = randomUUID();
+      const countedRunId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        title: "Handed back to the coordinator",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: seeded.agentId,
+      });
+      // Today's only run, on this issue: it fills a cap of 1 and anchors the
+      // issue for the orphaned-queue sweep.
+      await db.insert(heartbeatRuns).values({
+        id: countedRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        createdAt: new Date(),
+        startedAt: new Date(),
+        finishedAt: new Date(),
+        contextSnapshot: { issueId },
+      });
+      return { ...seeded, issueId, countedRunId };
+    }
+
+    function assignmentWake(issueId: string, extra: Record<string, unknown> = {}) {
+      return {
+        source: "assignment" as const,
+        triggerDetail: "system" as const,
+        reason: "issue_assigned",
+        payload: { issueId, mutation: "update", ...extra },
+        requestedByActorType: "system" as const,
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      };
+    }
+
+    async function wakesFor(agentId: string) {
+      return db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+    }
+
+    async function runsFor(agentId: string) {
+      return db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+    }
+
+    it("holds an issue wake at the cap and folds repeated automatic wakes into it", async () => {
+      const { agentId, issueId } = await seedCappedAssignee();
+
+      expect(await heartbeat.wakeup(agentId, assignmentWake(issueId))).toBeNull();
+      expect(await heartbeat.wakeup(agentId, assignmentWake(issueId))).toBeNull();
+
+      const wakes = await wakesFor(agentId);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({
+        status: "deferred_issue_execution",
+        reason: "issue_assigned",
+        coalescedCount: 1,
+        runId: null,
+        payload: expect.objectContaining({
+          issueId,
+          dailyCapDeferral: expect.objectContaining({
+            reason: "heartbeat.daily_run_limit",
+            observed: 1,
+            limit: 1,
+          }),
+          _paperclipWakeContext: expect.objectContaining({
+            issueId,
+            wakeReason: "issue_assigned",
+          }),
+        }),
+      });
+      expect(await runsFor(agentId)).toHaveLength(1);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+
+    it("still drops timer wakes at the cap", async () => {
+      const { agentId } = await seedCappedAssignee({ maxDailyRuns: 1, enabled: true });
+
+      expect(await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "system" })).toBeNull();
+
+      const wakes = await wakesFor(agentId);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ status: "skipped", reason: "heartbeat.daily_run_limit" });
+    });
+
+    it("leaves held wakes to their own sweep and admits them when the window rolls over", async () => {
+      const { agentId, issueId, countedRunId } = await seedCappedAssignee();
+      expect(await heartbeat.wakeup(agentId, assignmentWake(issueId))).toBeNull();
+      const [held] = await wakesFor(agentId);
+      // Past the orphaned-queue grace period, so only the cap keeps it waiting.
+      await db
+        .update(agentWakeupRequests)
+        .set({ requestedAt: new Date(Date.now() - 3 * 60_000) })
+        .where(eq(agentWakeupRequests.id, held!.id));
+
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.reconcileStrandedAssignedIssues();
+
+      // Still capped: no promotion, no new run, no new skipped row per sweep.
+      expect(await wakesFor(agentId)).toEqual([
+        expect.objectContaining({ id: held!.id, status: "deferred_issue_execution", runId: null }),
+      ]);
+      expect(await runsFor(agentId)).toHaveLength(1);
+
+      // 00:00 UTC: yesterday's run no longer counts toward today's cap.
+      const yesterday = new Date(Date.now() - 26 * 60 * 60 * 1000);
+      await db
+        .update(heartbeatRuns)
+        .set({ createdAt: yesterday, startedAt: yesterday, finishedAt: yesterday })
+        .where(eq(heartbeatRuns.id, countedRunId));
+
+      await heartbeat.resumeQueuedRuns();
+
+      const [admitted] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, held!.id));
+      expect(admitted).toMatchObject({ status: "coalesced", runId: expect.any(String) });
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, admitted!.runId!));
+      expect(run).toMatchObject({ agentId, invocationSource: "assignment" });
+      expect(run?.contextSnapshot).toMatchObject({ issueId, wakeReason: "issue_assigned" });
+      await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+      expect(countExecuteCallsForRun(run!.id)).toBe(1);
+    });
+
+    it("admits a held wake as soon as the cap is raised", async () => {
+      const { agentId, issueId } = await seedCappedAssignee();
+      expect(await heartbeat.wakeup(agentId, assignmentWake(issueId))).toBeNull();
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await runsFor(agentId)).toHaveLength(1);
+
+      await db
+        .update(agents)
+        .set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1, maxDailyRuns: 5 } } })
+        .where(eq(agents.id, agentId));
+      await heartbeat.resumeQueuedRuns();
+
+      const runs = await runsFor(agentId);
+      expect(runs).toHaveLength(2);
+      const admitted = runs.find((run) => run.contextSnapshot?.wakeReason === "issue_assigned");
+      expect(admitted?.contextSnapshot).toMatchObject({ issueId });
+      const held = (await wakesFor(agentId)).find((row) => row.payload?.dailyCapDeferral);
+      expect(held).toMatchObject({ status: "coalesced", runId: admitted!.id });
+    });
+
+    it("cancels a held wake whose issue closed while it waited", async () => {
+      const { agentId, issueId, countedRunId } = await seedCappedAssignee();
+      expect(await heartbeat.wakeup(agentId, assignmentWake(issueId))).toBeNull();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      const yesterday = new Date(Date.now() - 26 * 60 * 60 * 1000);
+      await db
+        .update(heartbeatRuns)
+        .set({ createdAt: yesterday, startedAt: yesterday, finishedAt: yesterday })
+        .where(eq(heartbeatRuns.id, countedRunId));
+
+      await heartbeat.resumeQueuedRuns();
+
+      expect(await wakesFor(agentId)).toEqual([
+        expect.objectContaining({ status: "cancelled", runId: null }),
+      ]);
+      expect(await runsFor(agentId)).toHaveLength(1);
+    });
   });
 
   it("cancels queued max-turn continuations when another continuation owns the issue lock", async () => {

@@ -28,6 +28,7 @@ export type {
   RunSummary,
 } from "./application/types.js";
 export { WakeQueueApplicationError } from "./application/types.js";
+export { DAILY_CAP_DEFERRAL_KEY } from "./domain/values.js";
 export type {
   IssueSnapshot,
   RunSnapshot,
