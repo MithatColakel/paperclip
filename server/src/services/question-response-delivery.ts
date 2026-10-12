@@ -1,4 +1,16 @@
-import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lte,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -21,11 +33,16 @@ import { getTelemetryClient } from "../telemetry.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import type { heartbeatService } from "./heartbeat.js";
+import { issueService } from "./issues.js";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 
 const DELIVERY_CLAIM_STALE_MS = 30_000;
 const DELIVERY_CLAIM_REFRESH_MS = 10_000;
 const MAX_DELIVERY_ATTEMPTS = 5;
+/** A pending receipt with this code waits for its issue's blockers. */
+const DEPENDENCY_PARKED_ERROR_CODE = "question_response_dependency_blocked";
+/** Safety net: a parked receipt is still retried this often while blocked. */
+const DEPENDENCY_PARKED_RECHECK_MS = 60 * 60_000;
 const DELIVERY_CORRELATION_PREFIX = "question-response:";
 const QUESTION_RESPONSE_WAKE_IDEMPOTENCY_CONSTRAINT =
   "agent_wakeup_requests_question_response_delivery_idempotency_uq";
@@ -420,6 +437,7 @@ export function questionResponseDeliveryService(
   options: QuestionResponseDeliveryServiceOptions,
 ) {
   const resolveNativeQuestion = options.resolveNativeQuestion;
+  const issuesSvc = issueService(db);
   const now = options.now ?? (() => new Date());
   const claimStaleMs = Math.max(
     2,
@@ -735,6 +753,92 @@ export function questionResponseDeliveryService(
       .limit(1)
       .then((rows) => rows[0] ?? null);
     return { request, run };
+  }
+
+  // Admission leaves a skipped receipt under the wake's own idempotency key.
+  // Read its gate so a dependency wait is not mistaken for a passing outage.
+  async function latestSkippedWakeReason(input: {
+    companyId: string;
+    agentId: string;
+    idempotencyKey: string;
+  }) {
+    return db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.status, "skipped"),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        ),
+      )
+      .orderBy(
+        desc(agentWakeupRequests.updatedAt),
+        desc(agentWakeupRequests.createdAt),
+      )
+      .limit(1)
+      .then((rows) => rows[0]?.reason ?? null);
+  }
+
+  // A parked receipt resumes once its issue can admit the wake again: every
+  // blocker is resolved, an execution run already owns the issue, or the
+  // issue no longer has a live assignee and delivery must settle.
+  async function listResumableParkedInteractionIds(
+    parked: Array<{
+      interactionId: string;
+      companyId: string;
+      issueId: string;
+    }>,
+  ) {
+    if (parked.length === 0) return [];
+    const issueRows = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(
+        inArray(issues.id, [...new Set(parked.map((row) => row.issueId))]),
+      );
+    const issueById = new Map(issueRows.map((row) => [row.id, row]));
+    const resumesWithoutReadiness = (row: (typeof parked)[number]) => {
+      const issue = issueById.get(row.issueId);
+      return (
+        !issue ||
+        issue.companyId !== row.companyId ||
+        !issue.assigneeAgentId ||
+        issue.status === "done" ||
+        issue.status === "cancelled" ||
+        Boolean(issue.executionRunId)
+      );
+    };
+    const blockedIssueIdsByCompany = new Map<string, Set<string>>();
+    for (const row of parked) {
+      if (resumesWithoutReadiness(row)) continue;
+      const issueIds =
+        blockedIssueIdsByCompany.get(row.companyId) ?? new Set<string>();
+      issueIds.add(row.issueId);
+      blockedIssueIdsByCompany.set(row.companyId, issueIds);
+    }
+    const readyIssueIds = new Set<string>();
+    for (const [companyId, issueIds] of blockedIssueIdsByCompany) {
+      const readiness = await issuesSvc.listDependencyReadiness(companyId, [
+        ...issueIds,
+      ]);
+      for (const [issueId, state] of readiness) {
+        if (state.isDependencyReady) readyIssueIds.add(issueId);
+      }
+    }
+    return parked
+      .filter(
+        (row) =>
+          resumesWithoutReadiness(row) || readyIssueIds.has(row.issueId),
+      )
+      .map((row) => row.interactionId);
   }
 
   async function deliver(
@@ -1212,11 +1316,33 @@ export function questionResponseDeliveryService(
               idempotencyKey: wakeIdempotencyKey,
             }));
       if (!wakeRun && !durableWake) {
-        const errorCode = "question_response_wake_skipped";
         // Scheduling suppression is an availability state, not a delivery
         // failure. Keep the durable receipt retryable until the suppression is
         // lifted; the bounded limit remains reserved for actual wake errors.
+        // A dependency gate holds until a blocker resolves, so retrying it on
+        // every sweep only piles up skipped wakes. Park it; the sweep resumes
+        // it once the issue can admit the wake again.
+        const dependencyBlocked =
+          (await latestSkippedWakeReason({
+            companyId: interaction.companyId,
+            agentId: assigneeAgentId,
+            idempotencyKey: wakeIdempotencyKey,
+          })) === "issue_dependencies_blocked";
+        const errorCode = dependencyBlocked
+          ? DEPENDENCY_PARKED_ERROR_CODE
+          : "question_response_wake_skipped";
         await releaseForRetry(claimed, errorCode, { bounded: false });
+        if (dependencyBlocked) {
+          logger.info(
+            {
+              deliveryId: claimed.id,
+              interactionId,
+              issueId: issue.id,
+              attemptCount: claimed.attemptCount,
+            },
+            "question response delivery parked until issue blockers resolve",
+          );
+        }
         return null;
       }
       const eligibleQueuedSuccessor = externalChatBoundary
@@ -1316,13 +1442,57 @@ export function questionResponseDeliveryService(
           ),
         ),
       );
-    const ids = await db
+    // Parked receipts stay pending but are not claimed again until their issue
+    // can admit the wake or the recheck interval passes. They are selected
+    // separately so a backlog of parked rows cannot starve due deliveries.
+    const parkedRecheckAt = new Date(
+      sweepAt.getTime() - DEPENDENCY_PARKED_RECHECK_MS,
+    );
+    const due = await db
       .select({ interactionId: issueQuestionResponseDeliveries.interactionId })
       .from(issueQuestionResponseDeliveries)
-      .where(eq(issueQuestionResponseDeliveries.status, "pending"))
+      .where(
+        and(
+          eq(issueQuestionResponseDeliveries.status, "pending"),
+          or(
+            isNull(issueQuestionResponseDeliveries.lastErrorCode),
+            ne(
+              issueQuestionResponseDeliveries.lastErrorCode,
+              DEPENDENCY_PARKED_ERROR_CODE,
+            ),
+            isNull(issueQuestionResponseDeliveries.lastAttemptAt),
+            lte(
+              issueQuestionResponseDeliveries.lastAttemptAt,
+              parkedRecheckAt,
+            ),
+          ),
+        ),
+      )
       .orderBy(asc(issueQuestionResponseDeliveries.createdAt))
-      .limit(limit)
-      .then((rows) => rows.map((row) => row.interactionId));
+      .limit(limit);
+    const parked = await db
+      .select({
+        interactionId: issueQuestionResponseDeliveries.interactionId,
+        companyId: issueQuestionResponseDeliveries.companyId,
+        issueId: issueQuestionResponseDeliveries.issueId,
+      })
+      .from(issueQuestionResponseDeliveries)
+      .where(
+        and(
+          eq(issueQuestionResponseDeliveries.status, "pending"),
+          eq(
+            issueQuestionResponseDeliveries.lastErrorCode,
+            DEPENDENCY_PARKED_ERROR_CODE,
+          ),
+          gt(issueQuestionResponseDeliveries.lastAttemptAt, parkedRecheckAt),
+        ),
+      )
+      .orderBy(asc(issueQuestionResponseDeliveries.lastAttemptAt))
+      .limit(limit);
+    const ids = [
+      ...due.map((row) => row.interactionId),
+      ...(await listResumableParkedInteractionIds(parked)),
+    ];
     const counts = {
       scanned: ids.length,
       steered: 0,
