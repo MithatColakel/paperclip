@@ -18,8 +18,10 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueQuestionResponseDeliveries,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
   workspaceOperations,
@@ -29,6 +31,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
+import { questionResponseDeliveryService } from "../services/question-response-delivery.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -138,6 +142,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(issueQuestionResponseDeliveries);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueRelations);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
@@ -1332,5 +1338,170 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         interaction: true,
       },
     });
+  });
+
+  it("parks a dependency-blocked question answer and delivers it once after the blocker resolves", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const sourceRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `Q${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ProjectManager",
+      role: "pm",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: blockerId,
+        companyId,
+        title: "Prove the runner",
+        status: "blocked",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Move onto the runner",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "succeeded",
+      contextSnapshot: { issueId: blockedIssueId },
+      finishedAt: new Date(),
+    });
+    const interactions = issueThreadInteractionService(db);
+    const interaction = await interactions.create(
+      { id: blockedIssueId, companyId },
+      {
+        kind: "ask_user_questions",
+        continuationPolicy: "wake_assignee",
+        sourceRunId,
+        payload: {
+          version: 1,
+          title: "Runner device",
+          questions: [
+            {
+              id: "device",
+              prompt: "Which device should run releases?",
+              selectionMode: "single",
+              required: true,
+              options: [
+                { id: "mac", label: "Mac" },
+                { id: "linux", label: "Linux" },
+              ],
+            },
+          ],
+        },
+      },
+      { agentId, runId: sourceRunId },
+    );
+    const answered = await interactions.answerQuestions(
+      { id: blockedIssueId, companyId, status: "blocked" },
+      interaction.id,
+      { answers: [{ questionId: "device", optionIds: ["mac"] }] },
+      { userId: "responsible-user" },
+    );
+    const wakeup = vi.fn((wakeAgentId: string, opts: Parameters<typeof heartbeat.wakeup>[1]) =>
+      heartbeat.wakeup(wakeAgentId, opts));
+    const deliveries = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup, cancelRun: heartbeat.cancelRun },
+    });
+    const idempotencyKey = `question-response:${answered.id}`;
+    const wakeRows = () => db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, idempotencyKey));
+
+    await expect(deliveries.deliver(answered.id)).resolves.toBeNull();
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await expect(deliveries.sweepPending()).resolves.toMatchObject({ scanned: 0 });
+    }
+
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(await wakeRows()).toEqual([
+      expect.objectContaining({ status: "skipped", reason: "issue_dependencies_blocked" }),
+    ]);
+    const [parked] = await db
+      .select()
+      .from(issueQuestionResponseDeliveries)
+      .where(eq(issueQuestionResponseDeliveries.interactionId, answered.id));
+    expect(parked).toMatchObject({
+      status: "pending",
+      attemptCount: 1,
+      lastErrorCode: "question_response_dependency_blocked",
+    });
+
+    // The continuation run settles the dependent so no disposition repair follows.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db
+        .update(issues)
+        .set({ status: "done", updatedAt: new Date() })
+        .where(eq(issues.id, blockedIssueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Answer received.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date() })
+      .where(eq(issues.id, blockerId));
+    await expect(deliveries.sweepPending()).resolves.toMatchObject({ scanned: 1 });
+    await expect(deliveries.sweepPending()).resolves.toMatchObject({ scanned: 0 });
+
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    const [delivered] = await db
+      .select()
+      .from(issueQuestionResponseDeliveries)
+      .where(eq(issueQuestionResponseDeliveries.interactionId, answered.id));
+    expect(delivered?.status).toMatch(/^(delivered|fallback_queued)$/);
+    expect(delivered?.targetRunId).toBeTruthy();
+    const durableWakes = (await wakeRows()).filter((row) => row.status !== "skipped");
+    expect(durableWakes).toHaveLength(1);
+    expect(durableWakes[0]?.runId).toBe(delivered?.targetRunId);
+    const continuationFinished = await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, delivered!.targetRunId!))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    }, 10_000);
+    expect(continuationFinished).toBe(true);
   });
 });

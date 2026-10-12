@@ -19,6 +19,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueQuestionResponseDeliveries,
+  issueRelations,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -26,6 +27,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { recordExecutionWait } from "../services/execution-wait.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import {
   buildQuestionResponseDeliveryEnvelope,
@@ -71,6 +73,7 @@ describeEmbeddedPostgres("question response delivery", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issueRelations);
     await db.delete(issueQuestionResponseDeliveries);
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
@@ -722,6 +725,362 @@ describeEmbeddedPostgres("question response delivery", () => {
       errorCount: 1,
       targetRunId: fallbackRunId,
     });
+  });
+
+  async function blockIssue(seeded: Awaited<ReturnType<typeof seed>>) {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: seeded.companyId,
+      title: "Prove the runner",
+      status: "blocked",
+      priority: "medium",
+    });
+    await db.insert(issueRelations).values({
+      companyId: seeded.companyId,
+      issueId: blockerId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+    });
+    await db
+      .update(issues)
+      .set({ status: "blocked" })
+      .where(eq(issues.id, seeded.issueId));
+    return blockerId;
+  }
+
+  // Mirrors heartbeat admission for this wake: an unresolved blocker leaves a
+  // skipped execution-wait receipt, otherwise the wake queues a run.
+  function dependencyGatedWakeup(
+    seeded: Awaited<ReturnType<typeof seed>>,
+    blockerId: string,
+  ) {
+    return vi.fn().mockImplementation(
+      async (agentId: string, opts: Record<string, any>) => {
+        const [blocker] = await db
+          .select({ status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, blockerId));
+        if (blocker?.status !== "done") {
+          await db.transaction((tx) =>
+            recordExecutionWait(tx as never, {
+              issueId: seeded.issueId,
+              coalesce: false,
+              condition: { unresolvedBlockerIssueIds: [blockerId] },
+              request: {
+                companyId: seeded.companyId,
+                agentId,
+                source: opts.source,
+                triggerDetail: opts.triggerDetail,
+                reason: "issue_dependencies_blocked",
+                payload: {
+                  ...opts.payload,
+                  issueId: seeded.issueId,
+                  unresolvedBlockerIssueIds: [blockerId],
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType,
+                requestedByActorId: opts.requestedByActorId,
+                idempotencyKey: opts.idempotencyKey,
+                finishedAt: new Date(),
+              },
+            }),
+          );
+          return null;
+        }
+        const [request] = await db
+          .insert(agentWakeupRequests)
+          .values({
+            companyId: seeded.companyId,
+            agentId,
+            source: opts.source,
+            triggerDetail: opts.triggerDetail,
+            reason: opts.reason,
+            payload: opts.payload,
+            status: "queued",
+            idempotencyKey: opts.idempotencyKey,
+          })
+          .returning();
+        const [run] = await db
+          .insert(heartbeatRuns)
+          .values({
+            companyId: seeded.companyId,
+            agentId,
+            invocationSource: "automation",
+            status: "queued",
+            runtimeMode: "legacy",
+            driverKind: "codex",
+            wakeupRequestId: request!.id,
+            contextSnapshot: opts.contextSnapshot,
+          })
+          .returning();
+        await db
+          .update(agentWakeupRequests)
+          .set({ runId: run!.id })
+          .where(eq(agentWakeupRequests.id, request!.id));
+        return run!;
+      },
+    );
+  }
+
+  async function questionResponseWakeRows(interactionId: string) {
+    return db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        eq(agentWakeupRequests.idempotencyKey, `question-response:${interactionId}`),
+      );
+  }
+
+  it("parks a dependency-blocked answer instead of retrying it every sweep", async () => {
+    const seeded = await seed();
+    const blockerId = await blockIssue(seeded);
+    const wakeup = dependencyGatedWakeup(seeded, blockerId);
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    });
+
+    await expect(service.deliver(seeded.interaction.id)).resolves.toBeNull();
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await expect(service.sweepPending()).resolves.toMatchObject({
+        scanned: 0,
+      });
+    }
+
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    const [delivery] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(delivery).toMatchObject({
+      status: "pending",
+      attemptCount: 1,
+      errorCount: 0,
+      lastErrorCode: "question_response_dependency_blocked",
+    });
+    const receipts = await questionResponseWakeRows(seeded.interaction.id);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({
+      status: "skipped",
+      reason: "issue_dependencies_blocked",
+    });
+  });
+
+  it("resumes a parked answer once its blockers resolve and delivers it exactly once", async () => {
+    const seeded = await seed();
+    const blockerId = await blockIssue(seeded);
+    const wakeup = dependencyGatedWakeup(seeded, blockerId);
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    });
+    await expect(service.deliver(seeded.interaction.id)).resolves.toBeNull();
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 0 });
+
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, blockerId));
+    await expect(service.sweepPending()).resolves.toMatchObject({
+      scanned: 1,
+      wakeFallback: 1,
+    });
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 0 });
+    await expect(service.deliver(seeded.interaction.id)).resolves.toMatchObject({
+      status: "fallback_queued",
+      duplicate: true,
+    });
+
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    const receipts = await questionResponseWakeRows(seeded.interaction.id);
+    const durable = receipts.filter((row) => row.status !== "skipped");
+    expect(durable).toHaveLength(1);
+    expect(receipts.filter((row) => row.status === "skipped")).toHaveLength(1);
+    const [delivery] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(delivery).toMatchObject({
+      status: "fallback_queued",
+      deliveryMode: "wake_fallback",
+      attemptCount: 2,
+      errorCount: 0,
+      targetRunId: durable[0]!.runId,
+    });
+  });
+
+  it("resumes a parked answer when another run already owns the issue", async () => {
+    const seeded = await seed({ successorStatus: "queued" });
+    const blockerId = await blockIssue(seeded);
+    const wakeup = vi
+      .fn()
+      .mockImplementationOnce(dependencyGatedWakeup(seeded, blockerId));
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    });
+    await expect(service.deliver(seeded.interaction.id)).resolves.toBeNull();
+    const [parked] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(parked?.lastErrorCode).toBe("question_response_dependency_blocked");
+
+    await db
+      .update(issues)
+      .set({ executionRunId: seeded.successorRunId })
+      .where(eq(issues.id, seeded.issueId));
+    const successor = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.successorRunId!))
+      .then((rows) => rows[0]!);
+    wakeup.mockResolvedValueOnce(successor);
+    await expect(service.sweepPending()).resolves.toMatchObject({
+      scanned: 1,
+      coalesced: 1,
+    });
+    expect(wakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("rechecks a parked answer after the safety interval without adding wake rows", async () => {
+    const seeded = await seed();
+    const blockerId = await blockIssue(seeded);
+    const wakeup = dependencyGatedWakeup(seeded, blockerId);
+    let clock = new Date();
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+      now: () => clock,
+    });
+    await expect(service.deliver(seeded.interaction.id)).resolves.toBeNull();
+
+    clock = new Date(clock.getTime() + 59 * 60_000);
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 0 });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+
+    clock = new Date(clock.getTime() + 2 * 60_000);
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 1 });
+    expect(wakeup).toHaveBeenCalledTimes(2);
+    const [delivery] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(delivery).toMatchObject({
+      status: "pending",
+      attemptCount: 2,
+      errorCount: 0,
+      lastErrorCode: "question_response_dependency_blocked",
+    });
+    const receipts = await questionResponseWakeRows(seeded.interaction.id);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]?.coalescedCount).toBe(1);
+  });
+
+  it("parks a looping pre-upgrade receipt on its next sweep", async () => {
+    const seeded = await seed();
+    const blockerId = await blockIssue(seeded);
+    const idempotencyKey = `question-response:${seeded.interaction.id}`;
+    // Shape of the receipts left by a build that retried a blocked answer
+    // every sweep: pending, a large claim generation, and one skipped wake
+    // row per attempt.
+    await db
+      .update(issueQuestionResponseDeliveries)
+      .set({
+        attemptCount: 16_148,
+        lastAttemptAt: new Date(Date.now() - 30_000),
+        lastErrorCode: "question_response_wake_skipped",
+      })
+      .where(
+        eq(issueQuestionResponseDeliveries.interactionId, seeded.interaction.id),
+      );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await db.insert(agentWakeupRequests).values({
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_dependencies_blocked",
+        status: "skipped",
+        requestedByActorType: "user",
+        requestedByActorId: "board-user",
+        idempotencyKey,
+        finishedAt: new Date(),
+        payload: {
+          issueId: seeded.issueId,
+          mutation: "interaction",
+          unresolvedBlockerIssueIds: [blockerId],
+          executionWait: {
+            unresolvedBlockerIssueIds: [blockerId],
+            requestedIdempotencyKey: idempotencyKey,
+          },
+        },
+      });
+    }
+    const wakeup = dependencyGatedWakeup(seeded, blockerId);
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    });
+
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 1 });
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await expect(service.sweepPending()).resolves.toMatchObject({
+        scanned: 0,
+      });
+    }
+
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    const [delivery] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(delivery).toMatchObject({
+      status: "pending",
+      attemptCount: 16_149,
+      errorCount: 0,
+      lastErrorCode: "question_response_dependency_blocked",
+    });
+    const receipts = await questionResponseWakeRows(seeded.interaction.id);
+    expect(receipts).toHaveLength(3);
+    expect(
+      receipts.reduce((total, row) => total + row.coalescedCount, 0),
+    ).toBe(1);
+  });
+
+  it("keeps retrying transient wake failures and other skips on every sweep", async () => {
+    const seeded = await seed();
+    const wakeup = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("scheduler temporarily unavailable"))
+      .mockImplementationOnce(async (agentId: string, opts: Record<string, any>) => {
+        await db.insert(agentWakeupRequests).values({
+          companyId: seeded.companyId,
+          agentId,
+          source: opts.source,
+          triggerDetail: opts.triggerDetail,
+          reason: "heartbeat.scheduling_suppressed",
+          status: "skipped",
+          idempotencyKey: opts.idempotencyKey,
+          payload: opts.payload,
+          finishedAt: new Date(),
+        });
+        return null;
+      })
+      .mockResolvedValue(null);
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+      steer: vi.fn(),
+    });
+
+    await expect(service.deliver(seeded.interaction.id)).resolves.toBeNull();
+    const [afterError] = await db
+      .select()
+      .from(issueQuestionResponseDeliveries);
+    expect(afterError).toMatchObject({
+      status: "pending",
+      errorCount: 1,
+      lastErrorCode: "scheduler temporarily unavailable",
+    });
+
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 1 });
+    const [afterSkip] = await db
+      .select()
+      .from(issueQuestionResponseDeliveries);
+    expect(afterSkip).toMatchObject({
+      status: "pending",
+      errorCount: 1,
+      lastErrorCode: "question_response_wake_skipped",
+    });
+
+    await expect(service.sweepPending()).resolves.toMatchObject({ scanned: 1 });
+    expect(wakeup).toHaveBeenCalledTimes(3);
   });
 
   it("enforces one durable wake per question-response idempotency key", async () => {

@@ -361,6 +361,10 @@ run/turn ids, payload digest, attempt/acknowledgement state, and one of `steered
 `coalesced`, or `wake_fallback`; answer content remains only in
 `issue_thread_interactions.result`. Deleting the interaction cascades its receipt,
 while deleting a referenced run clears that run pointer without deleting history.
+A wake skipped because the issue has unresolved blockers parks the receipt: it
+stays `pending` with `last_error_code = question_response_dependency_blocked` and
+is not claimed again until the blockers resolve, an execution run owns the issue,
+or an hourly recheck runs. Wake errors still use the bounded retry budget.
 
 ## Plugin database namespaces
 
