@@ -184,6 +184,27 @@ describe("classifyAdapterFailureForRecovery", () => {
     }, now)).toMatchObject({ retryAt: new Date("2026-10-15T06:00:00.000Z"), parsedResetTime: true });
   });
 
+  // The run the claude-local ACP lane now stores when automatic compaction
+  // fails on the usage limit (a `request` typed failure).
+  it("reads the dated reset from an ACP request-category compaction failure", () => {
+    const title =
+      "Prompt is too long · automatic compaction failed: You've hit your weekly limit · resets Oct 15, 6am (UTC)";
+    const finishedAt = new Date("2026-10-12T01:21:00.000Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: `ACP agent reported a terminal request failure.\n${title}`,
+      resultJson: {
+        errorFamily: "provider_quota",
+        terminalSessionFailure: { category: "request", title },
+      },
+      finishedAt,
+    }, finishedAt)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-10-15T06:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
   it.each([
     ["resets Oct 15 at 6am", "2026-10-15T06:00:00.000Z"],
     ["resets Oct 15, 6:30pm (America/Chicago)", "2026-10-15T23:30:00.000Z"],
