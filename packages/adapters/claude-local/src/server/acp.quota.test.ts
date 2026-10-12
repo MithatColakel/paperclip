@@ -123,6 +123,78 @@ it.each([
   expect(transcript.some((entry) => entry.kind === "assistant")).toBe(false);
 });
 
+// Typed failure titles recorded for VPN TrelloIntake on 2026-10-12. The Claude
+// CLI wrote them as synthetic assistant errors and claude-agent-acp forwarded
+// them as `limit` (usage-limit message) and `request` (invalid_request) failures.
+const PROD_WEEKLY_LIMIT_TITLE = "You've hit your weekly limit · resets Oct 15, 6am (UTC)";
+const PROD_COMPACTION_LIMIT_TITLE =
+  "Prompt is too long · automatic compaction failed: You've hit your weekly limit · resets Oct 15, 6am (UTC)";
+
+it.each([
+  ["0.12.0", "oneshot"],
+  ["0.12.0", "persistent"],
+  ["0.13.1", "oneshot"],
+  ["0.13.1", "persistent"],
+])("waits for quota when automatic compaction hit the usage limit with ACPX %s in %s mode", async (version, mode) => {
+  const { result, logs } = await executeFailure(
+    PROD_COMPACTION_LIMIT_TITLE, "request", mode, version === "0.13.1" ? runnerAcpx.createAcpRuntime : undefined,
+  );
+  expect(result).toMatchObject({
+    exitCode: 1,
+    // The provider's reset text stays in the run error for the recovery sweep.
+    errorMessage: `ACP agent reported a terminal request failure.\n${PROD_COMPACTION_LIMIT_TITLE}`,
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    resultJson: {
+      errorFamily: "provider_quota",
+      terminalSessionFailure: { category: "request", title: PROD_COMPACTION_LIMIT_TITLE },
+    },
+  });
+  expect(logs).toContain(PROD_COMPACTION_LIMIT_TITLE);
+});
+
+it("carries the clock reset of a compaction quota failure into the run result", async () => {
+  const title = "Prompt is too long · automatic compaction failed: You've hit your session limit · resets 4pm (UTC)";
+  const { result } = await executeFailure(title, "request");
+  expect(result).toMatchObject({
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore: "2026-07-16T16:00:00.000Z",
+    resultJson: {
+      retryNotBefore: "2026-07-16T16:00:00.000Z",
+      providerQuotaRetryNotBefore: "2026-07-16T16:00:00.000Z",
+    },
+  });
+});
+
+it("keeps the weekly reset text of a typed Claude limit in the run error", async () => {
+  const { result } = await executeFailure(PROD_WEEKLY_LIMIT_TITLE);
+  expect(result).toMatchObject({
+    errorMessage: `ACP agent reported a terminal limit failure.\n${PROD_WEEKLY_LIMIT_TITLE}`,
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    resultJson: {
+      errorFamily: "provider_quota",
+      terminalSessionFailure: { category: "limit", title: PROD_WEEKLY_LIMIT_TITLE },
+    },
+  });
+});
+
+it("classifies only a quota-caused compaction failure as a request-category quota wait", () => {
+  expect(classifyClaudeTerminalSessionFailure({ category: "request", title: PROD_COMPACTION_LIMIT_TITLE }, now))
+    .toMatchObject({ errorCode: "provider_quota", errorFamily: "provider_quota" });
+  expect(classifyClaudeTerminalSessionFailure({
+    category: "request",
+    title: "Claude could not process this request.",
+    details: "automatic compaction failed: You've hit your session limit · resets 9pm (UTC)",
+  }, now)).toMatchObject({ errorCode: "provider_quota", retryNotBefore: "2026-07-15T21:00:00.000Z" });
+  expect(classifyClaudeTerminalSessionFailure({ category: "request", title: "Prompt is too long" }, now)).toBeNull();
+  // A typed access failure is Claude's auth_required signal: it goes to
+  // sign-in recovery, never to a quota wait, whatever its title says.
+  expect(classifyClaudeTerminalSessionFailure({ category: "access", title: PROD_COMPACTION_LIMIT_TITLE }, now))
+    .toEqual({ errorCode: "acpx_auth_required" });
+});
+
 it("classifies quota without a reset time for the existing recovery backoff", async () => {
   const { result } = await executeFailure("You've hit your weekly limit");
   expect(result).toMatchObject({ errorCode: "provider_quota", errorFamily: "provider_quota" });
@@ -161,6 +233,9 @@ it.each([
   ["Rate limit exceeded; retry later", "limit"],
   ["You've hit your session limit", "request"],
   ["The Claude account has no available quota.", "request"],
+  ["Prompt is too long", "request"],
+  ["Prompt is too long · automatic compaction failed: Conversation too long", "request"],
+  [PROD_COMPACTION_LIMIT_TITLE, "connection"],
   ["The Claude account has available quota.", "limit"],
   ["The worker connection closed", "connection"],
 ])("keeps a non-quota typed failure out of quota recovery: %s", async (title, category) => {
@@ -172,6 +247,13 @@ it.each([
   expect(result.resultJson?.terminalSessionFailure).toMatchObject({ category, title });
   expect(result.summary).not.toContain(title);
   expect(logs).toContain(title);
+});
+
+it("routes a typed access failure that quotes a compaction quota to sign-in recovery, not a quota wait", async () => {
+  const { result } = await executeFailure(PROD_COMPACTION_LIMIT_TITLE, "access");
+  expect(result).toMatchObject({ exitCode: 1, errorCode: "claude_auth_required" });
+  expect(result.errorFamily).not.toBe("provider_quota");
+  expect(result.retryNotBefore).toBeUndefined();
 });
 
 it("does not infer quota from the historical generic terminal-limit error", () => {
