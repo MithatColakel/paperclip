@@ -1460,6 +1460,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it.each([
+    ["the first failure", 0, 0],
+    ["a replacement attempt", 2, 10],
+  ])("parks an already-passed reset after %s (attempts %i, floor %i min)", async (_label, attempts, minutes) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const passed = new Date(Date.now() - 2 * 60 * 1000);
+    const label = `${passed.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${passed.getUTCDate()}`;
+    const clock = passed.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "UTC" })
+      .replace(" ", "")
+      .toLowerCase();
+    await seedProviderQuotaFailure({
+      companyId,
+      agentId: coderId,
+      issueId: sourceIssueId,
+      error: `Claude run failed: subtype=success: You've hit your weekly limit · resets ${label}, ${clock} (UTC)`,
+      contextSnapshot: attempts === 0
+        ? {}
+        : {
+            retryReason: "provider_quota_recovery",
+            scheduledRetryAttempt: attempts,
+            providerQuotaWaitStartedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+          },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const before = Date.now();
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+    const after = Date.now();
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const nextCheckAt = updatedIssue!.monitorNextCheckAt!.getTime();
+    if (minutes === 0) {
+      // The first failure retries at the reported reset, even if it is already past.
+      expect(nextCheckAt).toBeLessThanOrEqual(after);
+    } else {
+      expect(nextCheckAt).toBeGreaterThanOrEqual(before + minutes * 60 * 1000);
+      expect(nextCheckAt).toBeLessThanOrEqual(after + minutes * 60 * 1000);
+    }
+  });
+
+  it.each([
     ["its replacement attempts", { scheduledRetryAttempt: 40, waitAgeMs: 60 * 60 * 1000 }],
     ["its time limit", { scheduledRetryAttempt: 3, waitAgeMs: 9 * 24 * 60 * 60 * 1000 }],
   ])("escalates a provider-quota wait that spent %s to the board instead of re-arming it", async (_label, input) => {

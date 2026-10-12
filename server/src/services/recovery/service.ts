@@ -67,6 +67,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import {
   PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE,
+  PROVIDER_QUOTA_RECOVERY_PASSED_RESET_FLOOR_MS,
   providerQuotaExhaustedComment,
   providerQuotaExhaustionReason,
   providerQuotaRecoveryBackoffMs,
@@ -4319,8 +4320,14 @@ export function recoveryService(
       };
     }
 
+    const passedResetFloor = new Date(
+      input.now.getTime() + PROVIDER_QUOTA_RECOVERY_PASSED_RESET_FLOOR_MS,
+    );
     const retryAt = input.classification.parsedResetTime
-      ? input.classification.retryAt
+      ? progress.attempts > 0 &&
+        input.classification.retryAt.getTime() < passedResetFloor.getTime()
+        ? passedResetFloor
+        : input.classification.retryAt
       : new Date(
           input.now.getTime() + providerQuotaRecoveryBackoffMs(progress.attempts),
         );
