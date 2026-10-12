@@ -244,6 +244,8 @@ Blocked issues should stay idle while blockers remain unresolved. Paperclip shou
 
 Both terminal states satisfy the dependency. A `done` blocker remains gated until any required workspace finalization completes so delivered work is synchronized before downstream execution. A `cancelled` blocker resolves immediately because its work was abandoned and has no delivered workspace state to finalize.
 
+The periodic dependency reconciliation sweep delivers an `issue_blockers_resolved` wake that the transition missed. A `blocked` dependent is woken again until a wake for its current ready state is delivered. A `todo` or `in_progress` dependent with an explicit blocker gets at most one sweep wake per blocker resolution, whatever that wake's outcome, and none when its assignee already had a successful run on the issue after the latest blocker terminal transition. A `backlog` dependent is never woken by the sweep.
+
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.
 
 ### Child→Parent Reporting

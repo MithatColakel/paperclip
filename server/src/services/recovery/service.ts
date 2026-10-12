@@ -15,6 +15,7 @@ import {
   asc,
   desc,
   eq,
+  exists,
   gt,
   gte,
   inArray,
@@ -120,8 +121,10 @@ import {
 } from "../issue-execution-policy.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersResolvedResolutionWakeKey,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  findLatestIssueBlockerTerminalTransitionAt,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
@@ -183,6 +186,14 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+// Dependents the backstop wakes once their blockers are all terminal. Backlog
+// dependents stay asleep on purpose; `todo` and `in_progress` dependents get at
+// most one wake per blocker resolution.
+const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_STATUSES = [
+  "blocked",
+  "todo",
+  "in_progress",
+] as const;
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -5678,6 +5689,8 @@ export function recoveryService(
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
+      alreadyRunSkipped: 0,
+      agentUnavailableSkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
@@ -5697,13 +5710,24 @@ export function recoveryService(
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
-        eq(issues.status, "blocked"),
+        inArray(issues.status, [...RESOLVED_DEPENDENCY_WAKE_BACKSTOP_STATUSES]),
         isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
+      const candidateColumns = {
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+        projectId: issues.projectId,
+        assigneeAgentId: issues.assigneeAgentId,
+        blockedTransitionAt: issues.blockedTransitionAt,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        totalCount: sql<number>`count(*) over()::int`,
+      };
 
       if (opts?.blockerIssueId) {
         filters.push(
@@ -5713,14 +5737,7 @@ export function recoveryService(
           eq(issueRelations.relatedIssueId, issues.id),
         );
         return db
-          .select({
-            id: issues.id,
-            companyId: issues.companyId,
-            identifier: issues.identifier,
-            assigneeAgentId: issues.assigneeAgentId,
-            blockedTransitionAt: issues.blockedTransitionAt,
-            totalCount: sql<number>`count(*) over()::int`,
-          })
+          .select(candidateColumns)
           .from(issueRelations)
           .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
           .where(and(...filters))
@@ -5728,15 +5745,27 @@ export function recoveryService(
           .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
       }
 
+      // Every assigned blocked issue is scanned. A todo or in_progress issue is
+      // scanned only when it has an explicit blocker edge.
+      filters.push(
+        or(
+          eq(issues.status, "blocked"),
+          exists(
+            db
+              .select({ id: issueRelations.id })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, issues.companyId),
+                  eq(issueRelations.type, "blocks"),
+                  eq(issueRelations.relatedIssueId, issues.id),
+                ),
+              ),
+          ),
+        )!,
+      );
       return db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          assigneeAgentId: issues.assigneeAgentId,
-          blockedTransitionAt: issues.blockedTransitionAt,
-          totalCount: sql<number>`count(*) over()::int`,
-        })
+        .select(candidateColumns)
         .from(issues)
         .where(and(...filters))
         .orderBy(asc(issues.id))
@@ -5819,16 +5848,74 @@ export function recoveryService(
           continue;
         }
 
-        // Level-triggered dedup: key on the full blocker set (the current ready
-        // state), not on any single resolved edge. An older completed per-edge
-        // wake for an earlier partial resolution has a different key, so it does
-        // not suppress this wake. The shared helper still suppresses a duplicate
-        // wake for the SAME ready state, which bounds reconciliation.
-        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
-          dependentIssueId: candidate.id,
-          blockerIssueIds: readiness.blockerIssueIds,
-          blockedTransitionAt: candidate.blockedTransitionAt,
-        });
+        // A todo or in_progress dependent has no blocked cycle to key on. It is
+        // woken at most once per blocker resolution, and only when its assignee
+        // has not already run the issue since that resolution (a route-time,
+        // assignment or monitor wake already delivered the news).
+        const unblockedDependent = candidate.status !== "blocked";
+        let idempotencyKey: string;
+        if (unblockedDependent) {
+          const resolvedAt = await findLatestIssueBlockerTerminalTransitionAt(
+            db,
+            { companyId, blockerIssueIds: readiness.blockerIssueIds },
+          );
+          // Only a run created after the resolution saw the resolved blockers;
+          // a run that was already going when the last blocker closed did not.
+          const runSinceResolution = await db
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, companyId),
+                eq(heartbeatRuns.agentId, agentId),
+                eq(heartbeatRuns.status, "succeeded"),
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${candidate.id}`,
+                resolvedAt ? gte(heartbeatRuns.createdAt, resolvedAt) : sql`true`,
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (runSinceResolution) {
+            result.alreadyRunSkipped += 1;
+            continue;
+          }
+          idempotencyKey = buildIssueBlockersResolvedResolutionWakeKey({
+            dependentIssueId: candidate.id,
+            blockerIssueIds: readiness.blockerIssueIds,
+            resolvedAt,
+          });
+          // Any row under the one-shot key, whatever its status, means this
+          // resolution was already handed to the assignee. A skipped or failed
+          // wake is not retried, so the sweep cannot storm.
+          const oneShotWake = await db
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (oneShotWake) {
+            result.existingWakeSkipped += 1;
+            continue;
+          }
+        } else {
+          // Level-triggered dedup: key on the full blocker set (the current
+          // ready state), not on any single resolved edge. An older completed
+          // per-edge wake for an earlier partial resolution has a different
+          // key, so it does not suppress this wake. The shared helper still
+          // suppresses a duplicate wake for the SAME ready state, which bounds
+          // reconciliation.
+          idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+            dependentIssueId: candidate.id,
+            blockerIssueIds: readiness.blockerIssueIds,
+            blockedTransitionAt: candidate.blockedTransitionAt,
+          });
+        }
         const existingWake =
           await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId,
@@ -5842,6 +5929,7 @@ export function recoveryService(
         }
 
         if (
+          (unblockedDependent && candidate.monitorNextCheckAt) ||
           (await hasActiveExecutionPath(companyId, candidate.id, agentId)) ||
           (await hasQueuedIssueWake(companyId, candidate.id, agentId))
         ) {
@@ -5864,6 +5952,25 @@ export function recoveryService(
         ) {
           result.pauseHoldSkipped += 1;
           continue;
+        }
+
+        // The one-shot key is spent by any wake row, including a skipped one,
+        // so do not hand it to an assignee that cannot run right now.
+        if (unblockedDependent) {
+          const agent = await getAgent(agentId);
+          if (
+            !agent ||
+            agent.companyId !== companyId ||
+            !(await isAgentInvokable(agent)) ||
+            !isHeartbeatWakeOnDemandEnabled(agent) ||
+            (await budgets.getInvocationBlock(companyId, agentId, {
+              issueId: candidate.id,
+              projectId: candidate.projectId,
+            }))
+          ) {
+            result.agentUnavailableSkipped += 1;
+            continue;
+          }
         }
 
         try {
