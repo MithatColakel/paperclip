@@ -98,6 +98,7 @@ import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
 import {
   legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
@@ -5962,8 +5963,28 @@ export function recoveryService(
         // The one-shot key is spent by any wake row, including a skipped one,
         // so do not hand it to an assignee that cannot run right now.
         if (unblockedDependent) {
+          // A board-owned recovery action is the human-owned continuation
+          // path, and an execution hold or an inactive company only records a
+          // coalesced execution-wait row under its own key. Enqueuing would
+          // race the board or repeat that write on every sweep, so skip, as
+          // stranded-work recovery does.
+          const activeRecoveryAction =
+            await recoveryActionsSvc.getActiveForIssue(companyId, candidate.id);
+          if (
+            activeRecoveryAction?.ownerType === "board" ||
+            (await getExecutionBlocker(db, companyId, candidate.id))
+          ) {
+            result.livePathSkipped += 1;
+            continue;
+          }
+          const company = await db
+            .select({ status: companies.status })
+            .from(companies)
+            .where(eq(companies.id, companyId))
+            .then((rows) => rows[0] ?? null);
           const agent = await getAgent(agentId);
           if (
+            company?.status !== "active" ||
             !agent ||
             agent.companyId !== companyId ||
             !(await isAgentInvokable(agent)) ||
