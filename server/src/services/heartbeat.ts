@@ -537,6 +537,14 @@ import {
 import { withRecoveryContext } from "./recovery/status-only-context.js";
 import { recoveryService } from "./recovery/service.js";
 import {
+  PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE,
+  PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
+  PROVIDER_QUOTA_RECOVERY_RETRY_REASON,
+  PROVIDER_QUOTA_RECOVERY_WAKE_REASON,
+  providerQuotaExhaustedComment,
+  readProviderQuotaRecoveryProgress,
+} from "./recovery/provider-quota-recovery.js";
+import {
   createRunDispatch,
   type PostCommitEffect,
   MAX_TURN_CONTINUATION_RETRY_REASON,
@@ -11647,6 +11655,116 @@ export function heartbeatService(
     });
   }
 
+  async function readProviderQuotaMonitorSourceRun(
+    claimed: IssueMonitorDispatchRow,
+  ) {
+    // Normalized monitor projections redact externalRef. Read the claimed
+    // persisted policy only on this server-owned quota recovery path.
+    const sourceRunId = readNonEmptyString(
+      parseObject(parseObject(claimed.executionPolicy).monitor).externalRef,
+    );
+    return sourceRunId && isUuidLike(sourceRunId)
+      ? await getRun(sourceRunId, { unsafeFullResultJson: true })
+      : null;
+  }
+
+  // A provider-quota monitor that cannot start a replacement run (its wait is
+  // spent, or scheduling was refused) must not report "triggered" and leave
+  // the sweep to re-arm it forever. It clears the monitor and hands the issue
+  // to the board as a blocked issue with a board-owned recovery action, which
+  // the board Inbox lists. An existing human-owned action already is that
+  // escalation (legacy reconciliation records one).
+  async function escalateProviderQuotaMonitor(input: {
+    claimed: IssueMonitorDispatchRow;
+    policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+    monitor: IssueExecutionMonitorPolicy | null;
+    sourceRun: typeof heartbeatRuns.$inferSelect | null;
+    clearReason: IssueExecutionMonitorClearReason;
+    reason: string;
+    scheduledAtIso: string;
+    nextAttemptCount: number;
+    now: Date;
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    activitySource: "manual" | "scheduled";
+  }) {
+    await db
+      .update(issues)
+      .set({
+        ...buildIssueMonitorClearedPatch({
+          issue: input.claimed,
+          policy: input.policy,
+          clearReason: input.clearReason,
+          clearedAt: input.now,
+        }),
+        updatedAt: input.now,
+      })
+      .where(eq(issues.id, input.claimed.id));
+
+    const existingBoardAction = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.claimed.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.claimed.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          inArray(issueRecoveryActions.ownerType, ["board", "user"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!existingBoardAction) {
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.claimed.id))
+        .then((rows) => rows[0] ?? null);
+      if (issue && (issue.status === "in_progress" || issue.status === "in_review")) {
+        await recovery.escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status,
+          latestRun: input.sourceRun,
+          recoveryCause: PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE,
+          comment: providerQuotaExhaustedComment({
+            reason: input.reason,
+            progress: input.sourceRun
+              ? readProviderQuotaRecoveryProgress(input.sourceRun, input.now)
+              : null,
+          }),
+        });
+      }
+    }
+
+    await logActivity(db, {
+      companyId: input.claimed.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.monitor_escalated_to_board",
+      entityType: "issue",
+      entityId: input.claimed.id,
+      details: {
+        ...monitorRecoveryDetails({
+          claimed: input.claimed,
+          scheduledAtIso: input.scheduledAtIso,
+          nextAttemptCount: input.nextAttemptCount,
+          clearReason: input.clearReason,
+          recoveryPolicy: "escalate_to_board",
+          monitor: input.monitor,
+          source: input.activitySource,
+        }),
+        reason: input.reason,
+        sourceRunId: input.sourceRun?.id ?? null,
+      },
+    });
+
+    return { outcome: "skipped" as const, reason: input.reason };
+  }
+
   async function clearIssueMonitorAndRecover(input: {
     claimed: IssueMonitorDispatchRow;
     policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
@@ -11781,7 +11899,34 @@ export function heartbeatService(
         }
       : {};
 
+    const escalationInput = {
+      claimed,
+      policy,
+      monitor,
+      scheduledAtIso,
+      nextAttemptCount,
+      now: input.now,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      activitySource: input.activitySource,
+    };
+
     if (clearReason) {
+      // Waking the owner past a quota wait's bounds would only start another
+      // run on the exhausted account; the board decides instead.
+      if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
+        return escalateProviderQuotaMonitor({
+          ...escalationInput,
+          sourceRun: await readProviderQuotaMonitorSourceRun(claimed),
+          clearReason,
+          reason:
+            clearReason === "timeout_exceeded"
+              ? "the usage-limit wait reached its time limit"
+              : "the usage-limit wait used all of its monitor checks",
+        });
+      }
       return clearIssueMonitorAndRecover({
         claimed,
         policy,
@@ -11801,15 +11946,7 @@ export function heartbeatService(
 
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
-        // Normalized monitor projections redact externalRef. Read the claimed
-        // persisted policy only on this server-owned quota recovery path.
-        const sourceRunId = readNonEmptyString(
-          parseObject(parseObject(claimed.executionPolicy).monitor).externalRef,
-        );
-        const sourceRun =
-          sourceRunId && isUuidLike(sourceRunId)
-            ? await getRun(sourceRunId, { unsafeFullResultJson: true })
-            : null;
+        const sourceRun = await readProviderQuotaMonitorSourceRun(claimed);
         if (
           !sourceRun ||
           sourceRun.companyId !== claimed.companyId ||
@@ -11829,32 +11966,68 @@ export function heartbeatService(
           );
         }
         if (await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)) {
+          // Reconciliation records the board-owned recovery action; the
+          // escalation only fills in when that record could not be written.
           await terminalizeLegacyExecution({
             db,
             run: sourceRun,
             status: sourceRun.status,
           });
-        } else {
-          const targetAgent = await getAgent(targetAgentId);
-          if (!targetAgent)
-            throw conflict("The quota recovery agent is unavailable.");
-          const scheduled = await scheduleBoundedRetryForRun(
+          return escalateProviderQuotaMonitor({
+            ...escalationInput,
             sourceRun,
-            targetAgent,
-            {
-              now: input.now,
-              ...(isProviderQuotaReviewMonitor
-                ? {
-                    retryReason:
-                      EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
-                    wakeReason:
-                      EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
-                  }
-                : {}),
-            },
+            clearReason: "dispatch_skipped",
+            reason:
+              "the previous execution must be reconciled before a replacement can start",
+          });
+        }
+        const targetAgent = await getAgent(targetAgentId);
+        if (!targetAgent)
+          throw conflict("The quota recovery agent is unavailable.");
+        // A fresh replacement in the provider-quota lane. The lane keeps its
+        // own attempt count, so failure retries spent before the wait cannot
+        // turn the resume into a silent no-op.
+        const scheduled = await scheduleBoundedRetryForRun(
+          sourceRun,
+          targetAgent,
+          isProviderQuotaReviewMonitor
+            ? {
+                now: input.now,
+                retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+                wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
+              }
+            : {
+                now: input.now,
+                retryReason: PROVIDER_QUOTA_RECOVERY_RETRY_REASON,
+                wakeReason: PROVIDER_QUOTA_RECOVERY_WAKE_REASON,
+                maxAttempts: PROVIDER_QUOTA_RECOVERY_MAX_ATTEMPTS,
+                delayMs: 0,
+              },
+        );
+        // A finished successor of the source means a newer run already owns
+        // the issue; the sweep re-arms the monitor on that run instead.
+        if (
+          scheduled.outcome === "scheduled" &&
+          scheduled.reusedExisting &&
+          !["scheduled_retry", "queued", "running"].includes(scheduled.run.status)
+        ) {
+          throw conflict(
+            "The quota recovery source changed; inspect the current task execution.",
           );
-          if (scheduled.outcome === "not_scheduled")
-            throw conflict(scheduled.reason);
+        }
+        if (scheduled.outcome !== "scheduled") {
+          return escalateProviderQuotaMonitor({
+            ...escalationInput,
+            sourceRun,
+            clearReason:
+              scheduled.outcome === "retry_exhausted"
+                ? "max_attempts_exhausted"
+                : "dispatch_skipped",
+            reason:
+              scheduled.outcome === "retry_exhausted"
+                ? `all ${scheduled.maxAttempts} automatic replacement attempts were used`
+                : `no replacement run could be scheduled (${scheduled.reason})`,
+          });
         }
       } else
         await enqueueWakeup(targetAgentId, {
@@ -15445,6 +15618,35 @@ export function heartbeatService(
     };
   }
 
+  // True when the recovery sweep will park this run's issue on the
+  // provider-quota monitor: the issue is in progress with the run's agent as
+  // assignee, or in review with that agent as the pending participant.
+  async function providerQuotaMonitorOwnsIssueRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "agentId">,
+    issueId: string,
+  ) {
+    const issue = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.assigneeUserId || !issue.assigneeAgentId) return false;
+    if (issue.status === "in_progress")
+      return issue.assigneeAgentId === run.agentId;
+    if (issue.status !== "in_review") return false;
+    const executionState = parseIssueExecutionState(issue.executionState);
+    const participant =
+      executionState?.status === "pending"
+        ? executionState.currentParticipant
+        : null;
+    return participant?.type === "agent" && participant.agentId === run.agentId;
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -15515,6 +15717,36 @@ export function heartbeatService(
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+
+    // A usage limit is not a transient failure: two blind retries 30 s apart
+    // only spend runs (and the daily run cap) on the same exhausted account.
+    // While the issue still waits on this run's agent, the recovery sweep
+    // parks it on the provider-quota monitor at the reset time instead.
+    if (
+      transientRecovery?.errorFamily === "provider_quota" &&
+      run.runtimeMode !== "native" &&
+      issueId &&
+      (await providerQuotaMonitorOwnsIssueRun(run, issueId))
+    ) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message:
+          "Provider usage limit reached; no transient retry was queued. The provider-quota monitor resumes this task after the reset.",
+        payload: {
+          retryReason,
+          retryNotBefore: transientRetryNotBefore?.toISOString() ?? null,
+        },
+      });
+      return {
+        outcome: "not_scheduled" as const,
+        reason:
+          "Provider usage limit reached; the provider-quota monitor owns the retry.",
+        errorCode: "provider_quota_wait" as const,
+        issueId,
+      };
+    }
 
     if (!baseSchedule) {
       const exhaustion = {
@@ -15681,6 +15913,14 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_FAILOVER_RETRY_REASON
           ? { aiConnectionFailovers: readAiConnectionFailoverCount(contextSnapshot) + 1 }
+          : {}),
+        ...(retryReason === PROVIDER_QUOTA_RECOVERY_RETRY_REASON
+          ? {
+              providerQuotaWaitStartedAt: readProviderQuotaRecoveryProgress(
+                run,
+                now,
+              ).waitStartedAt.toISOString(),
+            }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -26116,6 +26356,7 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
+          let providerQuotaWaitOwnsRetry = false;
           if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
@@ -26142,8 +26383,12 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            if (!(await scheduleAiConnectionPoolFailover(livenessRun, agent)))
-              await scheduleBoundedRetryForRun(livenessRun, agent);
+            if (!(await scheduleAiConnectionPoolFailover(livenessRun, agent))) {
+              const retry = await scheduleBoundedRetryForRun(livenessRun, agent);
+              providerQuotaWaitOwnsRetry =
+                retry.outcome === "not_scheduled" &&
+                retry.errorCode === "provider_quota_wait";
+            }
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -26160,7 +26405,10 @@ export function heartbeatService(
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
           await releaseIssueExecutionAndPromote(livenessRun, {
+            // The provider-quota monitor, not an immediate replacement on the
+            // same exhausted account, resumes a usage-limited issue.
             suppressImmediateRecovery: conversationSettled ||
+              providerQuotaWaitOwnsRetry ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||

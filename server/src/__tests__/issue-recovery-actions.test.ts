@@ -923,7 +923,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         serviceName: "AI provider quota",
         externalRef: runId,
         maxAttempts: null,
-        recoveryPolicy: "wake_owner",
+        timeoutAt: expect.any(String),
+        recoveryPolicy: "escalate_to_board",
       },
     });
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -1365,6 +1366,137 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitorNotes: "Provider usage quota reached; retry the original assignee after the default recovery backoff.",
     });
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
+
+  async function seedProviderQuotaFailure(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    error?: string;
+    contextSnapshot?: Record<string, unknown>;
+  }) {
+    const runId = randomUUID();
+    const now = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      status: "failed",
+      error: input.error ?? "ACP agent reported a terminal limit failure.",
+      errorCode: "provider_quota",
+      // The prod shape: a conversation-continuation run, safe to replay.
+      resultJson: { errorFamily: "provider_quota", conversationContinuation: "continue_conversation_v1" },
+      startedAt: now,
+      finishedAt: now,
+      contextSnapshot: { issueId: input.issueId, ...(input.contextSnapshot ?? {}) },
+    });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    return run!;
+  }
+
+  it.each([
+    [0, 1],
+    [1, 2],
+    [2, 4],
+    [3, 6],
+    [12, 6],
+  ])("backs off a provider-quota wait without a reset time after %i replacement attempts (%ih)", async (attempts, hours) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const waitStartedAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const run = await seedProviderQuotaFailure({
+      companyId,
+      agentId: coderId,
+      issueId: sourceIssueId,
+      contextSnapshot: attempts === 0
+        ? {}
+        : {
+            retryReason: "provider_quota_recovery",
+            scheduledRetryAttempt: attempts,
+            providerQuotaWaitStartedAt: waitStartedAt.toISOString(),
+          },
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const before = Date.now();
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    const after = Date.now();
+
+    expect(result.providerQuotaMonitored).toBe(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const nextCheckAt = updatedIssue!.monitorNextCheckAt!.getTime();
+    expect(nextCheckAt).toBeGreaterThanOrEqual(before + hours * 60 * 60 * 1000);
+    expect(nextCheckAt).toBeLessThanOrEqual(after + hours * 60 * 60 * 1000);
+    const deadline = (attempts === 0 ? run.createdAt : waitStartedAt).getTime() + 8 * 24 * 60 * 60 * 1000;
+    expect(updatedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        externalRef: run.id,
+        timeoutAt: new Date(deadline).toISOString(),
+        recoveryPolicy: "escalate_to_board",
+      },
+    });
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+  });
+
+  it("parks a dated weekly-limit reset on the reported day", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const today = new Date();
+    const reset = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 3, 6, 0));
+    const label = `${reset.toLocaleString("en-US", { month: "short", timeZone: "UTC" })} ${reset.getUTCDate()}`;
+    await seedProviderQuotaFailure({
+      companyId,
+      agentId: coderId,
+      issueId: sourceIssueId,
+      error: `Claude run failed: subtype=success: You've hit your weekly limit · resets ${label}, 6am (UTC)`,
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    expect(await recovery.reconcileStrandedAssignedIssues()).toMatchObject({ providerQuotaMonitored: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue?.monitorNextCheckAt?.toISOString()).toBe(reset.toISOString());
+    expect(updatedIssue?.monitorNotes).toBe(
+      "Provider usage quota reached; retry the original assignee at the provider reset time.",
+    );
+  });
+
+  it.each([
+    ["its replacement attempts", { scheduledRetryAttempt: 40, waitAgeMs: 60 * 60 * 1000 }],
+    ["its time limit", { scheduledRetryAttempt: 3, waitAgeMs: 9 * 24 * 60 * 60 * 1000 }],
+  ])("escalates a provider-quota wait that spent %s to the board instead of re-arming it", async (_label, input) => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await seedProviderQuotaFailure({
+      companyId,
+      agentId: coderId,
+      issueId: sourceIssueId,
+      contextSnapshot: {
+        retryReason: "provider_quota_recovery",
+        scheduledRetryAttempt: input.scheduledRetryAttempt,
+        providerQuotaWaitStartedAt: new Date(Date.now() - input.waitAgeMs).toISOString(),
+      },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ providerQuotaMonitored: 0, escalated: 1 });
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked", assigneeAgentId: coderId, monitorNextCheckAt: null });
+    const actions = await db.select().from(issueRecoveryActions);
+    expect(actions).toMatchObject([
+      { ownerType: "board", cause: "provider_quota_exhausted", kind: "stranded_assigned_issue", status: "active" },
+    ]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssueId));
+    expect(comments.map((comment) => comment.body).join("\n")).toContain(
+      "Paperclip stopped waiting for the AI provider usage limit to reset",
+    );
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    // Blocked with a board-owned action: later sweeps leave it to the board.
+    await recovery.reconcileStrandedAssignedIssues();
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+    const [stillBlocked] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(stillBlocked).toMatchObject({ status: "blocked", monitorNextCheckAt: null });
   });
 
   it("classifies model lookup failures as configuration incomplete without waking a recovery owner", async () => {

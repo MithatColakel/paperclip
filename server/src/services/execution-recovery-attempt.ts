@@ -41,9 +41,13 @@ function historicalFailureCount(run: RetryRun): number {
   return count(run.scheduledRetryAttempt) ?? 0;
 }
 
+// Resource waits keep their own attempt counter and never spend failures. A
+// provider-quota recovery is the wait for a usage limit to reset.
+const RESOURCE_WAIT_LANES = ["workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "ai_connection_failover", "provider_quota_recovery"];
+
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "ai_connection_failover"].includes(run.scheduledRetryReason ?? "");
+  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", ...RESOURCE_WAIT_LANES].includes(run.scheduledRetryReason ?? "");
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -58,7 +62,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
-  if (reason === "workspace_busy" || reason === "ai_connection_busy" || reason === "ai_connection_pool_wait" || reason === "ai_connection_failover") {
+  if (RESOURCE_WAIT_LANES.includes(reason)) {
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
@@ -68,6 +72,6 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== "ai_connection_pool_wait" && reason !== "ai_connection_failover") accounting.failureRetries = attempt;
+  else if (!RESOURCE_WAIT_LANES.includes(reason)) accounting.failureRetries = attempt;
   return accounting;
 }

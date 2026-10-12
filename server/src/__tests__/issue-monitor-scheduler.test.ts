@@ -299,6 +299,149 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(await db.select().from(issueRecoveryActions)).toMatchObject([{ ownerType: "board", evidence: { runId: sourceRunId } }]);
   });
 
+  // The prod source run after a weekly limit: the second of the two transient
+  // retries, failed on the limit, with a conversation-continuation policy.
+  async function seedProviderQuotaSourceRun(input: {
+    sourceRunId: string;
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    scheduledRetryReason: string;
+    scheduledRetryAttempt: number;
+    createdAt: Date;
+    contextSnapshot?: Record<string, unknown>;
+  }) {
+    await db.insert(heartbeatRuns).values({
+      id: input.sourceRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      error: "ACP agent reported a terminal limit failure.",
+      errorCode: "provider_quota",
+      createdAt: input.createdAt,
+      finishedAt: new Date(input.createdAt.getTime() + 60_000),
+      scheduledRetryReason: input.scheduledRetryReason,
+      scheduledRetryAttempt: input.scheduledRetryAttempt,
+      contextSnapshot: {
+        issueId: input.issueId,
+        retryReason: input.scheduledRetryReason,
+        scheduledRetryAttempt: input.scheduledRetryAttempt,
+        ...(input.contextSnapshot ?? {}),
+      },
+      resultJson: { conversationContinuation: "continue_conversation_v1", errorFamily: "provider_quota" },
+    });
+  }
+
+  it("starts one provider-quota replacement when the transient retry budget is already spent", async () => {
+    const sourceRunId = randomUUID();
+    const { companyId, issueId, agentId } = await seedFixture({
+      monitorAttemptCount: 36,
+      monitor: { serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRunId, recoveryPolicy: "wake_owner" },
+    });
+    const sourceCreatedAt = new Date("2026-04-10T22:01:46.784Z");
+    await seedProviderQuotaSourceRun({
+      sourceRunId, companyId, agentId, issueId,
+      scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2, createdAt: sourceCreatedAt,
+    });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(1);
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId));
+    expect(successors).toHaveLength(1);
+    const [replacement] = successors;
+    expect(replacement).toMatchObject({
+      agentId,
+      status: "scheduled_retry",
+      scheduledRetryReason: "provider_quota_recovery",
+      scheduledRetryAttempt: 1,
+    });
+    expect(replacement!.scheduledRetryAt?.toISOString()).toBe(tickAt.toISOString());
+    expect(replacement!.contextSnapshot).toMatchObject({
+      issueId,
+      wakeReason: "provider_quota_recovery",
+      retryReason: "provider_quota_recovery",
+      providerQuotaWaitStartedAt: sourceCreatedAt.toISOString(),
+      // The spent transient budget is carried, not consumed or reset.
+      executionRetryAccounting: { failureRetries: 2 },
+    });
+    const [wakeup] = await db.select().from(agentWakeupRequests);
+    expect(wakeup).toMatchObject({ reason: "provider_quota_recovery", runId: replacement!.id });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject({ status: "in_progress", monitorNextCheckAt: null });
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_triggered");
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+
+    expect(await heartbeat.promoteDueScheduledRetries(tickAt)).toMatchObject({ promoted: 1, runIds: [replacement!.id] });
+    const promoted = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, replacement!.id)).then((rows) => rows[0]!);
+    expect(promoted.status).not.toBe("scheduled_retry");
+    expect(promoted.status).not.toBe("cancelled");
+  });
+
+  it.each([
+    {
+      name: "the replacement lane is spent",
+      scheduledRetryReason: "provider_quota_recovery",
+      scheduledRetryAttempt: 40,
+      monitor: {},
+      agentStatus: "active" as const,
+      clearReason: "max_attempts_exhausted",
+    },
+    {
+      name: "the wait reached its deadline",
+      scheduledRetryReason: "provider_quota_recovery",
+      scheduledRetryAttempt: 3,
+      monitor: { timeoutAt: "2026-04-11T12:00:00.000Z", recoveryPolicy: "escalate_to_board" },
+      agentStatus: "active" as const,
+      clearReason: "timeout_exceeded",
+    },
+    {
+      name: "the agent cannot run",
+      scheduledRetryReason: "transient_failure",
+      scheduledRetryAttempt: 2,
+      monitor: {},
+      agentStatus: "paused" as const,
+      clearReason: "dispatch_skipped",
+    },
+  ])("escalates a provider-quota monitor to the board when $name", async (variant) => {
+    const sourceRunId = randomUUID();
+    const { companyId, issueId, agentId } = await seedFixture({
+      agentStatus: variant.agentStatus,
+      monitor: { serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRunId, ...variant.monitor },
+    });
+    await seedProviderQuotaSourceRun({
+      sourceRunId, companyId, agentId, issueId,
+      scheduledRetryReason: variant.scheduledRetryReason,
+      scheduledRetryAttempt: variant.scheduledRetryAttempt,
+      createdAt: new Date("2026-04-11T06:00:00.000Z"),
+      contextSnapshot: { providerQuotaWaitStartedAt: "2026-04-10T00:00:00.000Z" },
+    });
+
+    const result = await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    expect(result).toMatchObject({ enqueued: 0, skipped: 1 });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId))).toHaveLength(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: agentId, monitorNextCheckAt: null });
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: variant.clearReason,
+    });
+    expect(await db.select().from(issueRecoveryActions)).toMatchObject([
+      { ownerType: "board", cause: "provider_quota_exhausted", status: "active", sourceIssueId: issueId },
+    ]);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(activity).toContain("issue.monitor_escalated_to_board");
+    expect(activity).not.toContain("issue.monitor_triggered");
+  });
+
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
     const sourceRunId = randomUUID();
     const { companyId, issueId, agentId: assigneeAgentId } = await seedFixture({
