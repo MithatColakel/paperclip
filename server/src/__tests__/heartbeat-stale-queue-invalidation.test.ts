@@ -1817,6 +1817,78 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
+  it("does not count provider quota failures or runs cancelled before they started toward the daily run cap", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: { maxDailyRuns: 1 },
+    });
+    const today = new Date();
+    await db.insert(heartbeatRuns).values([
+      // A provider usage-limit failure and its two bounded retries.
+      ...[0, 1, 2].map(() => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "provider_quota",
+        createdAt: today,
+        startedAt: today,
+        finishedAt: today,
+        contextSnapshot: {},
+      })),
+      // An ACP limit failure recorded by its error family.
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "acpx_turn_failed",
+        resultJson: { errorFamily: "provider_quota" },
+        createdAt: today,
+        startedAt: today,
+        finishedAt: today,
+        contextSnapshot: {},
+      },
+      // Cancelled while still queued: it never started.
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        status: "cancelled",
+        errorCode: "heartbeat.daily_run_limit",
+        createdAt: today,
+        finishedAt: today,
+        contextSnapshot: {},
+      },
+    ]);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+
+    // The cap still counts real work: the run above fills it.
+    await waitForCondition(async () => {
+      const [settled] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, run!.id));
+      return settled?.status === "succeeded";
+    });
+    expect(
+      await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual" }),
+    ).toBeNull();
+  });
+
   it("cancels queued max-turn continuations when another continuation owns the issue lock", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
