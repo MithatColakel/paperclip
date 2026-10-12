@@ -8677,6 +8677,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("dispatches a todo hand-off to its new assignee when another agent's success is the latest issue run", async () => {
+    // The worker finished and handed the issue back by assignment; the
+    // coordinator's assignment wake was lost (a dropped or capped wake).
+    const { companyId, agentId: workerId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "succeeded",
+      });
+    const coordinatorId = randomUUID();
+    await db.insert(agents).values({
+      id: coordinatorId,
+      companyId,
+      name: "Coordinator",
+      role: "pm",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // The coordinator's own success predates the delegation and says nothing
+    // about the hand-back.
+    const triagedAt = new Date("2026-03-18T00:00:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: coordinatorId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      createdAt: triagedAt,
+      startedAt: triagedAt,
+      finishedAt: triagedAt,
+      updatedAt: triagedAt,
+    });
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: coordinatorId })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.assignmentDispatched).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const coordinatorWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, coordinatorId));
+    expect(coordinatorWakes).toEqual([
+      expect.objectContaining({
+        source: "assignment",
+        reason: "issue_assigned",
+        payload: expect.objectContaining({
+          issueId,
+          mutation: "assigned_todo_liveness_dispatch",
+        }),
+      }),
+    ]);
+    // Nothing is sent back to the worker that already finished.
+    const workerWakes = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, workerId));
+    expect(workerWakes).toHaveLength(1);
+
+    if (coordinatorWakes[0]?.runId) {
+      await waitForRunToSettle(heartbeat, coordinatorWakes[0].runId);
+    }
+  });
+
   it("leaves the onboarding first task idle until the user comments", async () => {
     const { companyId, agentId, issueId } =
       await seedAssignedTodoNoRunFixture();
