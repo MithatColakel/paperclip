@@ -316,14 +316,29 @@ async function prepareClaudeRemoteManagedHome(
   return { stagedRuntime, teardown: registerWorkspaceSyncBack(stagedRuntime) };
 }
 
+// Claude Code reports a usage limit hit during automatic context compaction as
+// an invalid request, for example "Prompt is too long · automatic compaction
+// failed: You've hit your weekly limit · resets Oct 15, 6am (UTC)", and
+// claude-agent-acp types that as a `request` failure. Only the compaction
+// reason is matched, so a request error that merely quotes quota text is not.
+const CLAUDE_COMPACTION_FAILURE_REASON_RE = /\bcompaction failed:\s*([^\n]+)/i;
+
+function isClaudeCompactionQuotaFailure(text: string): boolean {
+  const reason = text.match(CLAUDE_COMPACTION_FAILURE_REASON_RE)?.[1];
+  return reason ? isClaudeProviderQuotaError({ errorMessage: reason }) : false;
+}
+
 export function classifyClaudeTerminalSessionFailure(
   failure: AcpxTerminalSessionFailure,
   now: Date,
 ): AcpxTerminalFailureClassification | null {
+  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
+  // The session cannot continue until the quota resets, so a compaction that
+  // failed on the usage limit is a quota wait, not a broken request.
+  const isCompactionQuota = failure.category === "request" && isClaudeCompactionQuotaFailure(surface.errorMessage);
   // `limit` also includes context, turn, rate and configured budget limits.
   // Only the provider's quota wording qualifies for a quota wait.
-  if (failure.category !== "limit") return null;
-  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
+  if (failure.category !== "limit" && !isCompactionQuota) return null;
   // claude-agent-acp uses this exact quota_exhausted fallback when no provider
   // title is available. It does not match the CLI's usage-limit wording.
   const isQuotaFallback = failure.title === "The Claude account has no available quota.";
