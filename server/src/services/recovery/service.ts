@@ -4585,6 +4585,14 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      // A todo issue waits on its current assignee. When another agent ran on
+      // it last (the worker that handed it back by assignment), the
+      // assignee's own runs predate the hand-off and say nothing about it.
+      // Reasoning from the worker's succeeded run left a hand-off whose wake
+      // was dropped stranded in todo for good; treat it as never dispatched.
+      if (issue.status === "todo" && latestRun && latestRun.agentId !== agentId) {
+        latestRun = null;
+      }
 
       if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
