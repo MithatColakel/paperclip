@@ -303,7 +303,7 @@ function isSubHourlyCronExpression(expression: string, timeZone: string, after: 
 
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
-  if (status === "coalesced") return "Coalesced into an existing open execution issue";
+  if (status === "coalesced") return "Coalesced into an existing live execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because an open execution issue already exists";
   if (status === "completed") return "Execution issue completed";
@@ -1571,10 +1571,12 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
-  // Dispatch treats an execution issue as active until it is done or cancelled, not only while a
-  // run is live. Quota recovery parks issues with no live run, and blocked or in-review issues
-  // wait on someone else; counting only live runs let every tick stack a duplicate issue behind
-  // them. The live issue still wins so coalescing links to the run doing the work.
+  // skip_if_active treats an execution issue as active until it is done or cancelled, not only
+  // while a run is live. Quota recovery parks issues with no live run, and blocked or in-review
+  // issues wait on someone else; counting only live runs let every tick stack a duplicate issue
+  // behind them. The live issue still wins so the skip links to the run doing the work.
+  // coalesce_if_active keeps using findLiveExecutionIssue: coalescing wakes nobody, so joining an
+  // idle issue would swallow every later tick until someone closes it.
   async function findOpenExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1902,9 +1904,11 @@ export function routineService(
           ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
           : undefined;
 
+      const findActiveExecutionIssue =
+        input.routine.concurrencyPolicy === "skip_if_active" ? findOpenExecutionIssue : findLiveExecutionIssue;
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findOpenExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = await findActiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
@@ -1972,7 +1976,7 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findOpenExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingIssue = await findActiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });

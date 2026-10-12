@@ -677,8 +677,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(svc.evaluateActivityGate(projectRoutine, now)).resolves.toMatchObject({ fire: true });
   });
 
-  it("coalesces into the previous routine issue while it is open but idle", async () => {
-    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
+  it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
@@ -704,19 +704,24 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       completedAt: new Date("2026-03-20T12:00:00.000Z"),
     });
 
+    const detailBefore = await svc.getDetail(routine.id);
+    expect(detailBefore?.activeIssue).toBeNull();
+
     const run = await svc.runRoutine(routine.id, { source: "manual" });
-    expect(run.status).toBe("coalesced");
-    expect(run.linkedIssueId).toBe(previousIssue.id);
-    expect(run.coalescedIntoRunId).toBe(previousRunId);
-    expect(run.failureReason).toBeNull();
-    expect(wakeups).toHaveLength(0);
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(previousIssue.id);
 
     const routineIssues = await db
-      .select({ id: issues.id })
+      .select({
+        id: issues.id,
+        originRunId: issues.originRunId,
+      })
       .from(issues)
       .where(eq(issues.originId, routine.id));
 
-    expect(routineIssues).toEqual([{ id: previousIssue.id }]);
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.map((issue) => issue.id)).toContain(previousIssue.id);
+    expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
   });
 
   it("creates draft routines without a project or default assignee", async () => {
@@ -1667,6 +1672,43 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const afterCancel = await svc.runRoutine(routine.id, { source: "api" });
     expect(afterCancel.status).toBe("issue_created");
     expect(afterCancel.linkedIssueId).not.toBe(previousIssueId);
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, routine.id)));
+    expect(routineIssues).toHaveLength(2);
+  });
+
+  it("keeps coalesce_if_active on live runs so an idle in-review issue does not swallow later ticks", async () => {
+    const { companyId, routine, svc, wakeups } = await seedFixture();
+    expect(routine.concurrencyPolicy).toBe("coalesce_if_active");
+
+    const firstRun = await svc.runRoutine(routine.id, { source: "api" });
+    expect(firstRun.status).toBe("issue_created");
+    const previousIssueId = firstRun.linkedIssueId!;
+
+    const whileLive = await svc.runRoutine(routine.id, { source: "api" });
+    expect(whileLive).toMatchObject({
+      status: "coalesced",
+      linkedIssueId: previousIssueId,
+      failureReason: null,
+    });
+    expect(wakeups).toHaveLength(1);
+
+    // The run finished and the issue now waits in review with nothing queued.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.companyId, companyId));
+    await db
+      .update(issues)
+      .set({ status: "in_review", executionRunId: null, executionLockedAt: null })
+      .where(eq(issues.id, previousIssueId));
+
+    const whileIdle = await svc.runRoutine(routine.id, { source: "api" });
+    expect(whileIdle.status).toBe("issue_created");
+    expect(whileIdle.linkedIssueId).not.toBe(previousIssueId);
+    expect(wakeups).toHaveLength(2);
     const routineIssues = await db
       .select({ id: issues.id })
       .from(issues)
