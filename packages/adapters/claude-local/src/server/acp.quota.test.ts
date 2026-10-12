@@ -153,6 +153,22 @@ it.each([
   expect(logs).toContain(PROD_COMPACTION_LIMIT_TITLE);
 });
 
+it("dates the weekly reset of both prod ACP quota titles", () => {
+  // The shared reset parser reads the dated form, so the ACP lane hands the
+  // recovery monitor the reported reset instead of falling back to backoff.
+  const failedAt = new Date("2026-10-12T01:21:00.000Z");
+  for (const [category, title] of [
+    ["limit", PROD_WEEKLY_LIMIT_TITLE],
+    ["request", PROD_COMPACTION_LIMIT_TITLE],
+  ] as const) {
+    expect(classifyClaudeTerminalSessionFailure({ category, title }, failedAt)).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-10-15T06:00:00.000Z",
+    });
+  }
+});
+
 it("carries the clock reset of a compaction quota failure into the run result", async () => {
   const title = "Prompt is too long · automatic compaction failed: You've hit your session limit · resets 4pm (UTC)";
   const { result } = await executeFailure(title, "request");
