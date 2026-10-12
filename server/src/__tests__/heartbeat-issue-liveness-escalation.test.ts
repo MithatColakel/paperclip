@@ -1177,7 +1177,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(await resolutionKeyWakes()).toHaveLength(1);
   });
 
-  it("wakes an in_progress dependent whose earlier dependency wake failed", async () => {
+  it("wakes an in_progress dependent whose earlier dependency wake failed before stranded recovery runs", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({
         workspaceState: "none",
@@ -1210,15 +1210,42 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       invocationSource: "automation",
       triggerDetail: "system",
       errorCode: "claude_auth_required",
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "transient_failure",
+      resultJson: { conversationContinuation: "continue_conversation_v1" },
       contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_blockers_resolved" },
       createdAt: new Date("2026-10-07T04:02:12.000Z"),
+      startedAt: new Date("2026-10-07T04:02:12.000Z"),
       finishedAt: new Date("2026-10-07T04:02:30.000Z"),
     });
+    const heartbeat = heartbeatService(db);
 
-    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    // Server tick order: the dependency backstop runs before stranded-work
+    // recovery. In the other order, stranded recovery escalates the failed run,
+    // moves the dependent to blocked and drops its resolved blocker edge, so the
+    // backstop can no longer see the resolution.
+    const result = await heartbeat.reconcileResolvedDependencyWakes();
+    const stranded = await heartbeat.reconcileStrandedAssignedIssues();
 
     expect(result.healed).toBe(1);
     expect(result.issueIds).toEqual([blockedIssueId]);
+    expect(stranded.escalated).toBe(0);
+    const dependent = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(dependent?.status).toBe("in_progress");
+    expect(
+      await db
+        .select({ id: issueRelations.id })
+        .from(issueRelations)
+        .where(and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.issueId, blockerIssueId),
+          eq(issueRelations.relatedIssueId, blockedIssueId),
+        )),
+    ).toHaveLength(1);
     const wake = await db
       .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
       .from(agentWakeupRequests)
@@ -1282,6 +1309,73 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
 
     expect(result.checked).toBe(0);
     expect(result.healed).toBe(0);
+    expect(
+      await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)),
+    ).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      label: "an execution reconciliation hold",
+      kind: "execution_reconciliation",
+      cause: "uncertain_provider_action",
+    },
+    {
+      label: "a board-owned recovery action",
+      kind: "configuration_validation",
+      cause: "configuration_incomplete",
+    },
+  ])("leaves a todo dependent behind $label to the board across sweeps", async ({ kind, cause }) => {
+    const { companyId, blockedIssueId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      dependentStatus: "todo",
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind,
+      status: "active",
+      ownerType: "board",
+      cause,
+      fingerprint: `backstop-board-hold:${blockedIssueId}`,
+      evidence: {},
+      nextAction: "Reconcile the stopped work before continuing.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      const result = await heartbeat.reconcileResolvedDependencyWakes();
+      expect(result.healed).toBe(0);
+      expect(result.deferredOrFailed).toBe(0);
+      expect(result.livePathSkipped).toBe(1);
+    }
+    // No wake row at all: neither a run nor a coalesced execution-wait receipt
+    // that the sweep would keep touching on every tick.
+    expect(
+      await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)),
+    ).toHaveLength(0);
+  });
+
+  it.each(["paused", "archived"] as const)("does not enqueue a todo dependent wake while its company is %s", async (companyStatus) => {
+    const { companyId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      dependentStatus: "todo",
+    });
+    await db.update(companies).set({ status: companyStatus }).where(eq(companies.id, companyId));
+    const heartbeat = heartbeatService(db);
+
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      const result = await heartbeat.reconcileResolvedDependencyWakes();
+      expect(result.healed).toBe(0);
+      expect(result.deferredOrFailed).toBe(0);
+      expect(result.agentUnavailableSkipped).toBe(1);
+    }
     expect(
       await db
         .select({ id: agentWakeupRequests.id })

@@ -568,6 +568,39 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  it("wakes resolved dependents before stranded-work recovery at startup and on periodic recovery", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+      intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    const dependencyWakes = heartbeatServiceMock.reconcileResolvedDependencyWakes;
+    const strandedRecovery = heartbeatServiceMock.reconcileStrandedAssignedIssues;
+    try {
+      await startServer();
+      expect(dependencyWakes).toHaveBeenCalledTimes(1);
+      expect(strandedRecovery).toHaveBeenCalledTimes(1);
+      expect(dependencyWakes.mock.invocationCallOrder[0]).toBeLessThan(
+        strandedRecovery.mock.invocationCallOrder[0]!,
+      );
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2));
+      expect(dependencyWakes).toHaveBeenCalledTimes(2);
+      expect(strandedRecovery).toHaveBeenCalledTimes(2);
+      expect(dependencyWakes.mock.invocationCallOrder[1]).toBeLessThan(
+        strandedRecovery.mock.invocationCallOrder[1]!,
+      );
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("reconciles native replacements at startup and on the execution-control interval", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
     let executionControlTick: (() => void) | undefined;
