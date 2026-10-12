@@ -70,7 +70,7 @@ Fields:
 | `skip_if_active` | Incoming run is immediately finalised as `skipped` and linked to the active run — no new issue is created |
 | `always_enqueue` | Always create a new run regardless of active runs |
 
-A run stays active while its execution issue is open (anything other than `done` or `cancelled`), even when no heartbeat run is live — for example while the issue is blocked, in review, or parked by provider-quota recovery. Skipped runs carry `failureReason: "execution_issue_open"`.
+For `skip_if_active`, a run stays active while its execution issue is open (anything other than `done` or `cancelled`), even when no heartbeat run is live — for example while the issue is blocked, in review, or parked by provider-quota recovery. Skipped runs carry `failureReason: "execution_issue_open"`. `coalesce_if_active` only coalesces into an issue with a live heartbeat run; an open but idle issue gets a fresh execution issue.
 
 **Catch-up policies:**
 
