@@ -554,6 +554,7 @@ import {
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
+  DAILY_CAP_DEFERRAL_KEY,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
@@ -17131,6 +17132,200 @@ export function heartbeatService(
     return null;
   }
 
+  type HeartbeatDailyCapBlock = NonNullable<
+    Awaited<ReturnType<typeof getHeartbeatDailyCapBlock>>
+  >;
+
+  // Issue work is an obligation that outlives the cap window: a hand-off to a
+  // capped coordinator used to be dropped until someone noticed. Timer
+  // heartbeats, board run-now and failed-run retry clicks, chat receipts,
+  // chat conversations and closed issues keep the immediate skip.
+  function isDailyCapDeferrableWake(input: {
+    source: string | null;
+    reason: string | null;
+    idempotencyKey: string | null;
+    manualUserWake: boolean;
+    issue: {
+      status: string;
+      conversationAgentId: string | null;
+      conversationUserId: string | null;
+    } | null;
+  }) {
+    if (!input.issue || ["done", "cancelled"].includes(input.issue.status)) return false;
+    return input.source !== "timer" &&
+      !isConversation(input.issue) &&
+      input.reason !== "retry_failed_run" &&
+      !input.manualUserWake &&
+      !input.idempotencyKey?.startsWith("chat-");
+  }
+
+  function buildDailyCapDeferral(dailyCapBlock: HeartbeatDailyCapBlock, now: Date) {
+    return {
+      reason: dailyCapBlock.reason,
+      observed: dailyCapBlock.observed,
+      limit: dailyCapBlock.limit,
+      heldAt: now.toISOString(),
+    };
+  }
+
+  // A queued run that hits the cap at dispatch gives its wake back as a held
+  // wake (the same row, so its actor, receipt and queue position survive).
+  // Returns false when the wake is not issue work; the caller then skips it.
+  async function holdCappedRunWake(
+    run: typeof heartbeatRuns.$inferSelect,
+    dailyCapBlock: HeartbeatDailyCapBlock,
+    now: Date,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId) ?? run.nativeIssueId;
+    if (!issueId || !isUuidLike(issueId)) return false;
+    const [wake] = run.wakeupRequestId
+      ? await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+        ))
+      : [];
+    const wakePayload = parseObject(wake?.payload);
+    const issue = await getIssueExecutionContext(run.companyId, issueId);
+    if (!isDailyCapDeferrableWake({
+      source: run.invocationSource,
+      reason: readNonEmptyString(context.wakeReason) ?? wake?.reason ?? null,
+      idempotencyKey: wake?.idempotencyKey ?? null,
+      manualUserWake: wakePayload.manualUserWake === true,
+      issue,
+    })) return false;
+    const commentIds = [...new Set([
+      ...queuedCommentIdsFromRunContext(context),
+      ...(readNonEmptyString(context.wakeCommentId) ? [String(context.wakeCommentId)] : []),
+    ])];
+    const heldPayload = {
+      ...wakePayload,
+      issueId,
+      [DEFERRED_WAKE_CONTEXT_KEY]: context,
+      [DAILY_CAP_DEFERRAL_KEY]: buildDailyCapDeferral(dailyCapBlock, now),
+    };
+    const payload = commentIds.length
+      ? withQueuedCommentIdsInWakePayload(heldPayload, commentIds)
+      : heldPayload;
+    if (wake) {
+      const held = await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "deferred_issue_execution",
+          runId: null,
+          claimedAt: null,
+          finishedAt: null,
+          error: null,
+          payload,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.id, wake.id),
+          inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+        ))
+        .returning({ id: agentWakeupRequests.id });
+      return held.length > 0;
+    }
+    await db.insert(agentWakeupRequests).values({
+      companyId: run.companyId,
+      agentId: run.agentId,
+      source: run.invocationSource,
+      triggerDetail: run.triggerDetail,
+      reason: readNonEmptyString(context.wakeReason),
+      payload,
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+    });
+    return true;
+  }
+
+  // The only promoter of cap-held wakes: queue drains and the orphaned-queue
+  // sweep skip them. Each capped agent costs one count query per tick and no
+  // writes until its window rolls over at 00:00 UTC or its cap is raised.
+  // Then its oldest held wake re-enters ordinary admission, one per agent per
+  // tick, and every gate (and the cap itself) applies again.
+  async function admitDailyCapHeldWakes(cutoff: Date | null) {
+    const heldAgents = await db
+      .selectDistinct({ agentId: agentWakeupRequests.agentId })
+      .from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} -> 'dailyCapDeferral' is not null`,
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+      ))
+      .limit(50);
+    for (const { agentId } of heldAgents) {
+      const agent = await getAgent(agentId);
+      // A paused agent's held work waits for its resume, as a deferred queue does.
+      if (!agent || !(await getAgentInvokability(agent)).invokable) continue;
+      if (await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent))) continue;
+      const [wake] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload} -> 'dailyCapDeferral' is not null`,
+          cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+        ))
+        .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+        .limit(1);
+      if (!wake) continue;
+      await readmitDailyCapHeldWake(wake).catch((err) => {
+        logger.warn({ err, wakeupRequestId: wake.id, agentId }, "failed to admit a wake held by the daily cap");
+      });
+    }
+  }
+
+  async function readmitDailyCapHeldWake(wake: typeof agentWakeupRequests.$inferSelect) {
+    const payload = { ...parseObject(wake.payload) };
+    const contextSnapshot = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+    delete payload[DEFERRED_WAKE_CONTEXT_KEY];
+    delete payload[DAILY_CAP_DEFERRAL_KEY];
+    const issueId = readNonEmptyString(payload.issueId);
+    const [issue] = issueId && isUuidLike(issueId)
+      ? await db.select({ status: issues.status }).from(issues).where(and(
+          eq(issues.companyId, wake.companyId), eq(issues.id, issueId),
+        ))
+      : [];
+    const closed = !issue || ["done", "cancelled"].includes(issue.status);
+    const now = new Date();
+    // Retire the held receipt first. The re-admitted wake carries its
+    // idempotency key, which several partial unique indexes allow only once.
+    const [retired] = await db
+      .update(agentWakeupRequests)
+      .set(closed
+        ? { status: "cancelled", finishedAt: now, updatedAt: now,
+            error: "The issue closed while this wake was held by the daily cap" }
+        : { status: "coalesced", idempotencyKey: null, finishedAt: now, updatedAt: now })
+      .where(and(
+        eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.id, wake.id),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ))
+      .returning({ id: agentWakeupRequests.id });
+    if (!retired || closed) return;
+    const run = await enqueueWakeup(wake.agentId, {
+      source: wake.source as WakeupOptions["source"],
+      triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+      reason: wake.reason,
+      payload,
+      contextSnapshot,
+      requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+      requestedByActorId: wake.requestedByActorId,
+      idempotencyKey: wake.idempotencyKey,
+    });
+    if (run) {
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: run.id, updatedAt: new Date() })
+        .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, wake.id)));
+    }
+  }
+
   async function cancelQueuedRunForHeartbeatDailyCap(
     run: typeof heartbeatRuns.$inferSelect,
     dailyCapBlock: NonNullable<
@@ -17157,20 +17352,28 @@ export function heartbeatService(
     });
     if (!cancelled) return null;
 
-    await setWakeupStatus(run.wakeupRequestId, "skipped", {
-      finishedAt: now,
-      error: reason,
-    });
+    // The run never started, so cancelling it frees the issue lock for other
+    // agents. Its issue work is held for the next cap window, not dropped.
+    const wakeHeld = await holdCappedRunWake(cancelled, dailyCapBlock, now);
+    if (!wakeHeld) {
+      await setWakeupStatus(run.wakeupRequestId, "skipped", {
+        finishedAt: now,
+        error: reason,
+      });
+    }
 
     await appendRunEvent(cancelled, {
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: reason,
+      message: wakeHeld
+        ? `${reason}; the wake is held until the cap allows another run`
+        : reason,
       payload: {
         reason: dailyCapBlock.reason,
         observed: dailyCapBlock.observed,
         limit: dailyCapBlock.limit,
+        wakeHeld,
       },
     });
 
@@ -19855,6 +20058,8 @@ export function heartbeatService(
         notInArray(issues.status, ["done", "cancelled"]),
         recentlyAttempted.length ? notInArray(issues.id, recentlyAttempted) : undefined,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        // Cap-held wakes have their own admission sweep; a drain skips them.
+        sql`${agentWakeupRequests.payload}->'dailyCapDeferral' is null`,
         lte(agentWakeupRequests.requestedAt, new Date(now - ORPHANED_DEFERRED_WAKE_GRACE_MS)),
         gte(agentWakeupRequests.requestedAt, new Date(now - ORPHANED_DEFERRED_WAKE_MAX_AGE_MS)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
@@ -19913,6 +20118,7 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    await admitDailyCapHeldWakes(cutoff);
     // Runs before the stranded sweep below: that sweep advances the cursor of
     // every assignee comment queue it visits, even one it cannot anchor.
     await promoteOrphanedDeferredWakes(cutoff);
@@ -19933,6 +20139,7 @@ export function heartbeatService(
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        sql`${agentWakeupRequests.payload}->'dailyCapDeferral' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
@@ -28835,6 +29042,73 @@ export function heartbeatService(
               continuationWait = { reason: dailyCapBlock.reason,
                 message: "The agent has reached its daily limit. Your message is saved until work can resume." };
               return deferBlockedExecution(executionBlocker);
+            }
+            if (
+              !durableRequest &&
+              !executionWaitRequestId &&
+              !opts.failedRunId &&
+              isDailyCapDeferrableWake({
+                source,
+                reason,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                manualUserWake: Boolean(opts.manualUserWake),
+                issue,
+              })
+            ) {
+              // Hold the issue work for the next cap window. A repeated signal
+              // for the same task (the same receipt key, or another replaceable
+              // automatic wake) folds into the one held row instead of adding
+              // a row on every sweep.
+              const [held] = opts.idempotencyKey || coalesceExecutionWait
+                ? await tx
+                    .select({ id: agentWakeupRequests.id })
+                    .from(agentWakeupRequests)
+                    .where(and(
+                      eq(agentWakeupRequests.companyId, agent.companyId),
+                      eq(agentWakeupRequests.agentId, agentId),
+                      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                      sql`${agentWakeupRequests.payload} -> 'dailyCapDeferral' is not null`,
+                      opts.idempotencyKey
+                        ? eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey)
+                        : and(
+                            isNull(agentWakeupRequests.idempotencyKey),
+                            eq(agentWakeupRequests.requestedByActorType, "system"),
+                          ),
+                    ))
+                    .limit(1)
+                : [];
+              if (held) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                    updatedAt: new Date(),
+                  })
+                  .where(eq(agentWakeupRequests.id, held.id));
+                return { kind: "deferred" as const };
+              }
+              await tx.insert(agentWakeupRequests).values({
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason,
+                payload: withQueuedCommentIdsInWakePayload({
+                  ...payload,
+                  issueId: issue.id,
+                  [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                  [DAILY_CAP_DEFERRAL_KEY]: buildDailyCapDeferral(dailyCapBlock, new Date()),
+                }, [...new Set([
+                  ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
+                  ...(wakeCommentId ? [wakeCommentId] : []),
+                ])]),
+                status: "deferred_issue_execution",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+              });
+              return { kind: "deferred" as const };
             }
             const now = new Date();
             await tx.insert(agentWakeupRequests).values({
