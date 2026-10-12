@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { accountingForScheduledRetry, executionFailureRetryCount, executionRetryAttemptCount } from "./execution-recovery-attempt.js";
 
 describe("failure attempts across resource waits", () => {
   it("preserves prior failures through subscription waits without trusting unrelated context", () => {
@@ -23,6 +23,22 @@ describe("failure attempts across resource waits", () => {
   it("keeps ambiguous historical counts without treating a historical productive count as failures", () => {
     expect(executionFailureRetryCount({ scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 4 })).toBe(4);
     expect(executionFailureRetryCount({ scheduledRetryReason: "max_turns_continuation", scheduledRetryAttempt: 4 })).toBe(0);
+  });
+});
+
+describe("provider-quota recovery lane", () => {
+  it("counts its own attempts and never spends or resets the failure budget", () => {
+    // The prod source shape: both transient retries already spent on the limit.
+    const spent = { scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2 };
+    expect(executionRetryAttemptCount(spent, "provider_quota_recovery")).toBe(0);
+    const accounting = accountingForScheduledRetry(spent, "provider_quota_recovery", 1);
+    expect(accounting).toEqual({ version: 1, failureRetries: 2, maxTurnContinuations: 0 });
+
+    const replacement = { scheduledRetryReason: "provider_quota_recovery", scheduledRetryAttempt: 7,
+      contextSnapshot: { executionRetryAccounting: accounting } };
+    expect(executionRetryAttemptCount(replacement, "provider_quota_recovery")).toBe(7);
+    expect(executionFailureRetryCount(replacement)).toBe(2);
+    expect(executionRetryAttemptCount(replacement, "transient_failure")).toBe(2);
   });
 });
 

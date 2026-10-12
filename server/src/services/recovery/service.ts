@@ -64,6 +64,14 @@ import {
   workAssessments,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
+import {
+  PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE,
+  providerQuotaExhaustedComment,
+  providerQuotaExhaustionReason,
+  providerQuotaRecoveryBackoffMs,
+  providerQuotaRecoveryExhaustion,
+  readProviderQuotaRecoveryProgress,
+} from "./provider-quota-recovery.js";
 import { runningProcesses } from "../../adapters/index.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -232,6 +240,7 @@ type LatestIssueRun =
       | "createdAt"
     > & {
       resultJson?: unknown;
+      finishedAt?: Date | null;
     })
   | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & {
@@ -251,6 +260,7 @@ export type StrandedRecoveryCause =
   | "provider_transport_failed"
   | "provider_frame_too_large"
   | "execution_review_participant_recovery"
+  | typeof PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 const NATIVE_RUNNER_RECOVERY_CAUSES = new Set<StrandedRecoveryCause>([
@@ -309,6 +319,8 @@ function recoveryCauseTitle(cause: StrandedRecoveryCause) {
       return "reviewer recovery failed";
     case "provider_quota":
       return "provider quota unavailable";
+    case PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE:
+      return "provider quota wait exhausted";
     case SUCCESSFUL_RUN_MISSING_STATE_REASON:
       return "missing disposition recovery failed";
     default:
@@ -538,15 +550,83 @@ export type AdapterFailureRecoveryClassification =
   | { kind: "configuration_incomplete" }
   | null;
 
-function parseProviderQuotaClockReset(error: string, now: Date) {
-  const match = error.match(
-    /(?:try again at|resets?(?:\s+at)?)\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i,
-  );
-  if (!match) return null;
+const PROVIDER_QUOTA_RESET_MONTHS = [
+  "jan", "feb", "mar", "apr", "may", "jun",
+  "jul", "aug", "sep", "oct", "nov", "dec",
+];
+// Reset clocks as providers print them, with or without a date and timezone:
+// "resets 4pm (UTC)", "resets at 16:00", "Try again at 4:30 PM
+// (America/Chicago)", "resets Oct 15, 6am (UTC)", "resets Thu, Oct 15 at 6am".
+const PROVIDER_QUOTA_RESET_CLOCK_RE =
+  /(?:try again (?:at|on)|resets?(?:\s+(?:at|on))?)\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?(?:(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i;
+// Relative resets: "resets in 3 hours", "try again in 2h 30m".
+const PROVIDER_QUOTA_RESET_RELATIVE_RE =
+  /(?:try again|resets?)\s+in\s+(?:(\d+)\s*d(?:ays?)?,?\s*)?(?:(\d+)\s*h(?:ours?|rs?)?,?\s*)?(?:(\d+)\s*m(?:in(?:ute)?s?)?\b)?/i;
+const PROVIDER_QUOTA_RESET_DAY_MS = 24 * 60 * 60 * 1000;
 
-  const hourValue = Number.parseInt(match[1] ?? "", 10);
-  const minute = Number.parseInt(match[2] ?? "0", 10);
-  const meridiem = (match[3] ?? "").toLowerCase();
+function wallClockFields(date: Date, timeZone: string) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+      .formatToParts(date)
+      .map((part) => [part.type, part.value]),
+  );
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+  };
+}
+
+// The instant at which `timeZone` shows this wall-clock time.
+function wallClockInstant(
+  wall: { year: number; month: number; day: number; hour: number; minute: number },
+  timeZone: string,
+) {
+  const targetMs = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute);
+  let candidate = new Date(targetMs);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const actual = wallClockFields(candidate, timeZone);
+    const adjustment =
+      targetMs -
+      Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+    if (adjustment === 0) break;
+    candidate = new Date(candidate.getTime() + adjustment);
+  }
+  return candidate;
+}
+
+/**
+ * The provider's reset instant, resolved against `reference`: the time the
+ * limit message was written. A clock without a date is its next occurrence
+ * after the reference. A dated clock without a year falls in the reference's
+ * year, or the next one when that is more than a day before the reference.
+ * Clocks without a timezone are UTC.
+ */
+export function parseProviderQuotaReset(error: string, reference: Date) {
+  const match = error.match(PROVIDER_QUOTA_RESET_CLOCK_RE);
+  if (!match) {
+    const relative = error.match(PROVIDER_QUOTA_RESET_RELATIVE_RE);
+    if (!relative || !(relative[1] || relative[2] || relative[3])) return null;
+    const minutes =
+      Number.parseInt(relative[1] ?? "0", 10) * 24 * 60 +
+      Number.parseInt(relative[2] ?? "0", 10) * 60 +
+      Number.parseInt(relative[3] ?? "0", 10);
+    return new Date(reference.getTime() + minutes * 60 * 1000);
+  }
+
+  const hourValue = Number.parseInt(match[3] ?? "", 10);
+  const minute = Number.parseInt(match[4] ?? "0", 10);
+  const meridiem = (match[5] ?? "").toLowerCase();
   if (!Number.isInteger(hourValue)) return null;
   if (
     meridiem ? hourValue < 1 || hourValue > 12 : hourValue < 0 || hourValue > 23
@@ -556,60 +636,31 @@ function parseProviderQuotaClockReset(error: string, now: Date) {
 
   let hour = meridiem ? hourValue % 12 : hourValue;
   if (meridiem === "p") hour += 12;
-  const timeZone = (match[4] ?? match[5])?.trim();
-  if (!timeZone) {
-    const retryAt = new Date(now);
-    retryAt.setUTCHours(hour, minute, 0, 0);
-    if (retryAt.getTime() <= now.getTime())
-      retryAt.setUTCDate(retryAt.getUTCDate() + 1);
-    return retryAt;
-  }
+  const timeZone = (match[6] ?? match[7])?.trim() || "UTC";
 
   try {
-    const wallClock = (date: Date) =>
-      Object.fromEntries(
-        new Intl.DateTimeFormat("en-US", {
-          timeZone,
-          hourCycle: "h23",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-          hour: "2-digit",
-          minute: "2-digit",
-        })
-          .formatToParts(date)
-          .map((part) => [part.type, part.value]),
+    const { year, month, day } = wallClockFields(reference, timeZone);
+    if (match[1]) {
+      const resetMonth =
+        PROVIDER_QUOTA_RESET_MONTHS.indexOf(match[1].slice(0, 3).toLowerCase()) + 1;
+      const resetDay = Number.parseInt(match[2] ?? "", 10);
+      if (resetMonth < 1 || !Number.isInteger(resetDay) || resetDay < 1 || resetDay > 31)
+        return null;
+      const sameYear = wallClockInstant(
+        { year, month: resetMonth, day: resetDay, hour, minute },
+        timeZone,
       );
-    const nowParts = wallClock(now);
-    const buildRetryAt = (dayOffset: number) => {
-      const targetDay = new Date(
-        Date.UTC(
-          Number(nowParts.year),
-          Number(nowParts.month) - 1,
-          Number(nowParts.day) + dayOffset,
-          hour,
-          minute,
-        ),
-      );
-      let candidate = targetDay;
-      const targetMs = targetDay.getTime();
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        const actual = wallClock(candidate);
-        const actualMs = Date.UTC(
-          Number(actual.year),
-          Number(actual.month) - 1,
-          Number(actual.day),
-          Number(actual.hour),
-          Number(actual.minute),
-        );
-        const adjustment = targetMs - actualMs;
-        if (adjustment === 0) break;
-        candidate = new Date(candidate.getTime() + adjustment);
-      }
-      return candidate;
-    };
-    const sameDay = buildRetryAt(0);
-    return sameDay.getTime() > now.getTime() ? sameDay : buildRetryAt(1);
+      return sameYear.getTime() >= reference.getTime() - PROVIDER_QUOTA_RESET_DAY_MS
+        ? sameYear
+        : wallClockInstant(
+            { year: year + 1, month: resetMonth, day: resetDay, hour, minute },
+            timeZone,
+          );
+    }
+    const sameDay = wallClockInstant({ year, month, day, hour, minute }, timeZone);
+    return sameDay.getTime() > reference.getTime()
+      ? sameDay
+      : wallClockInstant({ year, month, day: day + 1, hour, minute }, timeZone);
   } catch {
     return null;
   }
@@ -619,7 +670,11 @@ export function classifyAdapterFailureForRecovery(
   latestRun: Pick<
     NonNullable<LatestIssueRun>,
     "error" | "errorCode" | "resultJson"
-  >,
+  > & {
+    finishedAt?: Date | null;
+    startedAt?: Date | null;
+    createdAt?: Date | null;
+  },
   now = new Date(),
 ): AdapterFailureRecoveryClassification {
   // An engine prerequisite cannot be repaired by asking the same unavailable
@@ -671,11 +726,16 @@ export function classifyAdapterFailureForRecovery(
     };
   }
 
-  const parsedClockReset = parseProviderQuotaClockReset(error, now);
-  if (parsedClockReset) {
+  // The limit text was written when the run failed, so its clock resolves
+  // against that time; a reset that has already passed is due now.
+  const parsedReset = parseProviderQuotaReset(
+    error,
+    latestRun.finishedAt ?? latestRun.startedAt ?? latestRun.createdAt ?? now,
+  );
+  if (parsedReset) {
     return {
       kind: "provider_quota",
-      retryAt: parsedClockReset,
+      retryAt: parsedReset.getTime() > now.getTime() ? parsedReset : now,
       parsedResetTime: true,
     };
   }
@@ -960,6 +1020,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
@@ -990,6 +1051,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
@@ -1821,6 +1883,7 @@ export function recoveryService(
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
+        finishedAt: heartbeatRuns.finishedAt,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
@@ -2531,6 +2594,8 @@ export function recoveryService(
             ? "Board operator: inspect the retry history, then explicitly retry the original owner, reassign, or intentionally resolve the task."
             : recoveryCause === "provider_quota"
               ? "Wait for provider quota recovery, then retry the original assignee; do not wake a takeover owner."
+              : recoveryCause === PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE
+              ? "Board operator: the AI provider usage limit did not clear within the automatic wait. Check the account's limit or move the agent to an available account, then explicitly retry the original owner, reassign, or intentionally resolve the task."
               : recoveryCause === "codex_output_inactivity_monitor"
                 ? "Board operator: inspect the inactivity evidence, then explicitly retry the original owner, reassign, or intentionally resolve the task."
                 : recoveryCause === "workspace_validation_failed"
@@ -4204,6 +4269,72 @@ export function recoveryService(
     };
   }
 
+  // One provider-quota wait is bounded (provider-quota-recovery.ts). Within
+  // the bounds the issue is parked on the quota monitor: at the reported reset
+  // time, or after a growing backoff when the provider reported none. Past
+  // them, the board gets the issue as blocked with an Inbox recovery action.
+  async function parkOrEscalateProviderQuotaWait(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: NonNullable<LatestIssueRun>;
+    classification: Extract<
+      NonNullable<AdapterFailureRecoveryClassification>,
+      { kind: "provider_quota" }
+    >;
+    now: Date;
+  }): Promise<{
+    outcome: "monitored" | "escalated" | "skipped";
+    latestRun: NonNullable<LatestIssueRun>;
+  }> {
+    const progress = readProviderQuotaRecoveryProgress(
+      input.latestRun,
+      input.now,
+    );
+    const exhaustion = providerQuotaRecoveryExhaustion(progress, input.now);
+    if (exhaustion) {
+      const updated = await escalateStrandedAssignedIssue({
+        issue: input.issue,
+        previousStatus: input.issue.status as StrandedPreviousStatus,
+        latestRun: input.latestRun,
+        recoveryCause: PROVIDER_QUOTA_EXHAUSTED_RECOVERY_CAUSE,
+        comment: providerQuotaExhaustedComment({
+          reason: providerQuotaExhaustionReason(exhaustion),
+          progress,
+        }),
+      });
+      return {
+        outcome: updated ? "escalated" : "skipped",
+        latestRun: input.latestRun,
+      };
+    }
+
+    const retryAt = input.classification.parsedResetTime
+      ? input.classification.retryAt
+      : new Date(
+          input.now.getTime() + providerQuotaRecoveryBackoffMs(progress.attempts),
+        );
+    const classification = {
+      ...input.classification,
+      retryAt:
+        retryAt.getTime() > progress.deadline.getTime()
+          ? progress.deadline
+          : retryAt,
+    };
+    const monitored = await scheduleProviderQuotaRecoveryMonitor({
+      issue: input.issue,
+      latestRun: input.latestRun,
+      classification,
+      timeoutAt: progress.deadline,
+    });
+    if (!monitored) return { outcome: "skipped", latestRun: input.latestRun };
+    return {
+      outcome: "monitored",
+      latestRun: await persistAdapterFailureRecoveryClassification(
+        input.latestRun,
+        classification,
+      ),
+    };
+  }
+
   async function scheduleProviderQuotaRecoveryMonitor(input: {
     issue: typeof issues.$inferSelect;
     latestRun: NonNullable<LatestIssueRun>;
@@ -4211,6 +4342,7 @@ export function recoveryService(
       NonNullable<AdapterFailureRecoveryClassification>,
       { kind: "provider_quota" }
     >;
+    timeoutAt: Date;
   }) {
     if (
       input.issue.status !== "in_progress" &&
@@ -4244,9 +4376,12 @@ export function recoveryService(
         kind: "external_service" as const,
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
-        timeoutAt: null,
+        // The wait's deadline bounds the monitor. Its attempt bound lives on
+        // the replacement runs: issues.monitor_attempt_count is lifetime and
+        // never resets, so a monitor maxAttempts would count unrelated waits.
+        timeoutAt: input.timeoutAt.toISOString(),
         maxAttempts: null,
-        recoveryPolicy: "wake_owner" as const,
+        recoveryPolicy: "escalate_to_board" as const,
       },
     };
     const transition = applyIssueMonitorPolicyTransition({
@@ -4302,17 +4437,14 @@ export function recoveryService(
     return participant?.type === "agent" ? participant.agentId : null;
   }
 
+  // A quota monitor armed for the latest failed run stays pending until the
+  // heartbeat fires it, also once it is due: a reset that has already passed
+  // is armed for "now", and re-arming it here would only churn the schedule.
   function hasPendingProviderQuotaRecoveryMonitor(
     issue: typeof issues.$inferSelect,
     latestRun: LatestIssueRun,
-    now: Date,
   ) {
-    if (
-      !latestRun ||
-      !issue.monitorNextCheckAt ||
-      issue.monitorNextCheckAt.getTime() <= now.getTime()
-    )
-      return false;
+    if (!latestRun || !issue.monitorNextCheckAt) return false;
     const monitor = parseObject(parseObject(issue.executionPolicy).monitor);
     return (
       readNonEmptyString(monitor.serviceName) ===
@@ -4685,11 +4817,7 @@ export function recoveryService(
           ? participantLatestRunForRecovery
           : latestRun;
       if (
-        hasPendingProviderQuotaRecoveryMonitor(
-          issue,
-          providerQuotaMonitorRun,
-          recoveryNow,
-        )
+        hasPendingProviderQuotaRecoveryMonitor(issue, providerQuotaMonitorRun)
       ) {
         result.skipped += 1;
         continue;
@@ -4726,21 +4854,22 @@ export function recoveryService(
         }
 
         if (adapterFailureClassification.kind === "provider_quota") {
-          const monitored = await scheduleProviderQuotaRecoveryMonitor({
+          const parked = await parkOrEscalateProviderQuotaWait({
             issue,
             latestRun,
             classification: adapterFailureClassification,
+            now: recoveryNow,
           });
-          if (monitored) {
-            latestRun = await persistAdapterFailureRecoveryClassification(
-              latestRun,
-              adapterFailureClassification,
-            );
+          latestRun = parked.latestRun;
+          if (parked.outcome === "monitored") {
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
-            continue;
+          } else if (parked.outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
           }
-          result.skipped += 1;
           continue;
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4950,17 +5079,18 @@ export function recoveryService(
         if (
           participantAdapterFailureClassification?.kind === "provider_quota"
         ) {
-          const monitored = await scheduleProviderQuotaRecoveryMonitor({
+          const parked = await parkOrEscalateProviderQuotaWait({
             issue,
             latestRun: participantLatestRun,
             classification: participantAdapterFailureClassification,
+            now: recoveryNow,
           });
-          if (monitored) {
-            latestRun = await persistAdapterFailureRecoveryClassification(
-              participantLatestRun,
-              participantAdapterFailureClassification,
-            );
+          if (parked.outcome !== "skipped") latestRun = parked.latestRun;
+          if (parked.outcome === "monitored") {
             result.providerQuotaMonitored += 1;
+            result.issueIds.push(issue.id);
+          } else if (parked.outcome === "escalated") {
+            result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
             result.skipped += 1;

@@ -485,6 +485,37 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(extracted?.toISOString()).toBe("2026-04-23T03:15:00.000Z");
   });
 
+  it("parses the dated weekly-limit reset recorded on prod runs", () => {
+    const now = new Date("2026-10-11T04:07:50.025Z");
+    for (const errorMessage of [
+      "You've hit your weekly limit · resets Oct 15, 6am (UTC)",
+      "Compacting...\n\nCompacting failed: You've hit your weekly limit · resets Oct 15, 6am (UTC)",
+    ]) {
+      expect(isClaudeProviderQuotaError({ errorMessage })).toBe(true);
+      expect(extractClaudeRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
+        "2026-10-15T06:00:00.000Z",
+      );
+    }
+  });
+
+  it.each([
+    ["You've hit your weekly limit · resets Oct 15 at 6am (UTC)", "2026-10-15T06:00:00.000Z"],
+    ["You've hit your weekly limit · resets Thu, Oct 15, 6:30pm (America/Chicago)", "2026-10-15T23:30:00.000Z"],
+    ["Weekly limit reached · resets October 15th, 6am (UTC)", "2026-10-15T06:00:00.000Z"],
+    ["You've hit your session limit · resets in 3 hours", "2026-10-11T07:07:50.025Z"],
+    ["You've hit your session limit · resets in 2h 30m", "2026-10-11T06:37:50.025Z"],
+  ])("parses the reset form %s", (errorMessage, expected) => {
+    const now = new Date("2026-10-11T04:07:50.025Z");
+    expect(extractClaudeRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(expected);
+  });
+
+  it("rolls a dated reset into the next year only when the date is far behind", () => {
+    const errorMessage = "You've hit your weekly limit · resets Jan 2, 6am (UTC)";
+    expect(
+      extractClaudeRetryNotBefore({ errorMessage }, new Date("2026-12-30T22:00:00.000Z"))?.toISOString(),
+    ).toBe("2027-01-02T06:00:00.000Z");
+  });
+
   it("returns null when no reset hint is present", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),

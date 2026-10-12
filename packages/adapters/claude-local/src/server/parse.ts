@@ -467,9 +467,61 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const CLAUDE_RESET_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+// "Oct 15, 6am", "Thu, Oct 15 at 6:30pm": a weekly limit names the reset day.
+const CLAUDE_RESET_DATED_CLOCK_RE =
+  /^(?:on\s+)?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?(.+)$/i;
+// "in 3 hours", "in 2h 30m".
+const CLAUDE_RESET_RELATIVE_RE =
+  /^in\s+(?:(\d+)\s*d(?:ays?)?,?\s*)?(?:(\d+)\s*h(?:ours?|rs?)?,?\s*)?(?:(\d+)\s*m(?:in(?:ute)?s?)?\b)?/i;
+const CLAUDE_RESET_DAY_MS = 24 * 60 * 60 * 1000;
+
+// A dated reset has no year. It falls in the current year, or the next one
+// when that date is more than a day behind (a late-December message naming
+// early January). Without a timezone the clock is server-local, like the
+// undated form.
+function nextDatedResetTime(input: {
+  now: Date;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  timeZoneHint?: string | null;
+}): Date | null {
+  const timeZone = normalizeResetTimeZone(input.timeZoneHint);
+  const build = (year: number) => {
+    if (timeZone) {
+      return dateFromTimeZoneWallClock({
+        year,
+        month: input.month,
+        day: input.day,
+        hour: input.hour,
+        minute: input.minute,
+        timeZone,
+      });
+    }
+    const local = new Date(year, input.month - 1, input.day, input.hour, input.minute, 0, 0);
+    return local.getMonth() === input.month - 1 && local.getDate() === input.day ? local : null;
+  };
+  const currentYear = timeZone ? readTimeZoneParts(input.now, timeZone).year : input.now.getFullYear();
+  const sameYear = build(currentYear);
+  if (!sameYear) return null;
+  return sameYear.getTime() >= input.now.getTime() - CLAUDE_RESET_DAY_MS ? sameYear : build(currentYear + 1);
+}
+
 function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
   const normalized = clockText.trim().replace(/\s+/g, " ");
-  const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
+  const relative = normalized.match(CLAUDE_RESET_RELATIVE_RE);
+  if (relative && (relative[1] || relative[2] || relative[3])) {
+    const minutes =
+      Number.parseInt(relative[1] ?? "0", 10) * 24 * 60 +
+      Number.parseInt(relative[2] ?? "0", 10) * 60 +
+      Number.parseInt(relative[3] ?? "0", 10);
+    return new Date(now.getTime() + minutes * 60 * 1000);
+  }
+
+  const dated = normalized.match(CLAUDE_RESET_DATED_CLOCK_RE);
+  const match = (dated ? dated[3] ?? "" : normalized).match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
   if (!match) return null;
 
   const hour12 = Number.parseInt(match[1] ?? "", 10);
@@ -479,6 +531,13 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
 
   let hour24 = hour12 % 12;
   if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
+
+  if (dated) {
+    const month = CLAUDE_RESET_MONTHS.indexOf((dated[1] ?? "").slice(0, 3).toLowerCase()) + 1;
+    const day = Number.parseInt(dated[2] ?? "", 10);
+    if (month < 1 || !Number.isInteger(day) || day < 1 || day > 31) return null;
+    return nextDatedResetTime({ now, month, day, hour: hour24, minute, timeZoneHint });
+  }
 
   if (timeZoneHint) {
     const explicitRetryAt = nextClockTimeInTimeZone({

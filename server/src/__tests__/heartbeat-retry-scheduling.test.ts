@@ -28,6 +28,7 @@ import {
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { recoveryService } from "../services/recovery/service.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentTaskRun = vi.hoisted(() => vi.fn());
@@ -386,6 +387,93 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("hands an assigned issue's provider-quota failure to the quota monitor instead of transient retries", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({
+      runId, companyId, agentId, now,
+      errorCode: "provider_quota", errorFamily: "provider_quota", retryNotBefore: "2026-04-20T16:00:00.000Z",
+    });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Quota fixture", status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "issue_assigned" } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    expect(await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 }))
+      .toMatchObject({ outcome: "not_scheduled", errorCode: "provider_quota_wait", issueId });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+
+    // No issue waits on this agent, so there is no monitor to hand over to:
+    // the existing reset-time retry still applies.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    expect(scheduled).toMatchObject({ outcome: "scheduled", run: { scheduledRetryReason: "transient_failure" } });
+    if (scheduled.outcome !== "scheduled") throw new Error("Expected a transient retry");
+    expect(scheduled.run?.scheduledRetryAt?.toISOString()).toBe("2026-04-20T16:00:00.000Z");
+  });
+
+  it("finalizes an assigned issue's provider-quota run without retries and parks it on the bounded quota monitor", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Quota Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Quota-limited task", status: "in_progress", assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, source: "issue.update" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(run).not.toBeNull();
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+    await expect.poll(
+      () => db.select({ message: heartbeatRunEvents.message }).from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, run!.id))
+        .then((rows) => rows.some((row) => row.message?.includes("no transient retry was queued"))),
+      { timeout: 5_000, interval: 50 },
+    ).toBe(true);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    // No transient retry and no immediate replacement on the exhausted account.
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .toHaveLength(1);
+    const [agent] = await db.select({ status: agents.status }).from(agents).where(eq(agents.id, agentId));
+    expect(agent?.status).toBe("idle");
+
+    const sweep = await recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).reconcileStrandedAssignedIssues();
+    expect(sweep.providerQuotaMonitored).toBe(1);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
+    // The adapter reports a reset in 2030, past the 8-day bound of one quota
+    // wait, so the monitor fires at the wait's deadline and goes to the board.
+    const deadline = new Date(failedRun!.createdAt.getTime() + 8 * 24 * 60 * 60 * 1000).toISOString();
+    expect(issue?.monitorNextCheckAt?.toISOString()).toBe(deadline);
+    expect(issue?.executionPolicy).toMatchObject({
+      monitor: { serviceName: "AI provider quota", externalRef: run!.id, timeoutAt: deadline },
+    });
   });
 
   async function seedMaxTurnFixture(input?: {
