@@ -31,6 +31,11 @@ export const PROVIDER_QUOTA_RECOVERY_BACKOFF_MS = [
   6 * HOUR_MS,
 ] as const;
 
+// A replacement run that still hits the limit after the reported reset time
+// (late or skewed reset) reports a reset that has already passed. Waiting at
+// least this long keeps such a wait from re-running every recovery sweep.
+export const PROVIDER_QUOTA_RECOVERY_PASSED_RESET_FLOOR_MS = 10 * 60 * 1000;
+
 export function providerQuotaRecoveryBackoffMs(completedAttempts: number) {
   const index = Math.min(
     Math.max(0, Math.floor(completedAttempts)),
