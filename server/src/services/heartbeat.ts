@@ -17239,9 +17239,14 @@ export function heartbeatService(
       const conditions = [
         eq(heartbeatRuns.companyId, agent.companyId),
         eq(heartbeatRuns.agentId, agent.id),
+        // A run cancelled before it started has no startedAt and never counts.
         gte(heartbeatRuns.startedAt, start),
         lt(heartbeatRuns.startedAt, end),
         notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        // A provider usage limit is the account's state, not agent work. With
+        // its bounded retries, each hit used to spend three runs of the cap.
+        sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'provider_quota'`,
+        sql`coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '') <> 'provider_quota'`,
       ];
       if (options.excludeRunId) {
         conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
