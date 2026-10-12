@@ -303,9 +303,9 @@ function isSubHourlyCronExpression(expression: string, timeZone: string, after: 
 
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
-  if (status === "coalesced") return "Coalesced into an existing live execution issue";
+  if (status === "coalesced") return "Coalesced into an existing open execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
-  if (status === "skipped") return "Skipped because a live execution issue already exists";
+  if (status === "skipped") return "Skipped because an open execution issue already exists";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
   return status;
@@ -1581,6 +1581,38 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  // Dispatch treats an execution issue as active until it is done or cancelled, not only while a
+  // run is live. Quota recovery parks issues with no live run, and blocked or in-review issues
+  // wait on someone else; counting only live runs let every tick stack a duplicate issue behind
+  // them. The live issue still wins so coalescing links to the run doing the work.
+  async function findOpenExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db = db,
+    dispatchFingerprint?: string | null,
+    origin?: { kind: string; id: string | null },
+  ) {
+    const liveIssue = await findLiveExecutionIssue(routine, executor, dispatchFingerprint, origin);
+    if (liveIssue) return liveIssue;
+
+    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, origin?.kind ?? "routine_execution"),
+          eq(issues.originId, origin?.id ?? routine.id),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1882,7 +1914,7 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeIssue = await findOpenExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
@@ -1898,6 +1930,7 @@ export function routineService(
           }
           const updated = await finalizeRun(createdRun.id, {
             status,
+            failureReason: status === "skipped" ? "execution_issue_open" : null,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
             completedAt: triggeredAt,
@@ -1949,7 +1982,7 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingIssue = await findOpenExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
@@ -1965,6 +1998,7 @@ export function routineService(
           }
           const updated = await finalizeRun(createdRun.id, {
             status,
+            failureReason: status === "skipped" ? "execution_issue_open" : null,
             linkedIssueId: existingIssue.id,
             coalescedIntoRunId: existingIssue.originRunId,
             completedAt: triggeredAt,

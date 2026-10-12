@@ -62,6 +62,9 @@ describe("runRowSubtitle", () => {
     expect(
       runRowSubtitle({ status: "skipped", failureReason: "paused", triggerPayload: null }, variables),
     ).toBe("Skipped — routine paused");
+    expect(
+      runRowSubtitle({ status: "skipped", failureReason: "execution_issue_open", triggerPayload: null }, variables),
+    ).toBe("Skipped — previous issue still open");
   });
 
   it("falls back to variable values for a skip with no known reason", () => {

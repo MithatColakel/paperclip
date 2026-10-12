@@ -36,6 +36,7 @@ export function dedupedTriggerLabel(
  * turn it into a one-line "why" for the runs list.
  */
 const SKIP_REASON_LABELS: Record<string, string> = {
+  execution_issue_open: "Skipped — previous issue still open",
   no_external_activity: "Skipped — no activity since last run",
   paused: "Skipped — routine paused",
   worktree_execution_cutoff: "Skipped — worktree execution cutoff",

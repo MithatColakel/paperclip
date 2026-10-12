@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -734,8 +734,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(svc.evaluateActivityGate(projectRoutine, now)).resolves.toMatchObject({ fire: true });
   });
 
-  it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
+  it("coalesces into the previous routine issue while it is open but idle", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
@@ -761,24 +761,19 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       completedAt: new Date("2026-03-20T12:00:00.000Z"),
     });
 
-    const detailBefore = await svc.getDetail(routine.id);
-    expect(detailBefore?.activeIssue).toBeNull();
-
     const run = await svc.runRoutine(routine.id, { source: "manual" });
-    expect(run.status).toBe("issue_created");
-    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    expect(run.coalescedIntoRunId).toBe(previousRunId);
+    expect(run.failureReason).toBeNull();
+    expect(wakeups).toHaveLength(0);
 
     const routineIssues = await db
-      .select({
-        id: issues.id,
-        originRunId: issues.originRunId,
-      })
+      .select({ id: issues.id })
       .from(issues)
       .where(eq(issues.originId, routine.id));
 
-    expect(routineIssues).toHaveLength(2);
-    expect(routineIssues.map((issue) => issue.id)).toContain(previousIssue.id);
-    expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
+    expect(routineIssues).toEqual([{ id: previousIssue.id }]);
   });
 
   it("creates draft routines without a project or default assignee", async () => {
@@ -1612,6 +1607,128 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       includeRoutineExecutions: true,
     });
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
+  });
+
+  it("skips scheduled ticks while the previous execution issue is parked without a live run", async () => {
+    const { companyId, routine, svc, wakeups } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" },
+      {},
+    );
+    const tick = async () => {
+      await db
+        .update(routineTriggers)
+        .set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
+        .where(eq(routineTriggers.id, trigger.id));
+      await svc.tickScheduledTriggers(new Date());
+      return db
+        .select()
+        .from(routineRuns)
+        .where(eq(routineRuns.routineId, routine.id))
+        .orderBy(desc(routineRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0]!);
+    };
+    const routineIssueIds = async () =>
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.originId, routine.id)))
+        .then((rows) => rows.map((row) => row.id).sort());
+
+    const firstRun = await tick();
+    expect(firstRun.status).toBe("issue_created");
+    const parkedIssueId = firstRun.linkedIssueId!;
+    expect(wakeups).toHaveLength(1);
+
+    // Provider-quota recovery parks the issue: its run failed and nothing is queued.
+    const parkedIssue = await db.select().from(issues).where(eq(issues.id, parkedIssueId)).then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, parkedIssue.executionRunId!));
+    await db
+      .update(issues)
+      .set({ status: "in_progress", executionRunId: null, executionLockedAt: null })
+      .where(eq(issues.id, parkedIssueId));
+
+    const skippedRun = await tick();
+    expect(skippedRun).toMatchObject({
+      source: "schedule",
+      status: "skipped",
+      failureReason: "execution_issue_open",
+      linkedIssueId: parkedIssueId,
+      coalescedIntoRunId: firstRun.id,
+    });
+    expect(skippedRun.completedAt).not.toBeNull();
+    expect(await routineIssueIds()).toEqual([parkedIssueId]);
+    expect(wakeups).toHaveLength(1);
+    const triggerAfterSkip = await db
+      .select()
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id))
+      .then((rows) => rows[0]!);
+    expect(triggerAfterSkip.lastResult).toBe("Skipped because an open execution issue already exists");
+    const skipActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.action, "routine.run_triggered"), eq(activityLog.entityId, skippedRun.id)));
+    expect(skipActivity).toEqual([
+      expect.objectContaining({ details: expect.objectContaining({ status: "skipped" }) }),
+    ]);
+
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, parkedIssueId));
+
+    const nextRun = await tick();
+    expect(nextRun.status).toBe("issue_created");
+    expect(nextRun.linkedIssueId).not.toBe(parkedIssueId);
+    expect(await routineIssueIds()).toEqual([parkedIssueId, nextRun.linkedIssueId!].sort());
+    expect(wakeups).toHaveLength(2);
+  });
+
+  it("treats the previous execution issue as active until it is done or cancelled", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const firstRun = await svc.runRoutine(routine.id, { source: "api" });
+    expect(firstRun.status).toBe("issue_created");
+    const previousIssueId = firstRun.linkedIssueId!;
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.companyId, companyId));
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, previousIssueId));
+
+    for (const status of ["backlog", "todo", "in_progress", "in_review", "blocked"] as const) {
+      await db.update(issues).set({ status }).where(eq(issues.id, previousIssueId));
+      const run = await svc.runRoutine(routine.id, { source: "api" });
+      expect({ status, run: run.status, linkedIssueId: run.linkedIssueId }).toEqual({
+        status,
+        run: "skipped",
+        linkedIssueId: previousIssueId,
+      });
+    }
+
+    await db
+      .update(issues)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(eq(issues.id, previousIssueId));
+    const afterCancel = await svc.runRoutine(routine.id, { source: "api" });
+    expect(afterCancel.status).toBe("issue_created");
+    expect(afterCancel.linkedIssueId).not.toBe(previousIssueId);
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originId, routine.id)));
+    expect(routineIssues).toHaveLength(2);
   });
 
   it("does not coalesce live routine runs with different resolved variables", async () => {
