@@ -72,6 +72,7 @@ import { attentionService } from "../services/attention.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import {
+  buildIssueBlockersResolvedResolutionWakeKey,
   buildIssueBlockersResolvedWakeStateKey,
   buildIssueBlockersResolvedWakeStateKeyWithoutCycle,
 } from "../services/issue-dependency-wakeups.ts";
@@ -226,6 +227,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
     blockerStatus?: "done" | "cancelled";
+    dependentStatus?: "blocked" | "todo" | "in_progress" | "backlog";
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
@@ -295,7 +297,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         companyId,
         projectId: workspaceState === "none" ? null : projectId,
         title: "Synthetic blocked dependent",
-        status: "blocked",
+        status: opts.dependentStatus ?? "blocked",
         priority: "medium",
         assigneeAgentId: opts.assignee === null ? null : agentId,
         issueNumber: 1,
@@ -1118,6 +1120,174 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         eq(agentWakeupRequests.idempotencyKey, stateKey),
       ));
     expect(stateKeyWakes).toHaveLength(1);
+  });
+
+  it("wakes a todo dependent of a cancelled blocker exactly once across sweeps", async () => {
+    const { companyId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        blockerStatus: "cancelled",
+        dependentStatus: "todo",
+      });
+    const resolvedAt = new Date("2026-10-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ cancelledAt: resolvedAt, updatedAt: resolvedAt })
+      .where(eq(issues.id, blockerIssueId));
+    const resolutionKey = buildIssueBlockersResolvedResolutionWakeKey({
+      dependentIssueId: blockedIssueId,
+      blockerIssueIds: [blockerIssueId],
+      resolvedAt,
+    });
+    const heartbeat = heartbeatService(db);
+    const resolutionKeyWakes = () =>
+      db
+        .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, resolutionKey),
+        ));
+
+    const first = await heartbeat.reconcileResolvedDependencyWakes();
+
+    expect(first.healed).toBe(1);
+    expect(first.issueIds).toEqual([blockedIssueId]);
+    expect(await resolutionKeyWakes()).toEqual([
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    ]);
+
+    await heartbeat.drainActiveRunExecutions();
+    const second = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(second.healed).toBe(0);
+
+    // Even when the delivered wake and its run end unsuccessfully, the one-shot
+    // key keeps later sweeps from waking the dependent again.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed" })
+      .where(eq(heartbeatRuns.companyId, companyId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "failed" })
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    const third = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(third.healed).toBe(0);
+    expect(third.existingWakeSkipped).toBe(1);
+    expect(await resolutionKeyWakes()).toHaveLength(1);
+  });
+
+  it("wakes an in_progress dependent whose earlier dependency wake failed", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        dependentStatus: "in_progress",
+      });
+    const resolvedAt = new Date("2026-10-07T04:02:00.000Z");
+    await db
+      .update(issues)
+      .set({ completedAt: resolvedAt, updatedAt: resolvedAt })
+      .where(eq(issues.id, blockerIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, blockerIssueIds: [blockerIssueId] },
+      status: "failed",
+      requestedAt: new Date("2026-10-07T04:02:11.000Z"),
+      finishedAt: new Date("2026-10-07T04:02:30.000Z"),
+      idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+      }),
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "failed",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: "claude_auth_required",
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_blockers_resolved" },
+      createdAt: new Date("2026-10-07T04:02:12.000Z"),
+      finishedAt: new Date("2026-10-07T04:02:30.000Z"),
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(1);
+    expect(result.issueIds).toEqual([blockedIssueId]);
+    const wake = await db
+      .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+        eq(agentWakeupRequests.requestedByActorId, "issue_graph_liveness_backstop"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(wake?.idempotencyKey).toBe(
+      buildIssueBlockersResolvedResolutionWakeKey({
+        dependentIssueId: blockedIssueId,
+        blockerIssueIds: [blockerIssueId],
+        resolvedAt,
+      }),
+    );
+  });
+
+  it("does not wake a todo dependent its assignee already ran after the blockers resolved", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "none",
+        dependentStatus: "todo",
+      });
+    const resolvedAt = new Date("2026-10-01T12:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ completedAt: resolvedAt, updatedAt: resolvedAt })
+      .where(eq(issues.id, blockerIssueId));
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_assigned" },
+      createdAt: new Date("2026-10-01T12:05:00.000Z"),
+      finishedAt: new Date("2026-10-01T12:10:00.000Z"),
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.healed).toBe(0);
+    expect(result.alreadyRunSkipped).toBe(1);
+    expect(
+      await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)),
+    ).toHaveLength(0);
+  });
+
+  it("leaves a backlog dependent asleep after its blockers resolve", async () => {
+    const { companyId } = await seedResolvedDependencyBackstopFixture({
+      workspaceState: "none",
+      blockerStatus: "cancelled",
+      dependentStatus: "backlog",
+    });
+
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+
+    expect(result.checked).toBe(0);
+    expect(result.healed).toBe(0);
+    expect(
+      await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId)),
+    ).toHaveLength(0);
   });
 
   it("counts null dependency wake returns as deferred instead of enqueue failures", async () => {

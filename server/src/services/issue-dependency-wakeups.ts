@@ -128,6 +128,69 @@ export function buildIssueBlockersResolvedWakeStateKey(input: IssueBlockersResol
   );
 }
 
+/**
+ * One-shot key for the backstop wake of a dependent that is already `todo` or
+ * `in_progress` when its blockers resolve. Such a dependent has no blocked
+ * cycle, so the key encodes the full blocker set plus the latest blocker
+ * terminal transition (`resolvedAt`, or `none`) instead. The backstop sends at
+ * most one wake per key whatever that wake's outcome, so a skipped or failed
+ * wake can never turn into a retry storm. Reopening and closing a blocker moves
+ * `resolvedAt` and produces a new key.
+ */
+export function buildIssueBlockersResolvedResolutionWakeKey(input: {
+  dependentIssueId: string;
+  blockerIssueIds: string[];
+  resolvedAt: IssueBlockersResolvedWakeCycleInput;
+}) {
+  const sortedBlockerIssueIds = uniqueSortedBlockerIssueIds(input.blockerIssueIds);
+  const resolution = `resolved:${formatIssueBlockersResolvedWakeCycle(input.resolvedAt)}`;
+  return [
+    ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+    "resolution",
+    input.dependentIssueId,
+    String(sortedBlockerIssueIds.length),
+    hashBlockerReadyStateDigest(sortedBlockerIssueIds, resolution),
+  ].join(":");
+}
+
+/**
+ * Latest terminal transition across the given blockers: `completedAt` for a
+ * `done` blocker and `cancelledAt` for a `cancelled` one. Returns `null` when no
+ * blocker is terminal or none recorded a transition time.
+ */
+export async function findLatestIssueBlockerTerminalTransitionAt(
+  db: Db,
+  input: { companyId: string; blockerIssueIds: string[] },
+): Promise<Date | null> {
+  const blockerTerminalStateRows =
+    input.blockerIssueIds.length > 0
+      ? await db
+          .select({
+            status: issues.status,
+            completedAt: issues.completedAt,
+            cancelledAt: issues.cancelledAt,
+          })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, input.companyId),
+              inArray(issues.id, [...new Set(input.blockerIssueIds)]),
+            ),
+          )
+      : [];
+  return blockerTerminalStateRows.reduce<Date | null>(
+    (latest, row) => {
+      const transitionedAt = row.status === "done"
+        ? row.completedAt
+        : row.status === "cancelled"
+          ? row.cancelledAt
+          : null;
+      return transitionedAt && (!latest || transitionedAt > latest) ? transitionedAt : latest;
+    },
+    null,
+  );
+}
+
 function parseWakeCycleDate(blockedTransitionAt: IssueBlockersResolvedWakeCycleInput): Date | null {
   if (blockedTransitionAt == null || blockedTransitionAt === "") return null;
   const parsed = blockedTransitionAt instanceof Date
@@ -212,33 +275,8 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
 ) {
   const cycleKey = buildIssueBlockersResolvedWakeStateKey(input);
   const oldStateKey = buildIssueBlockersResolvedWakeStateKeyWithoutCycle(input);
-  const blockerTerminalStateRows =
-    input.blockerIssueIds.length > 0
-      ? await db
-          .select({
-            status: issues.status,
-            completedAt: issues.completedAt,
-            cancelledAt: issues.cancelledAt,
-          })
-          .from(issues)
-          .where(
-            and(
-              eq(issues.companyId, input.companyId),
-              inArray(issues.id, [...new Set(input.blockerIssueIds)]),
-            ),
-          )
-      : [];
-  const latestBlockerTerminalTransitionAt = blockerTerminalStateRows.reduce<Date | null>(
-    (latest, row) => {
-      const transitionedAt = row.status === "done"
-        ? row.completedAt
-        : row.status === "cancelled"
-          ? row.cancelledAt
-          : null;
-      return transitionedAt && (!latest || transitionedAt > latest) ? transitionedAt : latest;
-    },
-    null,
-  );
+  const latestBlockerTerminalTransitionAt =
+    await findLatestIssueBlockerTerminalTransitionAt(db, input);
   const legacyKeyList = [
     ...new Set(
       input.blockerIssueIds
