@@ -121,7 +121,6 @@ it("does not offer reconnection for a healthy default or another owner's account
 it("keeps an ordinary member's new connection scoped to the current agent by default", async () => {
   await mount([], false);
   click("Connect another account");
-  click("My account");
   expect(credentialProps).toMatchObject({ allAgents: false, agentIds: ["agent"] });
 });
 
@@ -130,6 +129,28 @@ it("uses the server's connection-manager permission for company-wide access", as
   click("Connect another account");
   click("My account");
   expect(credentialProps).toMatchObject({ allAgents: true });
+});
+
+it("offers an ordinary member no company-shared account for this agent", async () => {
+  // Creating company-shared access needs a connection manager; the server
+  // refuses it for anyone else, so the dialog keeps the personal path.
+  await mount([], false);
+  click("Connect another account");
+  expect(document.body.textContent).not.toContain("Only Nova");
+  expect(credentialProps).toMatchObject({ ownership: "personal", allAgents: false, agentIds: ["agent"], name: "My Claude subscription" });
+  credentialProps!.onComplete({ connectionId: "new-connection", grantId: "new-grant", method: "subscription" });
+  await settle();
+  expect(mocks.setDefault).toHaveBeenCalledWith("company", "new-grant");
+  expect(onChange).toHaveBeenCalledWith({ provider: "anthropic", method: "subscription", mode: "responsible_user" });
+});
+
+it("defaults a connection manager to an account for this agent only", async () => {
+  await mount([], true);
+  click("Connect another account");
+  const choice = (label: string) => document.querySelector(`button[aria-label="${label}"]`);
+  expect(choice("Only Nova")?.getAttribute("aria-pressed")).toBe("true");
+  expect(choice("My account")?.getAttribute("aria-pressed")).toBe("false");
+  expect(credentialProps).toMatchObject({ ownership: "shared", allAgents: false, agentIds: ["agent"] });
 });
 
 it("connects a new account for this agent only and selects it", async () => {

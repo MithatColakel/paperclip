@@ -73,9 +73,10 @@ export function AiConnectionField({
   const [savedAccount, setSavedAccount] = useState<{ connectionId: string; grantId: string; method: AiAuthMethod }>();
   // A new account from an agent's page is for that agent unless the user
   // chooses their own default: a company-shared account installed only for
-  // this agent and selected for it, which changes no one's default.
-  const [connectFor, setConnectFor] = useState<"agent" | "personal">(agentId ? "agent" : "personal");
-  const agentOnly = !reconnecting && connectFor === "agent" && Boolean(agentId);
+  // this agent and selected for it, which changes no one's default. Only a
+  // connection manager may create company-shared access, so other users keep
+  // the personal-account path.
+  const [connectFor, setConnectFor] = useState<"agent" | "personal">("personal");
   const changeBinding = (next: AiRuntimeConnectionBinding) => {
     if (legacy && !value) { if (!connecting) returnFocus.current = document.activeElement as HTMLElement; setPendingAdoption(next); }
     else onChange(next);
@@ -86,6 +87,8 @@ export function AiConnectionField({
     queryFn: () => aiConnectionsApi.list(companyId, agentId),
     enabled: Boolean(provider),
   });
+  const offerAgentOnly = Boolean(agentId) && accounts.data?.canManageConnections === true;
+  const agentOnly = !reconnecting && connectFor === "agent" && offerAgentOnly;
   const personalDefault = accounts.data?.connections.find((account) => account.provider === provider && account.isDefault && account.ownership === "personal" && account.ownerUserId === accounts.data.currentUserId);
   const selectDefault = useMutation({
     mutationFn: async (result: NonNullable<typeof savedAccount>) => {
@@ -103,7 +106,7 @@ export function AiConnectionField({
   const openConnection = (reconnect?: AiManagedConnectionSummary) => {
     returnFocus.current = document.activeElement as HTMLElement;
     setReconnecting(reconnect);
-    setConnectFor(agentId ? "agent" : "personal");
+    setConnectFor(offerAgentOnly ? "agent" : "personal");
     setAllAgents(accounts.data?.canManageConnections ?? false);
     setSavedAccount(undefined);
     selectDefault.reset();
@@ -210,7 +213,7 @@ export function AiConnectionField({
               {reconnecting ? "Sign in again to repair your current default account. Its agent access stays the same." : agentOnly ? `This account is shared with the company and installed only for ${agentName}. ${agentName} uses it after you save; no one's default changes.` : "This account will become your default for this provider. Your tasks will use it; other users keep their own default."}
             </DialogDescription>
           </DialogHeader>
-          {agentId && !reconnecting && !savedAccount && (
+          {offerAgentOnly && !reconnecting && !savedAccount && (
             <ConnectionChoiceList
               selectedId={connectFor}
               choices={[
