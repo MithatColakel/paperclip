@@ -15,6 +15,11 @@ vi.mock("./ProjectRepositoryInput", () => ({
   repositoryOptionsKey: (companyId: string) => ["repositories", companyId],
 }));
 vi.mock("@/features/connections/ConnectionSetupFlow", () => ({ ConnectionSetupFlow: () => null }));
+// The fork's environment picker reads the company list from CompanyProvider,
+// which this form-only render does not mount; NewProjectDialog.environment.test.tsx covers it.
+vi.mock("../hooks/useEnvironmentChoices", () => ({
+  useEnvironmentChoices: () => ({ environments: [], companyDefaultEnvironmentId: null, instanceDefaultEnvironmentId: null, ready: true }),
+}));
 vi.mock("./ui/dialog", () => ({
   Dialog: ({ children }: { children: ReactNode }) => <>{children}</>,
   DialogContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,

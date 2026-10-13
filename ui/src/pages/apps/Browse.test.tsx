@@ -38,6 +38,10 @@ vi.mock("@/api/companies-query", () => ({ useAccountIdentity: () => accountIdent
 const poolListMock = vi.hoisted(() => vi.fn());
 const poolRemoveMock = vi.hoisted(() => vi.fn());
 vi.mock("@/api/ai-connection-pools", () => ({ aiConnectionPoolsApi: { list: poolListMock, remove: poolRemoveMock } }));
+// The fork's company account pool card has its own suite (AiAccountPoolCard.test.tsx).
+// Unmocked here it would fetch for real and its load-error alert would be the
+// page's first [role="alert"].
+vi.mock("@/components/ai-connections/AiAccountPoolCard", () => ({ AiAccountPoolCard: () => null }));
 
 const assistantConnectionsMock = vi.hoisted(() => vi.fn());
 vi.mock("@/api/publicMcp", () => ({ publicMcpApi: { connections: assistantConnectionsMock } }));
