@@ -36,6 +36,7 @@ import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/papercli
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
+import { admitExplicitContinuationUsageLimitRetry, EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS } from "./explicit-continuation-usage-limit-retry.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
@@ -16265,10 +16266,16 @@ export function heartbeatService(
 
         const scheduledRunId = randomUUID();
         if (contextSnapshot.explicitUserContinuation) {
-          const continuation = issueId && retryReason === "transient_failure" ? await admitExplicitContinuationRetry({
+          const admission = issueId ? {
             db: tx as unknown as Db, companyId: run.companyId, issueId, agentId: run.agentId,
             parentRunId: run.id, successorRunId: scheduledRunId, now,
-          }) : null;
+          } : null;
+          const continuation = !admission ? null
+            : retryReason === "transient_failure" ? await admitExplicitContinuationRetry(admission)
+            // Fork: the quota-recovery and company-pool failover lanes renew
+            // the same user authorization instead of failing closed.
+            : EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS.has(retryReason)
+              ? await admitExplicitContinuationUsageLimitRetry(admission) : null;
           if (!continuation) return {
             outcome: "not_scheduled", issueId,
             errorCode: "continuation_user_authorization_missing",
@@ -26595,7 +26602,12 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            if (!(await scheduleAiConnectionPoolFailover(livenessRun, agent))) {
+            // Fork: a user-continued legacy turn can renew its authorization
+            // only after this executor releases its controller and lease, so
+            // its company-pool failover runs after cleanup (below).
+            const deferPoolFailover = livenessRun.runtimeMode === "legacy" &&
+              Boolean(livenessRun.contextSnapshot?.explicitUserContinuation);
+            if (deferPoolFailover || !(await scheduleAiConnectionPoolFailover(livenessRun, agent))) {
               const retry = await scheduleBoundedRetryForRun(livenessRun, agent);
               providerQuotaWaitOwnsRetry =
                 retry.outcome === "not_scheduled" &&
@@ -27541,6 +27553,17 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
+      if (latestRun?.runtimeMode === "legacy" && latestRun.status === "failed" &&
+          latestRun.contextSnapshot?.explicitUserContinuation) {
+        // Fork: the company-pool failover deferred at finalization. It takes
+        // precedence over a transient retry on the same limited account; a
+        // refusal leaves the provider-quota wait in charge.
+        const failoverRun = await getRun(latestRun.id, { unsafeFullResultJson: true }).catch(() => null);
+        const failoverAgent = failoverRun ? await getAgent(failoverRun.agentId).catch(() => null) : null;
+        if (failoverRun && failoverAgent) await scheduleAiConnectionPoolFailover(failoverRun, failoverAgent).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to fail over an explicit continuation after cleanup");
+        });
+      }
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
           latestRun.contextSnapshot?.explicitUserContinuation) {
         // Re-run the same queue-first recovery decision after cleanup. Its
