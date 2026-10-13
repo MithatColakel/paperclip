@@ -1204,7 +1204,10 @@ describe("agent skill routes", () => {
           adapterType: "claude_local",
         }),
         expect.objectContaining({
-          "AGENTS.md": "You are an agent in a Paperclip company.\n",
+          // The upstream identity line plus the board policy's coordinator hand-off line.
+          "AGENTS.md": expect.stringMatching(
+            /^You are an agent in a Paperclip company\.\n\nBoard policy: unless your instructions name you the coordinator, do not create or assign tasks;[^\n]*`status: "todo"`, `assigneeAgentId`[^\n]*as the run's last API call; mentions wake no one\.\n$/,
+          ),
         }),
         { entryFile: "AGENTS.md", replaceExisting: false },
       );
