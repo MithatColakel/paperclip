@@ -2,6 +2,10 @@
 
 This document describes the server defaults for an ordinary, standard trust agent. An agent must belong to the same company and be active where the action requires active membership. A responsible user's authority, project or run trust policy, scope rules, and approval gates can narrow these defaults.
 
+## Coordinator-only defaults (board policy)
+
+This instance runs the board policy in `skills/paperclip/SKILL.md`: only the company's coordinator creates and assigns tasks. Four of the defaults below, `agents:configure`, `tools:manage_connections`, `tasks:assign`, and `tasks:assign_scope`, go only to a new coordinator: an agent created or approved with the `pm` role, or the onboarding chief of staff that the board creates with the onboarding marker. Every other new agent receives the remaining ten grants, and no route, invitation, or import adds a default `tasks:assign` grant for it. Such an agent still hands work back by assignment, because the default-open assignment rule needs no grant unless an assignment policy protects the target. Existing agents keep their grants.
+
 ## Granted by default
 
 | Capability | Source and limit |

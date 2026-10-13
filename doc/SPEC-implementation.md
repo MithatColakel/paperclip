@@ -638,8 +638,9 @@ access does not bypass that decision, and `agents:suggest-changes` alone cannot
 apply the lifecycle change. Pause, clear-error, terminate, approval, and
 key-management routes remain board-only.
 
-An ordinary standard agent receives a direct `agents:configure` grant on
-creation. Existing agents keep their current permissions; no backfill runs.
+A new coordinator (a `pm` role hire, or the board-created onboarding chief of
+staff) receives a direct `agents:configure` grant on creation; under the board
+policy other new agents do not. Existing agents keep their current permissions; no backfill runs.
 Low-trust and managed built-in agents do not receive this default. See
 [agent permission defaults](agent-permission-defaults.md) for the full inventory.
 Agent-authenticated changes cannot set or restore host-executed process adapter

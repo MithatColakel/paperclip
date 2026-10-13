@@ -11,22 +11,26 @@ import { agentJoinGrantsFromDefaults } from "../services/invite-grants.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDatabase = support.supported ? describe : describe.skip;
-const expectedNewAgentGrantKeys: PermissionKey[] = [
+// Board policy: only the coordinator gets these four by default.
+const coordinatorOnlyGrantKeys: PermissionKey[] = [
   "agents:configure",
+  "tools:manage_connections",
+  "tasks:assign",
+  "tasks:assign_scope",
+];
+const expectedNewAgentGrantKeys: PermissionKey[] = [
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",
-  "tools:manage_connections",
   "tools:manage_profiles",
   "tools:view_audit",
   "audit:view_agent_actions",
   "tools:use",
   "tools:manage_runtime",
   "inbox:manage",
-  "tasks:assign",
-  "tasks:assign_scope",
   "tasks:manage_active_checkouts",
 ].sort();
+const expectedCoordinatorGrantKeys: PermissionKey[] = [...expectedNewAgentGrantKeys, ...coordinatorOnlyGrantKeys].sort();
 
 describeDatabase("new agent configuration defaults", () => {
   let db!: ReturnType<typeof createDb>;
@@ -42,27 +46,39 @@ describeDatabase("new agent configuration defaults", () => {
     await cleanup?.();
   });
 
-  it("grants standard new agents direct peer configuration, but keeps restricted agents narrow", async () => {
+  it("grants only the coordinator assignment and peer configuration, and keeps restricted agents narrow", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Agent permission defaults",
       issuePrefix: `PD${companyId.slice(0, 6).toUpperCase()}`,
     });
-    const create = (name: string, permissions: Record<string, unknown> = {}, metadata?: Record<string, unknown>) =>
+    const create = (
+      name: string,
+      permissions: Record<string, unknown> = {},
+      metadata?: Record<string, unknown>,
+      role = "engineer",
+      coordinator = false,
+    ) =>
       agentService(db).create(companyId, {
         name,
-        role: "engineer",
+        role,
         adapterType: "process",
         adapterConfig: {},
         runtimeConfig: {},
         permissions,
         metadata,
-      }, metadata ? { allowBuiltInAgentMetadata: true } : undefined);
+      }, metadata || coordinator ? {
+        ...(metadata ? { allowBuiltInAgentMetadata: true } : {}),
+        ...(coordinator ? { coordinator: true } : {}),
+      } : undefined);
 
     const standard = await create("Standard");
     const peer = await create("Peer");
+    const projectManager = await create("Project Manager", {}, undefined, "pm");
+    const chiefOfStaff = await create("Chief of staff", {}, undefined, "general", true);
     const lowTrust = await create("Low trust", { trustPreset: LOW_TRUST_REVIEW_PRESET });
+    const lowTrustCoordinator = await create("Low trust PM", { trustPreset: LOW_TRUST_REVIEW_PRESET }, undefined, "pm");
     const bundled = await create("Bundled", {}, {
       paperclipBuiltInAgent: { key: "reflection-coach", featureKeys: [] },
     });
@@ -72,27 +88,51 @@ describeDatabase("new agent configuration defaults", () => {
     for (const agent of [standard, peer]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)
         .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+      expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
+        .toEqual({ responsibleUserOnly: true });
+    }
+    for (const agent of [projectManager, chiefOfStaff]) {
+      expect(grants.filter((grant) => grant.principalId === agent.id)
+        .map((grant) => grant.permissionKey).sort()).toEqual(expectedCoordinatorGrantKeys);
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "tasks:assign_scope")?.scope)
         .toEqual({ subtreeRootAgentId: agent.id });
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
         .toEqual({ responsibleUserOnly: true });
     }
-    for (const agent of [lowTrust, bundled]) {
+    for (const agent of [lowTrust, lowTrustCoordinator, bundled]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)).toEqual([]);
     }
 
-    await db.insert(companyMemberships).values({
+    await db.insert(companyMemberships).values([standard, projectManager].map((agent) => ({
+      companyId,
+      principalType: "agent" as const,
+      principalId: agent.id,
+      status: "active" as const,
+      membershipRole: "member" as const,
+    })));
+
+    for (const permissionKey of expectedCoordinatorGrantKeys) {
+      if (permissionKey === "tasks:assign_scope" || permissionKey === "inbox:manage") continue; // These grants require a target scope or the responsible-user inbox path.
+      expect(await accessService(db).hasPermission(companyId, "agent", projectManager.id, permissionKey)).toBe(true);
+      expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey))
+        .toBe(!coordinatorOnlyGrantKeys.includes(permissionKey));
+    }
+    expect(await authorizationService(db).decidePrincipalGrant({
       companyId,
       principalType: "agent",
-      principalId: standard.id,
-      status: "active",
-      membershipRole: "member",
-    });
-
-    for (const permissionKey of expectedNewAgentGrantKeys) {
-      if (permissionKey === "tasks:assign_scope" || permissionKey === "inbox:manage") continue; // These grants require a target scope or the responsible-user inbox path.
-      expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey)).toBe(true);
-    }
+      principalId: projectManager.id,
+      action: "tasks:assign",
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentId: projectManager.id },
+    })).toMatchObject({ allowed: true });
+    expect(await authorizationService(db).decidePrincipalGrant({
+      companyId,
+      principalType: "agent",
+      principalId: projectManager.id,
+      action: "tasks:assign",
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentId: peer.id },
+    })).toMatchObject({ allowed: false, reason: "deny_scope" });
     expect(await authorizationService(db).decidePrincipalGrant({
       companyId,
       principalType: "agent",
@@ -100,29 +140,31 @@ describeDatabase("new agent configuration defaults", () => {
       action: "tasks:assign",
       permissionKey: "tasks:assign_scope",
       scope: { assigneeAgentId: standard.id },
-    })).toMatchObject({ allowed: true });
-    expect(await authorizationService(db).decidePrincipalGrant({
-      companyId,
-      principalType: "agent",
-      principalId: standard.id,
-      action: "tasks:assign",
-      permissionKey: "tasks:assign_scope",
-      scope: { assigneeAgentId: peer.id },
-    })).toMatchObject({ allowed: false, reason: "deny_scope" });
+    })).toMatchObject({ allowed: false });
     for (const permissionKey of [
       "agents:create", "environments:manage", "tools:admin", "users:invite",
       "users:manage_permissions", "pipelines:write", "joins:approve",
     ] as const) {
       expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey)).toBe(false);
+      expect(await accessService(db).hasPermission(companyId, "agent", projectManager.id, permissionKey)).toBe(false);
     }
 
-    const decision = await authorizationService(db).decide({
-      actor: { type: "agent", agentId: standard.id, companyId, source: "agent_key" },
+    const decideConfigure = (actorAgentId: string) => authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgentId, companyId, source: "agent_key" },
       action: "agent_config:update",
       resource: { type: "agent", agentId: peer.id, companyId },
       scope: { requiresChangeGrant: true },
     });
-    expect(decision).toMatchObject({ allowed: true, reason: "allow_direct_change" });
+    expect(await decideConfigure(projectManager.id)).toMatchObject({ allowed: true, reason: "allow_direct_change" });
+    expect(await decideConfigure(standard.id)).toMatchObject({ allowed: false });
+
+    // A worker without the grant still hands work back to the coordinator by assignment.
+    expect(await authorizationService(db).decide({
+      actor: { type: "agent", agentId: standard.id, companyId, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId, assigneeAgentId: projectManager.id },
+      scope: { assigneeAgentId: projectManager.id },
+    })).toMatchObject({ allowed: true, reason: "allow_visible_issue_write" });
 
     // A later ordinary self-update must not recreate a grant removed by an operator.
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, standard.id));
@@ -181,36 +223,42 @@ describeDatabase("new agent configuration defaults", () => {
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
-  it("adds the default grant when a standard pending hire is approved", async () => {
+  it("adds the default grants when a pending hire is approved, the coordinator set only for a pm", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Pending permission default",
       issuePrefix: `PP${companyId.slice(0, 6).toUpperCase()}`,
     });
-    const pending = await agentService(db).create(companyId, {
-      name: "Pending hire",
+    const createPending = (name: string, role: string) => agentService(db).create(companyId, {
+      name,
       status: "pending_approval",
-      role: "engineer",
+      role,
       adapterType: "process",
       adapterConfig: {},
       runtimeConfig: {},
     });
+    const pending = await createPending("Pending hire", "engineer");
+    const pendingCoordinator = await createPending("Pending PM", "pm");
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.companyId, companyId))).toEqual([]);
 
+    const grantKeysFor = async (agentId: string) => (await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.principalId, agentId)))
+      .map((grant) => grant.permissionKey).sort();
     const result = await agentService(db).activatePendingApproval(pending.id);
     expect(result?.activated).toBe(true);
-    expect((await db.select().from(principalPermissionGrants)
-      .where(eq(principalPermissionGrants.companyId, companyId)))
-      .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    expect(await grantKeysFor(pending.id)).toEqual(expectedNewAgentGrantKeys);
+    const coordinatorResult = await agentService(db).activatePendingApproval(pendingCoordinator.id);
+    expect(coordinatorResult?.activated).toBe(true);
+    expect(await grantKeysFor(pendingCoordinator.id)).toEqual(expectedCoordinatorGrantKeys);
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
-  it("keeps configuration access when invitation approval replaces a new agent's grants", async () => {
+  it("keeps the non-coordinator defaults when invitation approval replaces a new agent's grants", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,

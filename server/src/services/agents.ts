@@ -39,7 +39,7 @@ import {
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
-import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope, normalizeAgentPermissions, permissionsImplyLowTrust } from "./agent-permissions.js";
+import { isCoordinatorAgentRole, newStandardAgentDefaultGrantKeys, newStandardAgentGrantScope, normalizeAgentPermissions, permissionsImplyLowTrust } from "./agent-permissions.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -131,6 +131,9 @@ interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; memberConnectionIds?: string[]; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  // The board-authored onboarding first agent (chief-of-staff persona) is the
+  // coordinator and gets the coordinator's default grants, like a "pm" hire.
+  coordinator?: boolean;
 }
 
 interface AgentShortnameRow {
@@ -945,12 +948,13 @@ export function agentService(db: Db) {
           })
           .returning()
           .then((rows) => rows[0]);
-        // New standard agents receive the standard direct grants at activation.
+        // New standard agents receive the standard direct grants at activation;
+        // the coordinator-only keys go to a coordinator alone (board policy).
         // Low-trust and bundled agents keep their explicit, narrower grants.
         if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
             !readBuiltInAgentMarker(created.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+            newStandardAgentDefaultGrantKeys(options?.coordinator === true || isCoordinatorAgentRole(role)).map((permissionKey) => ({
               companyId,
               principalType: "agent" as const,
               principalId: created.id,
@@ -1173,7 +1177,7 @@ export function agentService(db: Db) {
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+            newStandardAgentDefaultGrantKeys(isCoordinatorAgentRole(updated.role)).map((permissionKey) => ({
               companyId: updated.companyId,
               principalType: "agent" as const,
               principalId: updated.id,

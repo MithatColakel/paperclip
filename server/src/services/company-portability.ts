@@ -99,6 +99,7 @@ import {
 } from "./catalog-provenance.js";
 import { resolvePortableExportAgentSelection } from "./company-portability-agent-selection.js";
 import { normalizePortablePath } from "./portable-path.js";
+import { isCoordinatorAgentRole } from "./agent-permissions.js";
 import type {
   ImportIssueRow,
   ImportIssueCommentRow,
@@ -5673,14 +5674,17 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             status: pauseAutomations ? "paused" : "idle",
           });
           await access.ensureMembership(targetCompany.id, "agent", created.id, "member", "active");
-          await access.setPrincipalPermission(
-            targetCompany.id,
-            "agent",
-            created.id,
-            "tasks:assign",
-            true,
-            actorUserId ?? null,
-          );
+          // Board policy: only the coordinator gets the default task-assign grant.
+          if (isCoordinatorAgentRole(created.role)) {
+            await access.setPrincipalPermission(
+              targetCompany.id,
+              "agent",
+              created.id,
+              "tasks:assign",
+              true,
+              actorUserId ?? null,
+            );
+          }
           try {
             const materialized = await instructions.materializeManagedBundle(created, bundleFiles, {
               clearLegacyPromptTemplate: true,

@@ -1253,7 +1253,8 @@ describe("agent permission routes", () => {
       }),
       { claudeLogin: { storedSessionId: null, ownerUserId: "agent-admin-user", applyExistingWithoutClaim: false } },
     );
-    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+    // Board policy: an engineer is not the coordinator, so no default tasks:assign.
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
       companyId,
       "agent",
       agentId,
@@ -1292,7 +1293,7 @@ describe("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("grants tasks:assign by default when board creates a new agent", async () => {
+  it("adds membership but no default tasks:assign when board creates a non-coordinator agent", async () => {
     const app = await createApp({
       type: "board",
       userId: "board-user",
@@ -1318,6 +1319,37 @@ describe("agent permission routes", () => {
       "member",
       "active",
     );
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "tasks:assign",
+      true,
+      "board-user",
+    );
+    expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
+  }, 15_000);
+
+  it.each([
+    ["agents", "a pm role", { role: "pm" }],
+    ["agent-hires", "a pm role", { role: "pm" }],
+    ["agents", "the onboarding chief of staff", { role: "general", onboardingFirstAgent: true }],
+    ["agent-hires", "the onboarding chief of staff", { role: "general", onboardingFirstAgent: true }],
+  ])("grants the coordinator default tasks:assign via %s for %s", async (endpoint, _label, body) => {
+    mockAgentService.create.mockResolvedValue({ ...baseAgent, role: body.role });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/${endpoint}`)
+      .send({ name: "Coordinator", adapterType: "process", adapterConfig: {}, ...body }));
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
       companyId,
       "agent",
@@ -1325,6 +1357,27 @@ describe("agent permission routes", () => {
       "tasks:assign",
       true,
       "board-user",
+    );
+    if (body.onboardingFirstAgent) {
+      expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: true });
+    } else {
+      expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
+    }
+  }, 15_000);
+
+  it("does not treat an agent-sent onboarding marker as the coordinator", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Not a coordinator", role: "general", adapterType: "process", onboardingFirstAgent: true }));
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockAgentService.create).toHaveBeenCalled();
+    expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
+      companyId, "agent", agentId, "tasks:assign", true, expect.anything(),
     );
   }, 15_000);
 

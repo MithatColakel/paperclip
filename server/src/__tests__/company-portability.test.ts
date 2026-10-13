@@ -1991,6 +1991,53 @@ describe("company portability", () => {
     );
   });
 
+  it("grants the default tasks:assign only to an imported coordinator (pm role)", async () => {
+    const portability = companyPortabilityService({} as any);
+    agentSvc.list.mockResolvedValue([]);
+    agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
+      id: `agent-${String(input.role)}`,
+      name: input.name,
+      role: input.role,
+      adapterType: input.adapterType,
+      adapterConfig: input.adapterConfig,
+      runtimeConfig: input.runtimeConfig,
+      status: input.status,
+    }));
+    const agentFile = (name: string, slug: string, role: string) => [
+      "---", `name: ${name}`, `slug: ${slug}`, "kind: agent", `role: ${role}`, "---", "", `# ${name}`, "",
+    ].join("\n");
+
+    await portability.importBundle({
+      source: {
+        type: "inline",
+        files: {
+          "COMPANY.md": [
+            "---",
+            "name: Import",
+            "includes:",
+            "  - agents/pm/AGENTS.md",
+            "  - agents/coder/AGENTS.md",
+            "---",
+            "",
+          ].join("\n"),
+          "agents/pm/AGENTS.md": agentFile("Project Manager", "pm", "pm"),
+          "agents/coder/AGENTS.md": agentFile("Coder", "coder", "engineer"),
+        },
+      },
+      include: { company: false, agents: true, projects: false, issues: false },
+      target: { mode: "existing_company", companyId: "company-1" },
+      collisionStrategy: "rename",
+    }, "user-1");
+
+    expect(agentSvc.create).toHaveBeenCalledTimes(2);
+    expect(accessSvc.setPrincipalPermission).toHaveBeenCalledWith(
+      "company-1", "agent", "agent-pm", "tasks:assign", true, "user-1",
+    );
+    expect(accessSvc.setPrincipalPermission).not.toHaveBeenCalledWith(
+      "company-1", "agent", "agent-engineer", "tasks:assign", true, "user-1",
+    );
+  });
+
   it("removes import secrets created before a later import failure", async () => {
     const portability = companyPortabilityService({} as any);
     agentSvc.list.mockResolvedValue([]);

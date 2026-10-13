@@ -1,6 +1,6 @@
 import { PERMISSION_KEYS } from "@paperclipai/shared";
 import type { HumanCompanyMembershipRole } from "@paperclipai/shared";
-import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope } from "./agent-permissions.js";
+import { newStandardAgentDefaultGrantKeys, newStandardAgentGrantScope } from "./agent-permissions.js";
 import { grantsForHumanRole } from "./company-member-roles.js";
 
 export function grantsFromDefaults(
@@ -48,7 +48,8 @@ export function agentJoinGrantsFromDefaults(
   const grants = grantsFromDefaults(defaultsPayload, "agent");
   // Invitation approval replaces the whole grant set after agent creation.
   // Retain new-agent defaults, but never widen an explicitly scoped grant.
-  for (const permissionKey of NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS) {
+  // An invited agent joins as a "general" worker, never as the coordinator.
+  for (const permissionKey of newStandardAgentDefaultGrantKeys(false)) {
     if (!grants.some((grant) => grant.permissionKey === permissionKey)) {
       grants.push({ permissionKey, scope: newStandardAgentGrantScope(permissionKey, agentId) });
     }

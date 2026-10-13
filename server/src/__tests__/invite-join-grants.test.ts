@@ -8,17 +8,26 @@ import {
   normalizeHumanRole,
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
-import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope } from "../services/agent-permissions.js";
+import {
+  COORDINATOR_ONLY_DEFAULT_GRANT_KEYS,
+  newStandardAgentDefaultGrantKeys,
+  newStandardAgentGrantScope,
+} from "../services/agent-permissions.js";
 
 const invitedAgentId = "agent-1";
-const defaultAgentGrants = NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+const defaultAgentGrants = newStandardAgentDefaultGrantKeys(false).map((permissionKey) => ({
   permissionKey,
   scope: newStandardAgentGrantScope(permissionKey, invitedAgentId),
 }));
 
 describe("agentJoinGrantsFromDefaults", () => {
-  it("adds all new-agent grants when invite defaults do not specify grants", () => {
-    expect(agentJoinGrantsFromDefaults(null, invitedAgentId)).toEqual(defaultAgentGrants);
+  it("adds the non-coordinator new-agent grants when invite defaults do not specify grants", () => {
+    const grants = agentJoinGrantsFromDefaults(null, invitedAgentId);
+    expect(grants).toEqual(defaultAgentGrants);
+    expect(grants).toHaveLength(10);
+    for (const permissionKey of COORDINATOR_ONLY_DEFAULT_GRANT_KEYS) {
+      expect(grants.map((grant) => grant.permissionKey)).not.toContain(permissionKey);
+    }
   });
 
   it("preserves invite agent grants and appends the missing defaults", () => {

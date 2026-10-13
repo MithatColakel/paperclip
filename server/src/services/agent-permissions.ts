@@ -18,6 +18,30 @@ export const NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS = [
   "tasks:manage_active_checkouts",
 ] as const satisfies readonly PermissionKey[];
 
+/**
+ * Board policy (skills/paperclip/SKILL.md): only the company's coordinator
+ * creates and assigns tasks. Of the defaults above, these go to a new
+ * coordinator only. Other agents hand work back by assignment, which the
+ * default-open assignment rule allows without a grant.
+ */
+export const COORDINATOR_ONLY_DEFAULT_GRANT_KEYS = [
+  "agents:configure",
+  "tools:manage_connections",
+  "tasks:assign",
+  "tasks:assign_scope",
+] as const satisfies readonly PermissionKey[];
+
+/** The "pm" role marks a coordinator hire; the onboarding chief of staff is the other. */
+export function isCoordinatorAgentRole(role: string | null | undefined): boolean {
+  return typeof role === "string" && role.trim().toLowerCase() === "pm";
+}
+
+export function newStandardAgentDefaultGrantKeys(coordinator: boolean): readonly PermissionKey[] {
+  if (coordinator) return NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS;
+  const coordinatorOnly = new Set<PermissionKey>(COORDINATOR_ONLY_DEFAULT_GRANT_KEYS);
+  return NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.filter((permissionKey) => !coordinatorOnly.has(permissionKey));
+}
+
 export function newStandardAgentGrantScope(
   permissionKey: PermissionKey,
   agentId: string,

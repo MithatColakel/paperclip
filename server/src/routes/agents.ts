@@ -243,6 +243,7 @@ import {
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
 import { buildOnboardingFirstAgentInstructionsBundle } from "../services/onboarding-first-task-assets.js";
+import { isCoordinatorAgentRole } from "../services/agent-permissions.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { resolveInheritedEnvironmentDefaults } from "../services/environment-defaults.js";
@@ -1751,8 +1752,12 @@ export function agentRoutes(
     companyId: string,
     agentId: string,
     grantedByUserId: string | null,
+    coordinator: boolean,
   ) {
     await access.ensureMembership(companyId, "agent", agentId, "member", "active");
+    // Board policy: only the coordinator assigns tasks. Other agents hand work
+    // back by assignment through the default-open rule, which needs no grant.
+    if (!coordinator) return;
     await access.setPrincipalPermission(
       companyId,
       "agent",
@@ -4793,6 +4798,8 @@ export function agentRoutes(
       const status = requiresApproval ? "pending_approval" : "idle";
       const managedHireBinding = normalizedHireInput.runtimeConfig?.aiConnection ? aiRuntimeConnectionBindingSchema.parse(normalizedHireInput.runtimeConfig.aiConnection) : undefined;
       const managedHireConnection = managedHireBinding ? await validateManagedAgentBinding(req, companyId, hiredAgentId, normalizedHireInput.adapterType, normalizedHireInput.adapterConfig, managedHireBinding, normalizedHireInput.defaultEnvironmentId, false, true) : undefined;
+      // The chief-of-staff persona seeded below names this agent the coordinator.
+      const onboardingCoordinator = hireOnboardingFirstAgent === true && req.actor.type === "board";
       const createdAgent = await svc.create(
         companyId,
         {
@@ -4821,6 +4828,7 @@ export function agentRoutes(
                 ? req.actor.agentId
                 : null,
           },
+          ...(onboardingCoordinator ? { coordinator: true } : {}),
         },
       );
       const onboardingFirstAgentBundle = await resolveOnboardingFirstAgentBundle({
@@ -4927,6 +4935,7 @@ export function agentRoutes(
         companyId,
         agent.id,
         actor.actorType === "user" ? actor.actorId : null,
+        onboardingCoordinator || isCoordinatorAgentRole(agent.role),
       );
 
       if (approval) {
@@ -5046,6 +5055,8 @@ export function agentRoutes(
 
     const managedBinding = normalizedRuntimeConfig.aiConnection ? aiRuntimeConnectionBindingSchema.parse(normalizedRuntimeConfig.aiConnection) : undefined;
     const managedConnection = managedBinding ? await validateManagedAgentBinding(req, companyId, agentId, createInput.adapterType, normalizedAdapterConfig, managedBinding, createInput.defaultEnvironmentId, false, true) : undefined;
+    // The chief-of-staff persona seeded below names this agent the coordinator.
+    const onboardingCoordinator = createOnboardingFirstAgent === true && req.actor.type === "board";
     const createdAgent = await svc.create(
       companyId,
       {
@@ -5067,6 +5078,7 @@ export function agentRoutes(
           applyExistingWithoutClaim:
             req.actor.type !== "agent" && createApplyStoredClaudeLogin === true,
         },
+        ...(onboardingCoordinator ? { coordinator: true } : {}),
       },
     );
     const onboardingFirstAgentBundle = await resolveOnboardingFirstAgentBundle({
@@ -5107,6 +5119,7 @@ export function agentRoutes(
       companyId,
       agent.id,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      onboardingCoordinator || isCoordinatorAgentRole(agent.role),
     );
     await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
 
