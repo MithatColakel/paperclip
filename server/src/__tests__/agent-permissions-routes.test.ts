@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
-import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 vi.mock("acpx/runtime", () => ({
@@ -1377,7 +1377,7 @@ describe("agent permission routes", () => {
           heartbeat: {
             enabled: false,
             intervalSec: 3600,
-            maxConcurrentRuns: 20,
+            maxConcurrentRuns: AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
           },
         },
       }),
@@ -1490,7 +1490,7 @@ describe("agent permission routes", () => {
           heartbeat: {
             enabled: false,
             intervalSec: 3600,
-            maxConcurrentRuns: 20,
+            maxConcurrentRuns: AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
           },
         },
       }),
@@ -1694,9 +1694,11 @@ describe("agent permission routes", () => {
 
   it("allows creating an agent with an instance-scoped environment referenced from another company", async () => {
     const environmentId = "33333333-3333-4333-8333-333333333333";
+    // An instance-scoped (shared) environment has no owning company; one that
+    // belongs to another company is rejected (environment-company-scope.test.ts).
     mockEnvironmentService.getById.mockResolvedValue({
       id: environmentId,
-      companyId: "other-company",
+      companyId: null,
       driver: "local",
       config: {},
     });

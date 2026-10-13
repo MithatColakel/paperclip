@@ -2055,6 +2055,17 @@ describeEmbeddedPostgres(
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, fixture.runs.standard.id));
+        // The standard agent's other fixture run is still "running". Finish it
+        // too, so the wake below does not depend on the agent's concurrency
+        // default (the fork runs one task per agent at a time).
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "succeeded",
+            finishedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, fixture.runs.standardReport.id));
         await db
           .update(agents)
           .set({

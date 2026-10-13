@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CompanyPortabilityFileEntry } from "@paperclipai/shared";
+import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, type CompanyPortabilityFileEntry } from "@paperclipai/shared";
 
 const companySvc = {
   getById: vi.fn(),
@@ -3592,7 +3592,7 @@ describe("company portability", () => {
         },
         heartbeat: {
           enabled: false,
-          maxConcurrentRuns: 20,
+          maxConcurrentRuns: AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
         },
       },
     });
@@ -3674,7 +3674,7 @@ describe("company portability", () => {
       runtimeConfig: {
         heartbeat: {
           enabled: false,
-          maxConcurrentRuns: 20,
+          maxConcurrentRuns: AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
         },
       },
     }));
@@ -5868,7 +5868,7 @@ describe("company portability", () => {
         },
         heartbeat: {
           enabled: false,
-          maxConcurrentRuns: 20,
+          maxConcurrentRuns: AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
         },
       },
     }));
