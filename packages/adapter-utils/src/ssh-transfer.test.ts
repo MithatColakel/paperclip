@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -239,6 +239,96 @@ describe("SSH workspace transfer", () => {
     expect(await exists(path.join(localDir, "Package", ".build", "cache.bin"))).toBe(true);
     // A restored run's remote copy is removed.
     expect(await exists(path.join(remoteRoot, ".paperclip-runtime", "runs", "run-repos"))).toBe(false);
+  });
+
+  it("keeps nested .git entries outside the project repositories across a git-backed restore", async () => {
+    await useFakeSsh("local");
+    const localDir = await gitWorkspace();
+    // A submodule: its worktree carries a `.git` file that points into the
+    // anchor's `.git/modules`.
+    const upstreamDir = await tempDir("paperclip-ssh-submodule-upstream-");
+    git(upstreamDir, "init", "-q");
+    git(upstreamDir, "config", "user.email", "test@example.com");
+    git(upstreamDir, "config", "user.name", "Test");
+    await writeFile(path.join(upstreamDir, "lib.swift"), "let lib = 1\n", "utf8");
+    git(upstreamDir, "add", ".");
+    git(upstreamDir, "commit", "-q", "-m", "init");
+    git(localDir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", upstreamDir, "mods/sub");
+    git(localDir, "commit", "-q", "-m", "add submodule");
+    // A nested clone that is neither tracked nor ignored by the anchor.
+    const nestedDir = path.join(localDir, "vendor", "lib");
+    await mkdir(nestedDir, { recursive: true });
+    git(nestedDir, "init", "-q");
+    git(nestedDir, "config", "user.email", "test@example.com");
+    git(nestedDir, "config", "user.name", "Test");
+    await writeFile(path.join(nestedDir, "lib.c"), "int lib;\n", "utf8");
+    git(nestedDir, "add", ".");
+    git(nestedDir, "commit", "-q", "-m", "local only");
+    const nestedHead = git(nestedDir, "rev-parse", "HEAD").trim();
+    const remoteRoot = await tempDir("paperclip-ssh-remote-nested-git-");
+
+    const runtime = await prepareRemoteManagedRuntime({
+      spec: spec(remoteRoot),
+      runId: "run-nested-git",
+      adapterKey: "claude",
+      workspaceLocalDir: localDir,
+    });
+    const remoteDir = runtime.workspaceRemoteDir;
+    // The upload drops `.git` at every depth.
+    expect(await exists(path.join(remoteDir, "vendor", "lib", "lib.c"))).toBe(true);
+    expect(await exists(path.join(remoteDir, "vendor", "lib", ".git"))).toBe(false);
+    expect(await exists(path.join(remoteDir, "mods", "sub", ".git"))).toBe(false);
+
+    await writeFile(path.join(remoteDir, "app.swift"), "let a = 2\n", "utf8");
+    await runtime.restoreWorkspace();
+
+    await expect(readFile(path.join(localDir, "app.swift"), "utf8")).resolves.toBe("let a = 2\n");
+    // Missing on the host is not a remote deletion: both `.git` entries stay.
+    await expect(readFile(path.join(localDir, "mods", "sub", ".git"), "utf8")).resolves.toContain("gitdir:");
+    expect(git(nestedDir, "rev-parse", "HEAD").trim()).toBe(nestedHead);
+    const submoduleDir = path.join(localDir, "mods", "sub");
+    expect(git(submoduleDir, "rev-parse", "--show-toplevel").trim()).toBe(await realpath(submoduleDir));
+  });
+
+  it("keeps a nested clone's .git inside a project repository across a restore", async () => {
+    await useFakeSsh("local");
+    const localDir = await gitWorkspace();
+    const repository = `${PROJECT_REPOSITORIES_DIR}/backend-abc123`;
+    const repositoryDir = path.join(localDir, repository);
+    await mkdir(repositoryDir, { recursive: true });
+    git(repositoryDir, "init", "-q");
+    git(repositoryDir, "config", "user.email", "test@example.com");
+    git(repositoryDir, "config", "user.name", "Test");
+    await writeFile(path.join(repositoryDir, "server.ts"), "export const a = 1;\n", "utf8");
+    git(repositoryDir, "add", ".");
+    git(repositoryDir, "commit", "-q", "-m", "init");
+    await writeFile(path.join(localDir, ".git", "info", "exclude"), `/${PROJECT_REPOSITORIES_DIR}/\n`, "utf8");
+    const nestedDir = path.join(repositoryDir, "vendor", "dep");
+    await mkdir(nestedDir, { recursive: true });
+    git(nestedDir, "init", "-q");
+    git(nestedDir, "config", "user.email", "test@example.com");
+    git(nestedDir, "config", "user.name", "Test");
+    await writeFile(path.join(nestedDir, "dep.ts"), "export const dep = 1;\n", "utf8");
+    git(nestedDir, "add", ".");
+    git(nestedDir, "commit", "-q", "-m", "local only");
+    const nestedHead = git(nestedDir, "rev-parse", "HEAD").trim();
+    const remoteRoot = await tempDir("paperclip-ssh-remote-repo-nested-git-");
+
+    const runtime = await prepareRemoteManagedRuntime({
+      spec: spec(remoteRoot),
+      runId: "run-repo-nested-git",
+      adapterKey: "claude",
+      workspaceLocalDir: localDir,
+    });
+    const remoteDir = runtime.workspaceRemoteDir;
+    expect(await exists(path.join(remoteDir, repository, "vendor", "dep", "dep.ts"))).toBe(true);
+    expect(await exists(path.join(remoteDir, repository, "vendor", "dep", ".git"))).toBe(false);
+
+    await writeFile(path.join(remoteDir, repository, "server.ts"), "export const a = 2;\n", "utf8");
+    await runtime.restoreWorkspace();
+
+    await expect(readFile(path.join(repositoryDir, "server.ts"), "utf8")).resolves.toBe("export const a = 2;\n");
+    expect(git(nestedDir, "rev-parse", "HEAD").trim()).toBe(nestedHead);
   });
 
   it("removes a run's remote scratch directory and stops processes started from it", async () => {

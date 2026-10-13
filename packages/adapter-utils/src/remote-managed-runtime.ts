@@ -34,6 +34,18 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
   ".git",
 ].flatMap((entry) => [entry, `${entry}/*`, `*/${entry}`, `*/${entry}/*`]);
 
+// A git-backed upload runs tar with `--exclude .git`, which drops `.git` at every
+// depth: submodules (a `.git` file) and untracked nested clones reach the host
+// without it, and so do the nested `.git` entries inside each project repository.
+// The restore baselines must skip them the same way; otherwise the merge reads
+// their absence on the host as a remote deletion and removes the local `.git`.
+export const GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES = [
+  ...GIT_ARCHIVE_EXCLUDES,
+  "*/.git",
+  "*/.git/*",
+  ".paperclip-runtime",
+];
+
 export interface RemoteManagedRuntimeAsset {
   key: string;
   localDir: string;
@@ -205,8 +217,7 @@ export async function prepareRemoteManagedRuntime(input: {
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
           ? [
-              ...GIT_ARCHIVE_EXCLUDES,
-              ".paperclip-runtime",
+              ...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES,
               ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
               ...ignoredPaths,
             ]
@@ -219,7 +230,7 @@ export async function prepareRemoteManagedRuntime(input: {
     repositoryBaselines.push({
       path: repository,
       baselineSnapshot: await captureDirectorySnapshot(path.join(input.workspaceLocalDir, repository), {
-        exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...repositoryIgnoredPaths],
+        exclude: [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES, ...repositoryIgnoredPaths],
       }),
       ignoredPaths: repositoryIgnoredPaths,
     });

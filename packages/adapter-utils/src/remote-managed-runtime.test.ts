@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,7 +25,8 @@ vi.mock("./ssh.js", () => ({
   syncDirectoryToSsh,
 }));
 
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES, prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 
@@ -402,5 +403,80 @@ describe("remote managed runtime", () => {
     expect(scratchRemovals()).toHaveLength(0);
     prepareWorkspaceForSshExecution.mockReset();
     prepareWorkspaceForSshExecution.mockImplementation(async () => ({ gitBacked: false }) as never);
+  });
+
+  it("keeps nested .git entries that a git-backed upload never sends", async () => {
+    const localDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-local-"));
+    const remoteCopyDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-nested-copy-"));
+    cleanupDirs.push(localDir, remoteCopyDir);
+    // A project repository worktree and a submodule (both `.git` files), and an
+    // untracked nested clone (a `.git` directory).
+    const repository = path.join(".paperclip-repositories", "backend-abc123");
+    const submodule = path.join("mods", "sub");
+    const nestedClone = path.join("vendor", "lib");
+    for (const dir of [repository, submodule, nestedClone]) {
+      await mkdir(path.join(localDir, dir), { recursive: true });
+      await writeFile(path.join(localDir, dir, "README.md"), `${dir}\n`, "utf8");
+    }
+    await writeFile(path.join(localDir, repository, ".git"), "gitdir: /repos/backend/.git/worktrees/abc123\n", "utf8");
+    await writeFile(path.join(localDir, submodule, ".git"), "gitdir: ../../.git/modules/mods/sub\n", "utf8");
+    await mkdir(path.join(localDir, nestedClone, ".git"), { recursive: true });
+    await writeFile(path.join(localDir, nestedClone, ".git", "HEAD"), "ref: refs/heads/main\n", "utf8");
+    await writeFile(path.join(localDir, "main.txt"), "main\n", "utf8");
+
+    const baseline = await captureDirectorySnapshot(localDir, {
+      exclude: [...GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES],
+    });
+
+    // The host copy is what tar --exclude .git uploaded: no .git at any depth.
+    for (const dir of [repository, submodule, nestedClone]) {
+      await mkdir(path.join(remoteCopyDir, dir), { recursive: true });
+      await writeFile(path.join(remoteCopyDir, dir, "README.md"), `${dir}\n`, "utf8");
+    }
+    await writeFile(path.join(remoteCopyDir, "main.txt"), "main edited\n", "utf8");
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: remoteCopyDir, targetDir: localDir });
+
+    await expect(readFile(path.join(localDir, repository, ".git"), "utf8")).resolves.toContain("gitdir:");
+    await expect(readFile(path.join(localDir, submodule, ".git"), "utf8")).resolves.toContain("gitdir:");
+    await expect(readFile(path.join(localDir, nestedClone, ".git", "HEAD"), "utf8")).resolves.toContain("refs/heads/main");
+    await expect(readFile(path.join(localDir, "main.txt"), "utf8")).resolves.toBe("main edited\n");
+  });
+
+  it("excludes nested .git from the anchor and each project repository baseline", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-nested-git-"));
+    cleanupDirs.push(workspaceDir);
+    const repository = ".paperclip-repositories/backend-abc123";
+    await mkdir(path.join(workspaceDir, repository), { recursive: true });
+    prepareWorkspaceForSshExecution.mockResolvedValue({
+      gitBacked: true,
+      ignoredPaths: [],
+      repositories: [repository],
+      repositoryIgnoredPaths: { [repository]: ["dist"] },
+    } as never);
+    try {
+      const prepared = await prepareRemoteManagedRuntime({
+        spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote", remoteCwd: "/remote",
+          privateKey: null, knownHosts: null, strictHostKeyChecking: true },
+        runId: "run-nested-git",
+        adapterKey: "claude",
+        workspaceLocalDir: workspaceDir,
+      });
+      await prepared.restoreWorkspace();
+      expect(restoreWorkspaceFromSshExecution).toHaveBeenLastCalledWith(expect.objectContaining({
+        baselineSnapshot: expect.objectContaining({
+          exclude: expect.arrayContaining(["*/.git", "*/.git/*", ".paperclip-repositories"]),
+        }),
+        repositories: [expect.objectContaining({
+          path: repository,
+          baselineSnapshot: expect.objectContaining({
+            exclude: expect.arrayContaining(["*/.git", "*/.git/*", "dist"]),
+          }),
+        })],
+      }));
+    } finally {
+      prepareWorkspaceForSshExecution.mockReset();
+      prepareWorkspaceForSshExecution.mockImplementation(async () => ({ gitBacked: false }) as never);
+    }
   });
 });
