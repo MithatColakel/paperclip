@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
@@ -277,7 +277,88 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
       eq(activityLog.action, "ai_connection.pool_limit_reached")))).toHaveLength(1);
   });
 
-  it.each(["edited", "deleted", "reassigned", "new_input", "claimed_by_other"] as const)(
+  const quotaFailure = (runId: string) => async (input?: unknown) => {
+    const invocation = input as { onCancellationReady: () => Promise<void>; onDispatch: () => void };
+    await invocation.onCancellationReady();
+    invocation.onDispatch();
+    expect(adapterExecutionControls.has(runId)).toBe(true);
+    return { exitCode: 1, signal: null, timedOut: false, errorMessage: "You've hit your session limit",
+      errorCode: "provider_quota", resultJson: { errorFamily: "provider_quota" },
+      summary: null, provider: "test", model: "test-model" };
+  };
+
+  it("lets newer user input take precedence over the company-pool failover", async () => {
+    const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true, queued: true });
+    const heartbeat = heartbeatService(db);
+    const nextCommentId = randomUUID();
+    const deferredWakes = () => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    mockAdapterExecute.mockReset();
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      // The user replaces the instructions mid-turn; the wake waits on the task claim.
+      await db.insert(issueComments).values({ id: nextCommentId, companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: userId, body: "Stop, use these new instructions instead." });
+      await heartbeat.wakeup(f.agentId, { source: "automation", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: userId, payload: { issueId: f.issueId, commentId: nextCommentId },
+        contextSnapshot: { issueId: f.issueId, commentId: nextCommentId, wakeReason: "issue_commented" } });
+      expect(await deferredWakes()).toHaveLength(1);
+      return quotaFailure(f.runId)(input);
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "New instructions handled.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await heartbeat.getRun(f.runId)).toMatchObject({ status: "failed" });
+    // No successor takes the claim with the older message's authority.
+    expect(await successorsOf(f.runId)).toHaveLength(0);
+    expect(await renewedReceipts(f.issueId)).toHaveLength(0);
+    expect(await deferredWakes()).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${nextCommentId}`))).toHaveLength(1);
+    // The limited account is still marked, so the new turn selects the next one.
+    const [first, second] = await aiConnectionPoolService(db).members(f.companyId, "anthropic");
+    expect(first!.exhaustedUntil!.getTime()).toBeGreaterThan(Date.now());
+    expect(second!.exhaustedUntil).toBeNull();
+  });
+
+  it("leaves a fully limited pool to the provider-quota wait, which renews the user's authorization", async () => {
+    const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true, queued: true });
+    const pool = aiConnectionPoolService(db);
+    const [, second] = await pool.members(f.companyId, "anthropic");
+    await pool.markExhausted({ companyId: f.companyId, connectionId: second!.connectionId,
+      until: new Date(Date.now() + 2 * 60 * 60_000), reason: "provider_quota", source: "run_failure" });
+    // The quota wait is bounded from the turn's creation; start it now.
+    await db.update(heartbeatRuns).set({ createdAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    mockAdapterExecute.mockReset();
+    mockAdapterExecute.mockImplementationOnce(quotaFailure(f.runId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await heartbeat.getRun(f.runId)).toMatchObject({ status: "failed" });
+    // A failover successor would carry the user's authorization into the
+    // ai_connection_busy wait, which refuses it and strands the task.
+    expect(await successorsOf(f.runId)).toHaveLength(0);
+    expect(await renewedReceipts(f.issueId)).toHaveLength(0);
+    expect(await pool.hasAvailableMember(f.companyId, "anthropic")).toBe(false);
+
+    // The recovery sweep parks the task on the provider-quota monitor...
+    await heartbeat.sweepStaleIssueLocks();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const [parked] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(parked!.executionPolicy?.monitor).toMatchObject({
+      serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: f.runId });
+    // ...whose replacement renews the user's authorization after the reset.
+    expect(await heartbeat.tickTimers(new Date(parked!.monitorNextCheckAt!.getTime() + 60_000)))
+      .toMatchObject({ enqueued: 1 });
+    await expectRenewedSuccessor(f, f.runId, "provider_quota_recovery");
+  });
+
+  it.each(["edited", "deleted", "reassigned", "new_input", "deferred_input", "claimed_by_other"] as const)(
     "still refuses both lanes when the user's authorization is gone: %s", async kind => {
       const f = await seedUserContinuedQuotaFailure({ claim: "released", pool: true, quotaMonitor: true });
       let expectedClaim: string | null = null;
@@ -294,6 +375,11 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
       if (kind === "new_input") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
         runtimeMode: "legacy", status: "succeeded", createdAt: new Date(failedAt.getTime() + 60_000),
         finishedAt: new Date(failedAt.getTime() + 120_000), contextSnapshot: { issueId: f.issueId } });
+      // Newer input waits on the task claim; queue-first settlement promotes it.
+      if (kind === "deferred_input") await db.insert(agentWakeupRequests).values({ companyId: f.companyId,
+        agentId: f.agentId, source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: f.issueId, commentId: randomUUID() }, status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: userId });
       // Another live run owns the task; the lane must never take its claim.
       if (kind === "claimed_by_other") {
         const [owner] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,

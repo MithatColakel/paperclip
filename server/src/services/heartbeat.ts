@@ -16709,6 +16709,21 @@ export function heartbeatService(
       runId: run.id,
       details: { provider: provider.data, exhaustedUntil: until.toISOString(), poolPriority: attribution.poolPriority ?? null },
     });
+    // Fork: a successor of a user-continued turn carries the user's
+    // authorization, which the ai_connection_busy wait for a fully limited
+    // pool refuses. Leave the wait to the provider-quota monitor instead.
+    // Approximate: the >=95% usage-window skip is not counted here.
+    if (contextSnapshot.explicitUserContinuation &&
+        !(await pool.hasAvailableMember(run.companyId, provider.data, now))) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Every company AI account is at its usage limit; the provider-quota monitor resumes this task after the reset.",
+        payload: { connectionId, exhaustedUntil: until.toISOString() },
+      });
+      return false;
+    }
     const members = await pool.members(run.companyId, provider.data);
     const failovers = readAiConnectionFailoverCount(contextSnapshot);
     if (failovers >= members.length * 2) {
@@ -27557,7 +27572,9 @@ export function heartbeatService(
           latestRun.contextSnapshot?.explicitUserContinuation) {
         // Fork: the company-pool failover deferred at finalization. It takes
         // precedence over a transient retry on the same limited account; a
-        // refusal leaves the provider-quota wait in charge.
+        // refusal leaves the provider-quota wait in charge. Newer input that
+        // waits on the task claim refuses it, so the settlement below promotes
+        // that input onto the next account.
         const failoverRun = await getRun(latestRun.id, { unsafeFullResultJson: true }).catch(() => null);
         const failoverAgent = failoverRun ? await getAgent(failoverRun.agentId).catch(() => null) : null;
         if (failoverRun && failoverAgent) await scheduleAiConnectionPoolFailover(failoverRun, failoverAgent).catch(err => {

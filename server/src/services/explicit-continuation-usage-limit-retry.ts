@@ -1,5 +1,5 @@
-import { and, eq, isNull } from "drizzle-orm";
-import { issues } from "@paperclipai/db";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { agentWakeupRequests, issues } from "@paperclipai/db";
 import { AI_CONNECTION_FAILOVER_RETRY_REASON } from "../modules/run-dispatch/index.js";
 import { admitExplicitContinuationRetry } from "./explicit-native-continuation.js";
 import { PROVIDER_QUOTA_RECOVERY_RETRY_REASON } from "./recovery/provider-quota-recovery.js";
@@ -22,11 +22,23 @@ export const EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS: ReadonlySet<string
  * would always refuse. If no run holds the claim, lend it to the parent, run
  * the unchanged admission, and take the claim back when admission refuses. A
  * claim that another run holds is never touched.
+ *
+ * Newer input takes precedence: while a wake for this assignee waits on the
+ * task claim, refuse, so queue-first settlement promotes that input instead of
+ * a successor that would carry the older message's authority. A wake held by
+ * the daily cap is skipped here, as the queue drain skips it.
  */
 export async function admitExplicitContinuationUsageLimitRetry(
   input: Parameters<typeof admitExplicitContinuationRetry>[0],
 ) {
-  const { db, companyId, issueId, parentRunId } = input;
+  const { db, companyId, issueId, agentId, parentRunId } = input;
+  const [newerInput] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    sql`${agentWakeupRequests.payload} -> 'dailyCapDeferral' is null`,
+  )).limit(1);
+  if (newerInput) return null;
   const lent = await db.update(issues).set({ executionRunId: parentRunId })
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId), isNull(issues.executionRunId)))
     .returning({ id: issues.id });
