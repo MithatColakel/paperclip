@@ -1251,7 +1251,10 @@ describe("agent permission routes", () => {
       expect.objectContaining({
         status: "idle",
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "agent-admin-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "agent-admin-user", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
     // Board policy: an engineer is not the coordinator, so no default tasks:assign.
     expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
@@ -1327,7 +1330,7 @@ describe("agent permission routes", () => {
       true,
       "board-user",
     );
-    expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
+    expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: false });
   }, 15_000);
 
   it.each([
@@ -1358,11 +1361,7 @@ describe("agent permission routes", () => {
       true,
       "board-user",
     );
-    if (body.onboardingFirstAgent) {
-      expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: true });
-    } else {
-      expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
-    }
+    expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: true });
   }, 15_000);
 
   it("does not treat an agent-sent onboarding marker as the coordinator", async () => {
@@ -1375,10 +1374,27 @@ describe("agent permission routes", () => {
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockAgentService.create).toHaveBeenCalled();
-    expect(mockAgentService.create.mock.calls[0]?.[2]).not.toHaveProperty("coordinator");
-    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
-      companyId, "agent", agentId, "tasks:assign", true, expect.anything(),
-    );
+    expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: false });
+    // An agent actor grants with a null user, which expect.anything() would miss.
+    expect(mockAccessService.setPrincipalPermission.mock.calls
+      .filter((call: unknown[]) => call[3] === "tasks:assign")).toEqual([]);
+  }, 15_000);
+
+  it.each(["agents", "agent-hires"])("does not let an agent create a coordinator by choosing the pm role via %s", async (endpoint) => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockAgentService.create.mockResolvedValue({ ...baseAgent, role: "pm" });
+    const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/${endpoint}`)
+      .send({ name: "Not a coordinator", role: "pm", adapterType: "process", adapterConfig: {} }));
+
+    expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockAgentService.create).toHaveBeenCalled();
+    expect(mockAgentService.create.mock.calls[0]?.[2]).toMatchObject({ coordinator: false });
+    // An agent actor grants with a null user, which expect.anything() would miss.
+    expect(mockAccessService.setPrincipalPermission.mock.calls
+      .filter((call: unknown[]) => call[3] === "tasks:assign")).toEqual([]);
   }, 15_000);
 
   it("rejects unsupported query parameters on the agent list route", async () => {
@@ -1434,7 +1450,10 @@ describe("agent permission routes", () => {
           },
         },
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
   });
 
@@ -1470,7 +1489,10 @@ describe("agent permission routes", () => {
           model: DEFAULT_OPENCODE_LOCAL_MODEL,
         }),
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
   });
 
@@ -1508,7 +1530,10 @@ describe("agent permission routes", () => {
           model: "anthropic/claude-sonnet-4-5",
         }),
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
   });
 
@@ -1554,6 +1579,7 @@ describe("agent permission routes", () => {
           applyExistingWithoutClaim: false,
           inheritedFromAgentId: null,
         },
+        coordinator: false,
       },
     );
   });
@@ -1780,7 +1806,10 @@ describe("agent permission routes", () => {
       expect.objectContaining({
         defaultEnvironmentId: environmentId,
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
   });
 
@@ -1866,7 +1895,10 @@ describe("agent permission routes", () => {
           adapterType: adapterCase.adapterType,
           defaultEnvironmentId: environmentId,
         }),
-        { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+        {
+          claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false },
+          coordinator: false,
+        },
       );
     });
   }

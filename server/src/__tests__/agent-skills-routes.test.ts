@@ -1005,7 +1005,10 @@ describe("agent skill routes", () => {
           }),
         }),
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
     expect(mockTrackAgentCreated).toHaveBeenCalledWith(
       expect.anything(),
@@ -1055,7 +1058,10 @@ describe("agent skill routes", () => {
       expect.objectContaining({
         role: "security",
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false },
+        coordinator: false,
+      },
     );
     expect(mockTrackAgentCreated).toHaveBeenCalledWith(
       expect.anything(),
@@ -1500,6 +1506,7 @@ describe("agent skill routes", () => {
           applyExistingWithoutClaim: false,
           inheritedFromAgentId: null,
         },
+        coordinator: false,
       },
     );
     expect(mockApprovalService.create).toHaveBeenCalledWith(

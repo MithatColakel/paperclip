@@ -17,17 +17,20 @@ import {
 const invitedAgentId = "agent-1";
 const defaultAgentGrants = newStandardAgentDefaultGrantKeys(false).map((permissionKey) => ({
   permissionKey,
-  scope: newStandardAgentGrantScope(permissionKey, invitedAgentId),
+  scope: newStandardAgentGrantScope(permissionKey, invitedAgentId, false),
 }));
 
 describe("agentJoinGrantsFromDefaults", () => {
   it("adds the non-coordinator new-agent grants when invite defaults do not specify grants", () => {
     const grants = agentJoinGrantsFromDefaults(null, invitedAgentId);
     expect(grants).toEqual(defaultAgentGrants);
-    expect(grants).toHaveLength(10);
+    expect(grants).toHaveLength(11);
     for (const permissionKey of COORDINATOR_ONLY_DEFAULT_GRANT_KEYS) {
       expect(grants.map((grant) => grant.permissionKey)).not.toContain(permissionKey);
     }
+    // Board policy: a non-coordinator configures only itself directly.
+    expect(grants.find((grant) => grant.permissionKey === "agents:configure")?.scope)
+      .toEqual({ agentIds: [invitedAgentId] });
   });
 
   it("preserves invite agent grants and appends the missing defaults", () => {
@@ -65,9 +68,9 @@ describe("agentJoinGrantsFromDefaults", () => {
 
   it("preserves an explicit scoped agent configuration grant", () => {
     expect(agentJoinGrantsFromDefaults({
-      agent: { grants: [{ permissionKey: "agents:configure", scope: { agentIds: ["agent-1"] } }] },
+      agent: { grants: [{ permissionKey: "agents:configure", scope: { agentIds: ["agent-2"] } }] },
     }, invitedAgentId)).toEqual([
-      { permissionKey: "agents:configure", scope: { agentIds: ["agent-1"] } },
+      { permissionKey: "agents:configure", scope: { agentIds: ["agent-2"] } },
       ...defaultAgentGrants.filter((grant) => grant.permissionKey !== "agents:configure"),
     ]);
   });

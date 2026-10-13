@@ -51,7 +51,7 @@ export function agentJoinGrantsFromDefaults(
   // An invited agent joins as a "general" worker, never as the coordinator.
   for (const permissionKey of newStandardAgentDefaultGrantKeys(false)) {
     if (!grants.some((grant) => grant.permissionKey === permissionKey)) {
-      grants.push({ permissionKey, scope: newStandardAgentGrantScope(permissionKey, agentId) });
+      grants.push({ permissionKey, scope: newStandardAgentGrantScope(permissionKey, agentId, false) });
     }
   }
   return grants;

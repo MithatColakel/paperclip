@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, companyMemberships, createDb, principalPermissionGrants } from "@paperclipai/db";
+import {
+  agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, principalPermissionGrants,
+} from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET, type PermissionKey } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { authorizeInstructionCommit } from "../services/agent-instruction-authorization.js";
 import { agentService } from "../services/agents.js";
 import { authorizationService } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
@@ -11,14 +14,15 @@ import { agentJoinGrantsFromDefaults } from "../services/invite-grants.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDatabase = support.supported ? describe : describe.skip;
-// Board policy: only the coordinator gets these four by default.
+// Board policy: only the coordinator gets these three by default, and only the
+// coordinator gets agents:configure without a scope (others: scoped to self).
 const coordinatorOnlyGrantKeys: PermissionKey[] = [
-  "agents:configure",
   "tools:manage_connections",
   "tasks:assign",
   "tasks:assign_scope",
 ];
 const expectedNewAgentGrantKeys: PermissionKey[] = [
+  "agents:configure",
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",
@@ -88,12 +92,16 @@ describeDatabase("new agent configuration defaults", () => {
     for (const agent of [standard, peer]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)
         .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+      expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "agents:configure")?.scope)
+        .toEqual({ agentIds: [agent.id] });
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
         .toEqual({ responsibleUserOnly: true });
     }
     for (const agent of [projectManager, chiefOfStaff]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)
         .map((grant) => grant.permissionKey).sort()).toEqual(expectedCoordinatorGrantKeys);
+      expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "agents:configure")?.scope)
+        .toBeNull();
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "tasks:assign_scope")?.scope)
         .toEqual({ subtreeRootAgentId: agent.id });
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
@@ -114,8 +122,9 @@ describeDatabase("new agent configuration defaults", () => {
     for (const permissionKey of expectedCoordinatorGrantKeys) {
       if (permissionKey === "tasks:assign_scope" || permissionKey === "inbox:manage") continue; // These grants require a target scope or the responsible-user inbox path.
       expect(await accessService(db).hasPermission(companyId, "agent", projectManager.id, permissionKey)).toBe(true);
+      // An unscoped check misses the worker's self-scoped agents:configure grant.
       expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey))
-        .toBe(!coordinatorOnlyGrantKeys.includes(permissionKey));
+        .toBe(!coordinatorOnlyGrantKeys.includes(permissionKey) && permissionKey !== "agents:configure");
     }
     expect(await authorizationService(db).decidePrincipalGrant({
       companyId,
@@ -156,7 +165,7 @@ describeDatabase("new agent configuration defaults", () => {
       scope: { requiresChangeGrant: true },
     });
     expect(await decideConfigure(projectManager.id)).toMatchObject({ allowed: true, reason: "allow_direct_change" });
-    expect(await decideConfigure(standard.id)).toMatchObject({ allowed: false });
+    expect(await decideConfigure(standard.id)).toMatchObject({ allowed: false, reason: "deny_missing_consent" });
 
     // A worker without the grant still hands work back to the coordinator by assignment.
     expect(await authorizationService(db).decide({
@@ -243,15 +252,20 @@ describeDatabase("new agent configuration defaults", () => {
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.companyId, companyId))).toEqual([]);
 
-    const grantKeysFor = async (agentId: string) => (await db.select().from(principalPermissionGrants)
-      .where(eq(principalPermissionGrants.principalId, agentId)))
+    const grantsFor = async (agentId: string) => db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.principalId, agentId));
+    const grantKeysFor = async (agentId: string) => (await grantsFor(agentId))
       .map((grant) => grant.permissionKey).sort();
+    const configureScopeFor = async (agentId: string) => (await grantsFor(agentId))
+      .find((grant) => grant.permissionKey === "agents:configure")?.scope;
     const result = await agentService(db).activatePendingApproval(pending.id);
     expect(result?.activated).toBe(true);
     expect(await grantKeysFor(pending.id)).toEqual(expectedNewAgentGrantKeys);
+    expect(await configureScopeFor(pending.id)).toEqual({ agentIds: [pending.id] });
     const coordinatorResult = await agentService(db).activatePendingApproval(pendingCoordinator.id);
     expect(coordinatorResult?.activated).toBe(true);
     expect(await grantKeysFor(pendingCoordinator.id)).toEqual(expectedCoordinatorGrantKeys);
+    expect(await configureScopeFor(pendingCoordinator.id)).toBeNull();
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
@@ -279,10 +293,70 @@ describeDatabase("new agent configuration defaults", () => {
     const grants = await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.principalId, invited.id));
     expect(grants.map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    expect(grants.find((grant) => grant.permissionKey === "agents:configure")?.scope).toEqual({ agentIds: [invited.id] });
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(companies).where(eq(companies.id, companyId));
+  });
+
+  it("lets a new non-coordinator save its own instructions without consent, but not a peer's", async () => {
+    const companyId = randomUUID();
+    const userId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Own instruction edits",
+      issuePrefix: `PO${companyId.slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(authUsers).values({
+      id: userId, name: "Owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date(),
+    });
+    const create = (name: string) => agentService(db).create(companyId, {
+      name,
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    });
+    const worker = await create("Worker");
+    const peer = await create("Peer");
+    await db.insert(companyMemberships).values([
+      { companyId, principalType: "user" as const, principalId: userId, membershipRole: "owner" as const, status: "active" as const },
+      ...[worker, peer].map((agent) => ({
+        companyId,
+        principalType: "agent" as const,
+        principalId: agent.id,
+        membershipRole: "member" as const,
+        status: "active" as const,
+      })),
+    ]);
+    // The responsible user may edit every agent, so the agent's own grants decide.
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "user", principalId: userId, permissionKey: "agents:configure", scope: null,
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId: worker.id, status: "running", responsibleUserId: userId, invocationSource: "automation",
+    }).returning();
+    const actor = { type: "agent" as const, source: "agent_jwt" as const, companyId, agentId: worker.id, runId: run!.id };
+
+    // The agent-directory working copy saves AGENTS.md through this check, as the agent.
+    await expect(authorizeInstructionCommit(db, actor, { companyId, id: worker.id }))
+      .resolves.toMatchObject({ type: "agent", agentId: worker.id, onBehalfOfUserId: userId });
+    await expect(authorizeInstructionCommit(db, actor, { companyId, id: peer.id }))
+      .rejects.toMatchObject({ status: 403 });
+    expect(await authorizationService(db).decide({
+      actor: { type: "agent", agentId: worker.id, companyId, source: "agent_key" },
+      action: "agent_config:update",
+      resource: { type: "agent", agentId: peer.id, companyId },
+      scope: { requiresChangeGrant: true },
+    })).toMatchObject({ allowed: false, reason: "deny_missing_consent" });
+
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
+    await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
+    await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(authUsers).where(eq(authUsers.id, userId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 });

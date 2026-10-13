@@ -22,10 +22,10 @@ export const NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS = [
  * Board policy (skills/paperclip/SKILL.md): only the company's coordinator
  * creates and assigns tasks. Of the defaults above, these go to a new
  * coordinator only. Other agents hand work back by assignment, which the
- * default-open assignment rule allows without a grant.
+ * default-open assignment rule allows without a grant. A non-coordinator's
+ * agents:configure is scoped to itself (see newStandardAgentGrantScope).
  */
 export const COORDINATOR_ONLY_DEFAULT_GRANT_KEYS = [
-  "agents:configure",
   "tools:manage_connections",
   "tasks:assign",
   "tasks:assign_scope",
@@ -45,7 +45,11 @@ export function newStandardAgentDefaultGrantKeys(coordinator: boolean): readonly
 export function newStandardAgentGrantScope(
   permissionKey: PermissionKey,
   agentId: string,
+  coordinator: boolean,
 ): Record<string, unknown> | null {
+  // Board policy: a non-coordinator saves its own instruction files without a
+  // consent gate, but changes a peer only through agents:suggest-changes.
+  if (permissionKey === "agents:configure" && !coordinator) return { agentIds: [agentId] };
   if (permissionKey === "tasks:assign_scope") return { subtreeRootAgentId: agentId };
   if (permissionKey === "inbox:manage") return { responsibleUserOnly: true };
   return null;

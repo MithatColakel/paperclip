@@ -131,8 +131,10 @@ interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; memberConnectionIds?: string[]; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
-  // The board-authored onboarding first agent (chief-of-staff persona) is the
-  // coordinator and gets the coordinator's default grants, like a "pm" hire.
+  // Whether the new agent is the coordinator (board policy). Routes set it
+  // from the actor: only the board makes a coordinator, either a "pm" hire or
+  // the onboarding first agent (chief-of-staff persona). When unset, a "pm"
+  // role decides.
   coordinator?: boolean;
 }
 
@@ -953,13 +955,14 @@ export function agentService(db: Db) {
         // Low-trust and bundled agents keep their explicit, narrower grants.
         if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
             !readBuiltInAgentMarker(created.metadata)) {
+          const coordinator = options?.coordinator ?? isCoordinatorAgentRole(role);
           await tx.insert(principalPermissionGrants).values(
-            newStandardAgentDefaultGrantKeys(options?.coordinator === true || isCoordinatorAgentRole(role)).map((permissionKey) => ({
+            newStandardAgentDefaultGrantKeys(coordinator).map((permissionKey) => ({
               companyId,
               principalType: "agent" as const,
               principalId: created.id,
               permissionKey,
-              scope: newStandardAgentGrantScope(permissionKey, created.id),
+              scope: newStandardAgentGrantScope(permissionKey, created.id, coordinator),
             })),
           ).onConflictDoNothing();
         }
@@ -1176,13 +1179,15 @@ export function agentService(db: Db) {
         }
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
+          // The board approves this activation, so the role alone decides.
+          const coordinator = isCoordinatorAgentRole(updated.role);
           await tx.insert(principalPermissionGrants).values(
-            newStandardAgentDefaultGrantKeys(isCoordinatorAgentRole(updated.role)).map((permissionKey) => ({
+            newStandardAgentDefaultGrantKeys(coordinator).map((permissionKey) => ({
               companyId: updated.companyId,
               principalType: "agent" as const,
               principalId: updated.id,
               permissionKey,
-              scope: newStandardAgentGrantScope(permissionKey, updated.id),
+              scope: newStandardAgentGrantScope(permissionKey, updated.id, coordinator),
             })),
           ).onConflictDoNothing();
         }
