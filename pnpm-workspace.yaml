@@ -13,6 +13,10 @@ packages:
   # pnpm-lock.yaml stays byte-identical to the official image (the prod
   # overlay build checks lockfile parity and installs with --frozen-lockfile).
   - "!packages/plugins/roadmap"
+  # Fork-owned Mac Fleet plugin: a separate nested repository checked out at
+  # packages/plugins/mac-fleet. Excluded for the same reason, so a checkout
+  # that has it on disk still resolves the official lockfile unchanged.
+  - "!packages/plugins/mac-fleet"
   - server
   - ui
   - cli
