@@ -186,6 +186,8 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        // Pinned: these cases cover SSH execution, not the default model, whose CLI version probe adds a call.
+        model: "claude-opus-5",
         command: "claude",
         instructionsFilePath: instructionsPath,
         env: {
@@ -318,6 +320,8 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        // Pinned: these cases cover SSH execution, not the default model, whose CLI version probe adds a call.
+        model: "claude-opus-5",
         command: "claude",
       },
       context: {
@@ -380,6 +384,8 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        // Pinned: these cases cover SSH execution, not the default model, whose CLI version probe adds a call.
+        model: "claude-opus-5",
         command: "claude",
       },
       context: {
@@ -448,6 +454,8 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        // Pinned: these cases cover SSH execution, not the default model, whose CLI version probe adds a call.
+        model: "claude-opus-5",
         command: "claude",
       },
       context: {
@@ -654,6 +662,8 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        // Pinned: these cases cover SSH execution, not the default model, whose CLI version probe adds a call.
+        model: "claude-opus-5",
         command: "claude",
         env: { ANTHROPIC_API_KEY: "fixture-anthropic-key" },
       },

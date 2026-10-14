@@ -1,3 +1,5 @@
+// These cases cover probe and startup diagnostics, not the default model, so they pin
+// claude-opus-5: a model with a minimum CLI version adds a version probe call.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 
@@ -109,7 +111,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sandboxTarget,
       environmentName: "Daytona",
     });
@@ -130,7 +132,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sshTarget,
       environmentName: "Remote host",
     });

@@ -1,3 +1,5 @@
+// These cases cover environment diagnostics, not the default model, so they pin
+// claude-opus-5: a model with a minimum CLI version adds a version probe call.
 import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -107,7 +109,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd: process.cwd(),
@@ -133,7 +135,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd: process.cwd(),
@@ -161,7 +163,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd: process.cwd(),
@@ -189,7 +191,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd: process.cwd(),
@@ -220,7 +222,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd: process.cwd(),
@@ -245,7 +247,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
         cwd,
@@ -263,7 +265,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: process.execPath,
       },
@@ -304,7 +306,7 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: {
+      config: { model: "claude-opus-5",
         engine: "cli",
         command: "claude",
       },
@@ -413,7 +415,7 @@ console.log(JSON.stringify({ type: "result", result: "hello", usage: { input_tok
       const result = await testEnvironment({
         companyId: "company-1",
         adapterType: "claude_local",
-        config: {
+        config: { model: "claude-opus-5",
           engine: "cli",
           command: commandPath,
           env: { HOME: remoteHome },
@@ -449,7 +451,7 @@ console.log(JSON.stringify({ type: "result", result: "hello", usage: { input_tok
       const result = await testEnvironment({
         companyId: "company-1",
         adapterType: "claude_local",
-        config: {
+        config: { model: "claude-opus-5",
           engine: "cli",
           command: commandPath,
           cwd: workspace,
