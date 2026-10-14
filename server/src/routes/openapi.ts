@@ -10,6 +10,12 @@ import {
   aiConnectionPoolConfigSchema,
   aiProviderSchema,
   replaceAiConnectionPoolSchema,
+  createAiAccountHostSchema,
+  updateAiAccountHostSchema,
+  setAiAccountHostEnvironmentsSchema,
+  createAiAccountSchema,
+  updateAiAccountSchema,
+  setAiAccountProjectsSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -1364,6 +1370,16 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/pool",
   "PUT /api/companies/{companyId}/ai-connections/pool",
   "POST /api/companies/{companyId}/ai-connections/pool/{connectionId}/clear-limit",
+  "GET /api/instance/ai-hosts",
+  "POST /api/instance/ai-hosts",
+  "PATCH /api/instance/ai-hosts/{hostId}",
+  "DELETE /api/instance/ai-hosts/{hostId}",
+  "PUT /api/instance/ai-hosts/{hostId}/environments",
+  "POST /api/instance/ai-hosts/{hostId}/accounts",
+  "PATCH /api/instance/ai-accounts/{accountId}",
+  "PUT /api/instance/ai-accounts/{accountId}/projects",
+  "POST /api/instance/ai-accounts/{accountId}/clear-limit",
+  "DELETE /api/instance/ai-accounts/{accountId}",
 
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
@@ -10506,6 +10522,94 @@ registerCurrentRoute({
   path: "/api/companies/{companyId}/ai-connections/pool/{connectionId}/clear-limit",
   tags: ["ai-connections"],
   summary: "Make a usage-limited pool account available again",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+// --- Host Claude account pools (fork) ----------------------------------------
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/instance/ai-hosts",
+  tags: ["ai-accounts"],
+  summary: "List execution hosts with their Claude accounts, environments, usage and projects (instance admin)",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/ai-hosts",
+  tags: ["ai-accounts"],
+  summary: "Create an execution host for Claude accounts (instance admin)",
+  body: createAiAccountHostSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/instance/ai-hosts/{hostId}",
+  tags: ["ai-accounts"],
+  summary: "Rename a host, change its account limit or overflow rule (instance admin)",
+  body: updateAiAccountHostSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/instance/ai-hosts/{hostId}",
+  tags: ["ai-accounts"],
+  summary: "Remove a host and its accounts (instance admin)",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/instance/ai-hosts/{hostId}/environments",
+  tags: ["ai-accounts"],
+  summary: "Replace the environments that run on a host (instance admin)",
+  body: setAiAccountHostEnvironmentsSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/ai-hosts/{hostId}/accounts",
+  tags: ["ai-accounts"],
+  summary: "Add a Claude setup token or API key to a host; at most three per host (instance admin)",
+  body: createAiAccountSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/instance/ai-accounts/{accountId}",
+  tags: ["ai-accounts"],
+  summary: "Rename an account, switch it in or out of the pool, or set it active again (instance admin)",
+  body: updateAiAccountSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/instance/ai-accounts/{accountId}/projects",
+  tags: ["ai-accounts"],
+  summary: "Reserve an account for projects; an empty list makes it shared (instance admin)",
+  body: setAiAccountProjectsSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/instance/ai-accounts/{accountId}/clear-limit",
+  tags: ["ai-accounts"],
+  summary: "Make a usage-limited host account available again (instance admin)",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/instance/ai-accounts/{accountId}",
+  tags: ["ai-accounts"],
+  summary: "Remove an account from its host (instance admin)",
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
