@@ -1168,6 +1168,10 @@ export function connectionIntentService(db: Db) {
     requestForRunAuthFailure: async (runId: string) => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (!run || run.status !== "failed" || !isAiAuthenticationFailure(run.errorCode) || !run.responsibleUserId) return null;
+      // Fork: a host-pool credential is an instance account, repaired in
+      // Instance settings → Claude accounts; the run already moved to another
+      // account of the host, so no personal reconnect request is opened.
+      if (record(run.contextSnapshot?.aiConnection)?.mode === "host_pool") return null;
       const context = await loadRunContext({ sub: run.agentId, company_id: run.companyId, run_id: run.id, responsible_user_id: run.responsibleUserId }, true);
       const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, run.companyId),

@@ -2143,6 +2143,13 @@
       "when": 1791882242616,
       "tag": "0307_many_the_fury",
       "breakpoints": true
+    },
+    {
+      "idx": 308,
+      "version": "7",
+      "when": 1791972189545,
+      "tag": "0308_spicy_silk_fever",
+      "breakpoints": true
     }
   ]
 }

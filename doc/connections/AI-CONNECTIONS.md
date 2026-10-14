@@ -113,6 +113,44 @@ pool and clear a recorded limit; both write activity (`ai_connection.pool_update
 `ai_connection.pool_limit_reached`. Run detail shows the pool position that
 served the run.
 
+## Host account pools (fork)
+
+A host is a machine that runs agents: the Paperclip server (the single Local
+environment), a runner server (its SSH environments), or a Mac reached over SSH.
+Instance admins manage hosts in Instance settings → Claude accounts
+(`/api/instance/ai-hosts`). Each host holds at most three credentials, and a
+credential (by fingerprint) or an account email lives on one host only.
+
+- **Who uses it.** Every `claude_local` run without an explicit
+  `runtimeConfig.aiConnection` whose environment is mapped to a host with at least
+  one pool-enabled account. An explicit binding still wins. Mac Fleet sandboxes are
+  not covered: the Mac agent replaces any token Paperclip sends with its own login.
+- **Credential types.** A subscription token from `claude setup-token`
+  (delivered as `CLAUDE_CODE_OAUTH_TOKEN`) or a Claude Console API key (delivered as
+  `ANTHROPIC_API_KEY`). The run's other auth variables are blanked, and every env
+  layer's own auth variables are stripped, so an environment's old token cannot
+  leak in. No `HOME` or `CLAUDE_CONFIG_DIR` rewrite happens, so SSH runs work.
+- **Balanced selection.** Among active, pool-enabled accounts whose limit has
+  passed, the run takes the one serving the fewest running host-pool runs, then the
+  least recently picked. Selection holds a row lock on the host.
+- **Usage limits.** A host-pool run that ends with `provider_quota` rests its
+  account until the provider's reset (60 minutes without one; 24 hours for an API key
+  whose credit balance ran out) and retries at once with reason
+  `ai_connection_failover`, capped at twice the host's account count. When every
+  account rests, the run waits for the earliest reset through the `ai_connection_busy`
+  deferral. A sign-in failure marks the account `auth_failed` and moves the task to
+  another account; an admin sets it active again after fixing it.
+- **Attribution and audit.** `contextSnapshot.aiConnection` records `mode:
+  "host_pool"`, the account and the host; the run log shows which account served the
+  run. `ai_account.limit_reached` and `ai_account.auth_failed` are logged in the run's
+  company; host and account changes are logged in every company.
+- **Imports.** An admin can add the server's own `CLAUDE_CODE_OAUTH_TOKEN` or their
+  own personal Claude connection from any company without the value reaching the
+  browser.
+- **Terms.** Anthropic's documentation allows API keys managed by the customer for
+  its own authorized users, and describes subscription sign-in (OAuth) as intended
+  for the purchaser's ordinary use. Prefer API keys on shared hosts.
+
 ## Storage and API
 
 AI connections pair `connectionPurpose: ai` with `transport: runtime_auth`.

@@ -2,7 +2,7 @@ import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
-import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
+import { isAiAuthenticationBlocked, isAiAuthenticationFailure } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -40,10 +40,11 @@ import { admitExplicitContinuationUsageLimitRetry, EXPLICIT_CONTINUATION_USAGE_L
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS, aiConnectionBindingSchema, aiProviderSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
+import { AI_ACCOUNT_CREDIT_BALANCE_COOLDOWN_MS, AI_ACCOUNT_DEFAULT_LIMIT_COOLDOWN_MS, AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS, aiConnectionBindingSchema, aiProviderSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import { aiConnectionPoolRetryAt, aiConnectionPoolService, isAiConnectionPoolExhausted } from "./ai-connection-pool.js";
+import { aiAccountHostService, HOST_POOL_AUTH_ENV_KEYS, HOST_POOL_FORBIDDEN_ROUTING_ENV_KEYS, isCreditBalanceFailure } from "./ai-account-hosts.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
@@ -16669,6 +16670,102 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
+  // Fork: a host-pool account that hit its usage limit (or whose sign-in
+  // failed) rests, and the run moves at once to another account of the same
+  // host (doc/plans/2026-10-14-host-ai-account-pools.md). Returns false when
+  // the normal retry or the provider-quota wait should handle the failure.
+  async function scheduleHostPoolFailover(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    failure:
+      | { kind: "provider_quota"; retryNotBefore: Date | null }
+      | { kind: "credit_balance" }
+      | { kind: "auth_failed"; message: string },
+  ): Promise<boolean> {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const attribution = parseObject(contextSnapshot.aiConnection);
+    const accountId = readNonEmptyString(attribution.accountId);
+    const hostId = readNonEmptyString(attribution.hostId);
+    if (attribution.mode !== "host_pool" || !accountId || !hostId) return false;
+    const accounts = aiAccountHostService(db);
+    const now = new Date();
+    let until: Date | null = null;
+    if (failure.kind === "auth_failed") {
+      await accounts.markAuthFailed({ accountId, message: failure.message });
+    } else {
+      until = failure.kind === "credit_balance"
+        ? new Date(now.getTime() + AI_ACCOUNT_CREDIT_BALANCE_COOLDOWN_MS)
+        : failure.retryNotBefore && failure.retryNotBefore.getTime() > now.getTime()
+          ? failure.retryNotBefore
+          : new Date(now.getTime() + AI_ACCOUNT_DEFAULT_LIMIT_COOLDOWN_MS);
+      await accounts.markLimited({ accountId, until, reason: failure.kind, runId: run.id });
+    }
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: failure.kind === "auth_failed" ? "ai_account.auth_failed" : "ai_account.limit_reached",
+      entityType: "ai_account",
+      entityId: accountId,
+      agentId: agent.id,
+      runId: run.id,
+      details: {
+        host: attribution.hostName ?? null,
+        account: attribution.accountName ?? null,
+        reason: failure.kind,
+        ...(until ? { exhaustedUntil: until.toISOString() } : {}),
+      },
+    });
+    const accountLabel = String(attribution.accountName ?? "This Claude account");
+    const hostLabel = String(attribution.hostName ?? "this host");
+    if (contextSnapshot.explicitUserContinuation && !(await accounts.hasAvailableAccount(hostId, now, readNonEmptyString(contextSnapshot.projectId) ?? null))) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: `Every Claude account on ${hostLabel} is unavailable; the provider-quota monitor resumes this task after the reset.`,
+        payload: { accountId, ...(until ? { exhaustedUntil: until.toISOString() } : {}) },
+      });
+      return false;
+    }
+    const poolSize = await accounts.countPoolAccounts(hostId);
+    const failovers = readAiConnectionFailoverCount(contextSnapshot);
+    if (poolSize === 0 || failovers >= Math.max(1, poolSize) * 2) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `This task already moved between the Claude accounts on ${hostLabel} too often; it now waits like any usage-limited run.`,
+        payload: { accountId, failovers },
+      });
+      return false;
+    }
+    // Delay 0: runtime preparation picks another account of the host, or
+    // waits for the earliest reset when every account is limited.
+    const retry = await scheduleBoundedRetryForRun(run, agent, {
+      now,
+      retryReason: AI_CONNECTION_FAILOVER_RETRY_REASON,
+      wakeReason: "ai_connection_failover_retry",
+      maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
+      delayMs: 0,
+    });
+    const what = failure.kind === "auth_failed"
+      ? `${accountLabel} could not sign in and is out of the pool until it is fixed`
+      : failure.kind === "credit_balance"
+        ? `${accountLabel} has no API credit left`
+        : `${accountLabel} reached its usage limit until ${until!.toISOString()}`;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: retry.outcome === "scheduled"
+        ? `${what}. The task continues with another Claude account on ${hostLabel}.`
+        : `${what}. The task could not move to another account.`,
+      payload: { accountId, reason: failure.kind, retryOutcome: retry.outcome, ...(until ? { exhaustedUntil: until.toISOString() } : {}) },
+    });
+    return retry.outcome === "scheduled";
+  }
+
   // A company-pool account that hit its usage limit is skipped until its reset,
   // and the run moves to the company's next account at once instead of
   // waiting. Returns false when the normal bounded retry should handle the
@@ -16681,6 +16778,12 @@ export function heartbeatService(
     if (recovery?.errorFamily !== "provider_quota") return false;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const attribution = parseObject(contextSnapshot.aiConnection);
+    if (attribution.mode === "host_pool") {
+      const limitText = [run.error, run.stderrExcerpt, run.stdoutExcerpt].filter(Boolean).join("\n");
+      return scheduleHostPoolFailover(run, agent, isCreditBalanceFailure(limitText)
+        ? { kind: "credit_balance" }
+        : { kind: "provider_quota", retryNotBefore: recovery.retryNotBefore ?? null });
+    }
     const connectionId = readNonEmptyString(attribution.connectionId);
     const provider = aiProviderSchema.safeParse(attribution.provider);
     if (attribution.mode !== "company_pool" || !connectionId || !provider.success) return false;
@@ -22410,9 +22513,21 @@ export function heartbeatService(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
 
+      // Fork: an unbound claude_local run on a host with a Claude account pool
+      // takes its credential from that pool (doc/plans/2026-10-14-host-ai-account-pools.md).
+      const hostPoolHost = !aiBinding && agent.adapterType === "claude_local"
+        ? await aiAccountHostService(db).poolHostForEnvironment(selectedEnvironmentForConfig)
+        : null;
+      const stripAiAuth = Boolean(aiBinding) || Boolean(hostPoolHost);
+      if (!hostPoolHost && !aiBinding && parseObject(context.aiConnection).mode === "host_pool") {
+        // A retry copies its source run's context; drop a host-pool attribution
+        // this run will not use, so a later failure cannot rest that account.
+        delete context.aiConnection;
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) - 'aiConnection'` }).where(eq(heartbeatRuns.id, run.id));
+      }
       const { resolvedConfig, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
-          managedAiCredentials: Boolean(aiBinding),
+          managedAiCredentials: stripAiAuth,
           managedGitHubCredentials: !useHostGitHub,
           companyId: agent.companyId,
           agentId: agent.id,
@@ -22420,18 +22535,74 @@ export function heartbeatService(
           issueId,
           heartbeatRunId: run.id,
           environmentId: selectedEnvironmentForConfig?.id ?? null,
-          environmentEnv: aiBinding ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
+          environmentEnv: stripAiAuth ? stripAiAuthBindings(selectedEnvironmentForConfig?.envVars) : selectedEnvironmentForConfig?.envVars ?? null,
           environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
           projectId: projectContext?.id ?? null,
           routineId: routineEnvContext.routineId,
           responsibleUserId,
-          executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
-          projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
-          routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
+          executionRunConfig: stripAiAuth ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+          projectEnv: stripAiAuth ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
+          routineEnv: stripAiAuth ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
           secretsSvc,
           trustPreset,
         });
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
+      if (hostPoolHost) {
+        // A pool credential goes only to Anthropic and only where no project
+        // or argument overrides authentication (same guards as managed bindings).
+        const routedEnv = parseObject(resolvedConfig.env);
+        const routedKey = HOST_POOL_FORBIDDEN_ROUTING_ENV_KEYS.find((key) => {
+          const value = routedEnv[key];
+          return typeof value === "string" ? value.trim().length > 0 : value != null && value !== false;
+        });
+        let incompatible: string | null = routedKey
+          ? `${routedKey} is set for this agent, so the ${hostPoolHost.name} Claude account pool cannot serve it. Remove the provider routing override.`
+          : null;
+        if (!incompatible) {
+          try { await assertManagedAiProjectAuth(resolvedConfig, "anthropic"); }
+          catch { incompatible = `Project or argument authentication conflicts with the ${hostPoolHost.name} Claude account pool.`; }
+        }
+        if (incompatible) {
+          throw new ConfigurationIncompleteFailure(incompatible, {
+            configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime`, fingerprint: `ai-host-incompatible:${agent.id}` },
+          });
+        }
+        let pick: Awaited<ReturnType<ReturnType<typeof aiAccountHostService>["selectForRun"]>>;
+        try {
+          pick = await aiAccountHostService(db).selectForRun({ host: hostPoolHost, runId: run.id, projectId: projectContext?.id ?? null });
+        } catch (error) {
+          if (isAiConnectionPoolExhausted(error) && !persistedNativeExecutionInput) {
+            const authorizedNonAssigneeWake =
+              parseObject(run.runnerProfileJson).aiConnectionNonAssigneeCommentWake === true ||
+              (run.scheduledRetryReason === AI_CONNECTION_BUSY_RETRY_REASON &&
+                isNonAssigneeWorkspaceBusyRetry(run.scheduledRetryReason, parseObject(run.contextSnapshot)));
+            const poolRetryAt = aiConnectionPoolRetryAt(error);
+            await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake, {
+              delayMs: poolRetryAt ? Math.max(0, poolRetryAt.getTime() - Date.now()) : AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS,
+              waitMessage: `Every Claude account on ${hostPoolHost.name} is at its usage limit. This task resumes${poolRetryAt ? ` at ${poolRetryAt.toISOString()}` : " when an account is available"}.`,
+            });
+            return;
+          }
+          throw new ConfigurationIncompleteFailure(error instanceof Error ? error.message : `No Claude account on ${hostPoolHost.name} can serve this run`, {
+            configurationIncomplete: { reason: "ai_connection_unavailable", companyId: agent.companyId, agentId: agent.id, responsibleUserId,
+              provider: "anthropic", actionUrl: "/instance/settings/ai-accounts", fingerprint: `ai-host:${hostPoolHost.id}` },
+          });
+        }
+        const env = { ...parseObject(resolvedConfig.env) };
+        for (const key of HOST_POOL_AUTH_ENV_KEYS) env[key] = "";
+        env[pick.envKey] = pick.value;
+        resolvedConfig.env = env;
+        for (const key of HOST_POOL_AUTH_ENV_KEYS) secretKeys.add(key);
+        // selectForRun already wrote the attribution to the run under the host lock.
+        context.aiConnection = pick.attribution;
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message: `Using Claude account "${pick.attribution.accountName}" (${pick.attribution.method === "api_key" ? "API key" : "subscription"}) on ${pick.attribution.hostName}${pick.attribution.scope === "project" ? ", reserved for this project" : pick.attribution.scope === "overflow" ? ", borrowed from another project because this project's accounts are unavailable" : ""}`,
+          payload: { accountId: pick.attribution.accountId, hostId: pick.attribution.hostId, method: pick.attribution.method, scope: pick.attribution.scope },
+        });
+      }
       if (aiBinding) {
         try {
           managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
@@ -23518,6 +23689,10 @@ export function heartbeatService(
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
+      } else if (hostPoolHost) {
+        // Fork: the realized workspace (local or remote) must not override the pool credential either.
+        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, "anthropic", executionTarget); }
+        catch { throw new ConfigurationIncompleteFailure(`Project authentication conflicts with the ${hostPoolHost.name} Claude account pool`, { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       }
       const remoteExecution = realizationResult.remoteExecution;
       if (
@@ -26630,6 +26805,20 @@ export function heartbeatService(
             }
           } else if (
             outcome === "failed" &&
+            isAiAuthenticationFailure(livenessRun.errorCode) &&
+            parseObject(parseObject(livenessRun.contextSnapshot).aiConnection).mode === "host_pool" &&
+            // A user-continued legacy turn renews its authorization only after
+            // cleanup; that move happens in the post-cleanup block below.
+            !(livenessRun.runtimeMode === "legacy" && Boolean(livenessRun.contextSnapshot?.explicitUserContinuation))
+          ) {
+            // Fork: a host-pool credential that cannot sign in leaves the pool,
+            // and the task moves to another account of the same host.
+            await scheduleHostPoolFailover(livenessRun, agent, {
+              kind: "auth_failed",
+              message: livenessRun.error ?? "Claude sign-in failed",
+            });
+          } else if (
+            outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
           ) {
             await scheduleInteractionContinuationInfrastructureRetryIfEligible(
@@ -27580,6 +27769,15 @@ export function heartbeatService(
         if (failoverRun && failoverAgent) await scheduleAiConnectionPoolFailover(failoverRun, failoverAgent).catch(err => {
           logger.error({ err, runId: run.id }, "failed to fail over an explicit continuation after cleanup");
         });
+        if (failoverRun && failoverAgent && isAiAuthenticationFailure(failoverRun.errorCode) &&
+            parseObject(parseObject(failoverRun.contextSnapshot).aiConnection).mode === "host_pool") {
+          await scheduleHostPoolFailover(failoverRun, failoverAgent, {
+            kind: "auth_failed",
+            message: failoverRun.error ?? "Claude sign-in failed",
+          }).catch(err => {
+            logger.error({ err, runId: run.id }, "failed to move an explicit continuation to another host-pool account after cleanup");
+          });
+        }
       }
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
           latestRun.contextSnapshot?.explicitUserContinuation) {

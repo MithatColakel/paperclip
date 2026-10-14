@@ -166,6 +166,14 @@ describe("isClaudeModelNotFoundError", () => {
   });
 });
 
+describe("API credit exhaustion", () => {
+  it("classifies an API key without credit as provider quota, not as a transient upstream error", () => {
+    const parsed = { is_error: true, result: "Credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits." };
+    expect(isClaudeProviderQuotaError({ parsed })).toBe(true);
+    expect(isClaudeTransientUpstreamError({ parsed })).toBe(false);
+  });
+});
+
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as provider quota", () => {
     expect(

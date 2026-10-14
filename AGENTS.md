@@ -79,6 +79,14 @@ keyed by user and announcement so they persist across companies. Their audit
 context must still validate company membership. The announcement publication-ID
 registry is instance-level feed metadata; it contains no company or user data.
 
+Explicit exception (fork): host AI account pools (`ai_account_hosts`,
+`ai_account_host_environments`, `ai_accounts`) are instance-level. A machine
+that runs agents serves every company's runs, so its Claude credentials and
+their usage limits belong to the machine, not to a company. Only instance
+admins read or change them; every change is logged in every company, and each
+run's use, limit and sign-in failure is logged in the run's own company. See
+`doc/connections/AI-CONNECTIONS.md` ("Host account pools").
+
 2. Keep contracts synchronized.
 If you change schema/API behavior, update all impacted layers:
 - `packages/db` schema and exports
