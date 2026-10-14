@@ -33,6 +33,8 @@ describe("aiAccountState", () => {
     expect(aiAccountState({ ...base, ...limited, status: "auth_failed", statusMessage: "Token revoked" }, NOW))
       .toEqual({ kind: "auth_failed", message: "Token revoked" });
     expect(aiAccountState({ ...base, ...limited, status: "disabled" }, NOW)).toEqual({ kind: "disabled" });
+    expect(aiAccountState({ ...base, poolEnabled: false }, NOW)).toEqual({ kind: "out_of_pool" });
+    expect(aiAccountState({ ...base, poolEnabled: false, ...limited }, NOW)).toMatchObject({ kind: "limited" });
   });
 });
 

@@ -67,11 +67,12 @@ export type AiAccountState =
   | { kind: "available" }
   | { kind: "limited"; until: string; reason: AiAccountLimitReason | null }
   | { kind: "auth_failed"; message: string | null }
-  | { kind: "disabled" };
+  | { kind: "disabled" }
+  | { kind: "out_of_pool" };
 
 /** One state per account, in the order an operator needs to act on it. */
 export function aiAccountState(
-  account: Pick<AiAccountSummary, "status" | "statusMessage" | "exhaustedUntil" | "limitReason">,
+  account: Pick<AiAccountSummary, "status" | "statusMessage" | "exhaustedUntil" | "limitReason"> & { poolEnabled?: boolean },
   now = Date.now(),
 ): AiAccountState {
   if (account.status === "disabled") return { kind: "disabled" };
@@ -79,6 +80,7 @@ export function aiAccountState(
   if (account.exhaustedUntil && new Date(account.exhaustedUntil).getTime() > now) {
     return { kind: "limited", until: account.exhaustedUntil, reason: account.limitReason };
   }
+  if (account.poolEnabled === false) return { kind: "out_of_pool" };
   return { kind: "available" };
 }
 

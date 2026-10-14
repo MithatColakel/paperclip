@@ -427,6 +427,8 @@ function AccountStateBadge({ account }: { account: AiAccountSummary }) {
       return <Badge variant="destructive">Sign-in failed</Badge>;
     case "disabled":
       return <Badge variant="outline">Switched off</Badge>;
+    case "out_of_pool":
+      return <Badge variant="outline">Not in pool</Badge>;
   }
 }
 
