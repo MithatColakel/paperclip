@@ -87,12 +87,14 @@ describe("CompanySettingsNav", () => {
     expect(getCompanySettingsTab("/company/settings/instance/experimental")).toBe("instance-experimental");
     expect(getCompanySettingsTab("/PAP/company/settings/instance/plugins/example")).toBe("instance-plugins");
     expect(getCompanySettingsTab("/company/settings/instance/adapters")).toBe("instance-adapters");
+    expect(getCompanySettingsTab("/PAP/company/settings/instance/ai-accounts")).toBe("instance-ai-accounts");
   });
 
   function renderNav(
     root: ReturnType<typeof createRoot>,
     hiddenSettings?: string[],
     cloud?: { managed: boolean },
+    boardAccess?: { isInstanceAdmin: boolean; source: string },
   ) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(queryKeys.health, {
@@ -100,6 +102,7 @@ describe("CompanySettingsNav", () => {
       ...(hiddenSettings ? { hiddenSettings } : {}),
       ...(cloud ? { cloud } : {}),
     });
+    if (boardAccess) queryClient.setQueryData(queryKeys.access.currentBoardAccess, boardAccess);
     root.render(
       <QueryClientProvider client={queryClient}>
         <CompanySettingsNav />
@@ -146,6 +149,35 @@ describe("CompanySettingsNav", () => {
 
     await act(async () => {
       root.unmount();
+    });
+  });
+
+  it("offers the Claude accounts tab to instance admins only", async () => {
+    currentPathname = "/PAP/company/settings/instance/ai-accounts";
+    const root = createRoot(container);
+
+    await act(async () => {
+      renderNav(root, undefined, undefined, { isInstanceAdmin: true, source: "session" });
+    });
+
+    const adminTabs = pageTabBarMock.mock.calls.at(-1)?.[0];
+    expect(adminTabs?.value).toBe("instance-ai-accounts");
+    expect(adminTabs?.items).toContainEqual({ value: "instance-ai-accounts", label: "Claude accounts" });
+
+    await act(async () => {
+      root.unmount();
+    });
+
+    const memberRoot = createRoot(container);
+    await act(async () => {
+      renderNav(memberRoot, undefined, undefined, { isInstanceAdmin: false, source: "session" });
+    });
+
+    expect(pageTabBarMock.mock.calls.at(-1)?.[0]?.items?.map((item: { value: string }) => item.value))
+      .not.toContain("instance-ai-accounts");
+
+    await act(async () => {
+      memberRoot.unmount();
     });
   });
 

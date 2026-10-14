@@ -25,6 +25,10 @@ describe("normalizeRememberedInstanceSettingsPath", () => {
     expect(normalizeRememberedInstanceSettingsPath("/PAP/company/settings/instance/adapters")).toBe(
       "/company/settings/instance/adapters",
     );
+    // Host-pool run failures link here (server actionUrl).
+    expect(normalizeRememberedInstanceSettingsPath("/instance/settings/ai-accounts")).toBe(
+      "/company/settings/instance/ai-accounts",
+    );
     expect(normalizeRememberedInstanceSettingsPath("/company/settings/instance/general")).toBe(
       "/company/settings/instance/general",
     );

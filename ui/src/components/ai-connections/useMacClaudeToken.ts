@@ -38,6 +38,19 @@ export function useMacClaudeToken(companyId: string, onToken: (token: string, ac
   const requestId = useRef<string | null>(null);
   const onTokenRef = useRef(onToken);
   onTokenRef.current = onToken;
+  const scopedCompanyId = useRef(companyId);
+
+  // Another company has other Macs: forget the chosen Mac and any outcome. The
+  // cleanup below has already withdrawn a pending request in the old company.
+  useEffect(() => {
+    if (scopedCompanyId.current === companyId) return;
+    scopedCompanyId.current = companyId;
+    requestId.current = null;
+    setDeviceId(null);
+    setStatus("idle");
+    setError(null);
+    setExpiresAt(null);
+  }, [companyId]);
 
   async function start() {
     if (!pluginId || !deviceId || status === "requesting" || status === "pending") return;

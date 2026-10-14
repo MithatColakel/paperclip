@@ -69,55 +69,7 @@ export function ClaudeTokenSourcePicker({
         })}
       </div>
 
-      {source === "mac" && (
-        <div className="flex flex-col gap-2">
-          {mac.devicesError ? (
-            <p role="alert" className="text-sm text-destructive">Could not load this company's Macs. Try again.</p>
-          ) : mac.devices.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              {mac.loading ? "Loading Macs…" : "No Mac is enrolled in this company yet. Enroll one in Mac Fleet, or enter a token."}
-            </p>
-          ) : (
-            <div role="listbox" aria-label="Macs" className="divide-y divide-border overflow-hidden rounded-md border border-border">
-              {mac.devices.map((device) => {
-                const selected = mac.deviceId === device.id;
-                return (
-                  <button
-                    key={device.id}
-                    type="button"
-                    role="option"
-                    aria-selected={selected}
-                    disabled={disabled || waiting || !device.online}
-                    onClick={() => mac.selectDevice(device.id)}
-                    className={cn(
-                      "flex w-full items-center gap-3 px-3 py-2 text-left",
-                      "outline-none focus-visible:bg-accent/50 disabled:cursor-default disabled:opacity-50",
-                      selected ? "bg-accent" : "hover:bg-accent/40",
-                    )}
-                  >
-                    <Laptop className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm">{device.name}</span>
-                      <span className="block truncate text-xs text-muted-foreground">{deviceDetail(device)}</span>
-                    </span>
-                    {selected && <Check className="size-4 shrink-0 text-foreground" aria-hidden />}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          {waiting && (
-            <p role="status" className="text-sm text-muted-foreground">
-              {mac.status === "collecting"
-                ? "Receiving the token…"
-                : `Waiting for approval on the Mac${mac.expiresAt ? ` until ${formatDateTime(mac.expiresAt)}` : ""}. Its owner gets a prompt in Paperclip Mac Agent.`}
-            </p>
-          )}
-          {mac.status === "declined" && <p role="alert" className="text-sm text-destructive">The Mac's owner declined the request.</p>}
-          {mac.status === "expired" && <p role="alert" className="text-sm text-destructive">The request expired before the Mac answered. Try again.</p>}
-          {mac.status === "failed" && mac.error && <p role="alert" className="text-sm text-destructive">{mac.error}</p>}
-        </div>
-      )}
+      {source === "mac" && <MacClaudeTokenDevices mac={mac} disabled={disabled} />}
 
       {source === "token" && (
         <div className="flex flex-col gap-2">
@@ -136,6 +88,63 @@ export function ClaudeTokenSourcePicker({
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The company's Macs to ask for a Claude token, with the request's progress.
+ * The caller starts the request (`mac.start()`) from its own primary action.
+ */
+export function MacClaudeTokenDevices({ mac, disabled }: { mac: MacClaudeToken; disabled?: boolean }) {
+  const waiting = mac.status === "requesting" || mac.status === "pending" || mac.status === "collecting";
+  return (
+    <div className="flex flex-col gap-2">
+      {mac.devicesError ? (
+        <p role="alert" className="text-sm text-destructive">Could not load this company's Macs. Try again.</p>
+      ) : mac.devices.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          {mac.loading ? "Loading Macs…" : "No Mac is enrolled in this company yet. Enroll one in Mac Fleet, or enter a token."}
+        </p>
+      ) : (
+        <div role="listbox" aria-label="Macs" className="divide-y divide-border overflow-hidden rounded-md border border-border">
+          {mac.devices.map((device) => {
+            const selected = mac.deviceId === device.id;
+            return (
+              <button
+                key={device.id}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                disabled={disabled || waiting || !device.online}
+                onClick={() => mac.selectDevice(device.id)}
+                className={cn(
+                  "flex w-full items-center gap-3 px-3 py-2 text-left",
+                  "outline-none focus-visible:bg-accent/50 disabled:cursor-default disabled:opacity-50",
+                  selected ? "bg-accent" : "hover:bg-accent/40",
+                )}
+              >
+                <Laptop className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm">{device.name}</span>
+                  <span className="block truncate text-xs text-muted-foreground">{deviceDetail(device)}</span>
+                </span>
+                {selected && <Check className="size-4 shrink-0 text-foreground" aria-hidden />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {waiting && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {mac.status === "collecting"
+            ? "Receiving the token…"
+            : `Waiting for approval on the Mac${mac.expiresAt ? ` until ${formatDateTime(mac.expiresAt)}` : ""}. Its owner gets a prompt in Paperclip Mac Agent.`}
+        </p>
+      )}
+      {mac.status === "declined" && <p role="alert" className="text-sm text-destructive">The Mac's owner declined the request.</p>}
+      {mac.status === "expired" && <p role="alert" className="text-sm text-destructive">The request expired before the Mac answered. Try again.</p>}
+      {mac.status === "failed" && mac.error && <p role="alert" className="text-sm text-destructive">{mac.error}</p>}
     </div>
   );
 }

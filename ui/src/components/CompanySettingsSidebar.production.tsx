@@ -12,6 +12,7 @@ import {
   Shield,
   SlidersHorizontal,
   Upload,
+  UserRoundCog,
   UserRoundPen,
   Users,
 } from "lucide-react";
@@ -27,6 +28,7 @@ import { useCompany } from "@/context/CompanyContext";
 import { useSidebar } from "@/context/SidebarContext";
 import { useCloudInstance } from "@/hooks/useCloudInstance";
 import { useHiddenSettings } from "@/hooks/useHiddenSettings";
+import { useIsInstanceAdmin } from "@/hooks/useIsInstanceAdmin";
 import { usePluginSlots } from "@/plugins/slots";
 import { SidebarNavItem } from "./SidebarNavItem.production";
 
@@ -48,6 +50,8 @@ export function CompanySettingsSidebar() {
   const { hidden: hiddenSettings } = useHiddenSettings();
   const showPage = (pageKey: string) => !hiddenSettings.has(pageKey);
   const showPlugins = showPage("instance.plugins");
+  // Claude accounts serve every company's runs, so only instance admins see the page.
+  const showAiAccounts = useIsInstanceAdmin();
   // Import is floored server-side on cloud-managed instances (403 cloud_managed), so the
   // nav entry is hidden rather than dead-ending. Export stays available.
   const isCloud = Boolean(useCloudInstance());
@@ -140,6 +144,14 @@ export function CompanySettingsSidebar() {
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/environments`}
               label="Environments"
               icon={MonitorCog}
+              end
+            />
+          )}
+          {showAiAccounts && (
+            <SidebarNavItem
+              to={`${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts`}
+              label="Claude accounts"
+              icon={UserRoundCog}
               end
             />
           )}
