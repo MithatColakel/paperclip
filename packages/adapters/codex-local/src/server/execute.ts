@@ -39,7 +39,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
@@ -53,6 +52,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -1026,11 +1026,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Confining Codex with ${scopes} scope.\n`,
       );
     }
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv(effectiveEnv)).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    // A remote target's install and probe commands get the run env only,
+    // never the server's own environment.
+    const runtimeEnv = remoteSafeRuntimeEnv(env, executionTarget);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,

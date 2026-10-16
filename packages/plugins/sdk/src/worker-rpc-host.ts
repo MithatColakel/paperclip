@@ -1,5 +1,11 @@
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 import { environmentCreationCleanupErrorData } from "./environment-creation-cleanup.js";
+import {
+  ENVIRONMENT_PROJECT_ID_FEATURE,
+  environmentUnavailableErrorData,
+  normalizeEnvironmentTargetReports,
+  type PluginEnvironmentCheckAvailabilityParams,
+} from "./environment-availability.js";
 /**
  * Worker-side RPC host — runs inside the child process spawned by the host.
  *
@@ -1453,6 +1459,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      // Fork: environment target reports and per-company environments.
+      environments: {
+        async reportTargets(params) {
+          // Clean display text and cap retry times here, so one long device
+          // name does not get the whole report rejected by the host.
+          return callHost("environments.reportTargets", normalizeEnvironmentTargetReports(params));
+        },
+        async ensureCompanyEnvironment(params) {
+          return callHost("environments.ensureCompanyEnvironment", params);
+        },
+      },
+
       tools: {
         register(
           name: string,
@@ -1573,9 +1591,29 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           ? (err as any).code
           : PLUGIN_RPC_ERROR_CODES.WORKER_ERROR;
 
-      sendMessage(createErrorResponse(id, errorCode, errorMessage,
-        method === "environmentAcquireLease" || method === "environmentDestroyLease"
-          ? environmentCreationCleanupErrorData(err) : undefined));
+      sendMessage(createErrorResponse(id, errorCode, errorMessage, hostErrorData(method, err)));
+    }
+  }
+
+  /**
+   * Typed error data forwarded to the host. Only the allowlisted envelopes
+   * cross (Fork: the environment-unavailable envelope joins the cleanup one);
+   * any other `data` a thrown error carries stays in the worker. A
+   * creation-cleanup envelope wins over an unavailable one.
+   */
+  function hostErrorData(method: string, err: unknown): unknown {
+    switch (method) {
+      case "environmentAcquireLease":
+        return environmentCreationCleanupErrorData(err) ?? environmentUnavailableErrorData(err);
+      case "environmentDestroyLease":
+        return environmentCreationCleanupErrorData(err);
+      case "environmentResumeLease":
+      case "environmentRealizeWorkspace":
+      case "environmentExecute":
+      case "environmentCheckAvailability":
+        return environmentUnavailableErrorData(err);
+      default:
+        return undefined;
     }
   }
 
@@ -1682,6 +1720,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "environmentDeleteTemplate":
         return handleEnvironmentDeleteTemplate(params as PluginEnvironmentDeleteTemplateParams);
 
+      case "environmentCheckAvailability":
+        return handleEnvironmentCheckAvailability(params as PluginEnvironmentCheckAvailabilityParams);
+
       case "loginPtyOpen":
         return handleLoginPtyOpen(params as PluginLoginPtyOpenParams);
 
@@ -1762,6 +1803,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentCaptureTemplate) supportedMethods.push("environmentCaptureTemplate");
     if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
     if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
+    if (plugin.definition.onEnvironmentCheckAvailability) supportedMethods.push("environmentCheckAvailability");
+    // Fork: feature markers are opt-ins, not methods; the host changes what it sends.
+    if (plugin.definition.environmentDriverFeatures?.projectId === true) {
+      supportedMethods.push(ENVIRONMENT_PROJECT_ID_FEATURE);
+    }
     if (plugin.definition.onLoginPtyOpen) supportedMethods.push("loginPtyOpen");
     if (plugin.definition.onLoginPtyInput) supportedMethods.push("loginPtyInput");
     if (plugin.definition.onLoginPtyStop) supportedMethods.push("loginPtyStop");
@@ -1953,6 +1999,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       agentId: stringOrNull(rawActor?.agentId),
       runId: stringOrNull(rawActor?.runId),
       companyId: stringOrNull(rawActor?.companyId),
+      // Fork: host-derived. A host that predates the field leaves it unset,
+      // which plugins read as false.
+      ...(typeof rawActor?.isInstanceAdmin === "boolean" ? { isInstanceAdmin: rawActor.isInstanceAdmin } : {}),
     });
     return Object.freeze({
       actor,
@@ -2118,6 +2167,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       throw methodNotImplemented("environmentCancelInteractiveSetup");
     }
     return plugin.definition.onEnvironmentCancelInteractiveSetup(params);
+  }
+
+  async function handleEnvironmentCheckAvailability(params: PluginEnvironmentCheckAvailabilityParams) {
+    if (!plugin.definition.onEnvironmentCheckAvailability) {
+      throw methodNotImplemented("environmentCheckAvailability");
+    }
+    return plugin.definition.onEnvironmentCheckAvailability(params);
   }
 
   async function handleEnvironmentDeleteTemplate(params: PluginEnvironmentDeleteTemplateParams) {

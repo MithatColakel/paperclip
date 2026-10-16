@@ -6,8 +6,8 @@ import type {
 import {
   asString,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   asStringArray,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -125,7 +125,8 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
-  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env }));
+  // A remote target's probe gets the configured env only, never the server's.
+  const runtimeEnv = normalizeEnv(remoteSafeRuntimeEnv(env, target));
 
   const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
   if (cwdInvalid) {

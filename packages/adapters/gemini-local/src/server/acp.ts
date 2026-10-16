@@ -31,6 +31,7 @@ import {
   asString,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
 
@@ -329,7 +330,8 @@ async function commandIsResolvable(
         token,
         target,
         resolveAdapterExecutionTargetCwd(target, asString(input?.config.cwd, ""), process.cwd()),
-        process.env,
+        // Never the server's own env: a sandbox probe would carry it to the target.
+        remoteSafeRuntimeEnv({}, target),
       );
       return true;
     } catch {

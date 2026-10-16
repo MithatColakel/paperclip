@@ -60,6 +60,7 @@ const SOURCE_META: Record<AttentionSourceKind, SourceMeta> = {
   failed_run: { label: "Failed run" },
   budget_alert: { label: "Budget" },
   agent_error_alert: { label: "Agent error" },
+  resource_wait_alert: { label: "Waiting" },
 };
 
 export function sourceMeta(kind: AttentionSourceKind): SourceMeta {

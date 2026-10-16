@@ -31,7 +31,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   joinPromptSections,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
@@ -46,6 +45,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   SANDBOX_INSTALL_COMMAND,
   modelSupportsEffort,
@@ -137,12 +137,12 @@ function buildKimiHeadlessEnv(env: Record<string, string>): Record<string, strin
   return next;
 }
 
-function buildKimiRuntimeEnv(env: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildKimiHeadlessEnv(env) })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+// A remote target gets the run env only, never the server's own environment.
+function buildKimiRuntimeEnv(
+  env: Record<string, string>,
+  target: Parameters<typeof remoteSafeRuntimeEnv>[1],
+): Record<string, string> {
+  return remoteSafeRuntimeEnv(buildKimiHeadlessEnv(env), target);
 }
 
 function renderPaperclipEnvNote(env: Record<string, string>): string {
@@ -306,7 +306,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const kimiEffort = resolveKimiThinkingEffort(configuredEffort);
     if (kimiEffort) env.KIMI_MODEL_THINKING_EFFORT = kimiEffort;
   }
-  const runtimeEnv = buildKimiRuntimeEnv(env);
+  const runtimeEnv = buildKimiRuntimeEnv(env, executionTarget);
   const billingType = resolveKimiBillingType(runtimeEnv);
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
@@ -580,7 +580,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
     const args = buildArgs(resumeSessionId, prompt);
     const invocationEnv = buildKimiHeadlessEnv(env);
-    const invocationRuntimeEnv = buildKimiRuntimeEnv(env);
+    const invocationRuntimeEnv = buildKimiRuntimeEnv(env, executionTarget);
     const loggedEnv = buildInvocationEnvForLogs(invocationEnv, {
       runtimeEnv: invocationRuntimeEnv,
       includeRuntimeKeys: ["HOME"],

@@ -7,9 +7,9 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   describeAdapterExecutionTarget,
   prepareAdapterExecutionTargetRuntime,
@@ -190,7 +190,8 @@ export async function testEnvironment(
         });
       }
     }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  // A remote target's probe gets the configured env only, never the server's.
+  const runtimeEnv = remoteSafeRuntimeEnv(env, target);
 
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

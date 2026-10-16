@@ -16,6 +16,7 @@ import {
   type GitWorkspaceSnapshot,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { isSensitiveEnvKey } from "./sensitive-env.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import { workspacePaths } from "./workspace-manifest.js";
@@ -46,6 +47,33 @@ export interface SshRemoteExecutionSpec extends SshConnectionConfig {
 }
 
 /**
+ * How a remote command receives its environment. Secret values never ride
+ * the ssh command line: a separate ssh call writes them over stdin into a
+ * 0600 file, which the command sources after the login profiles and removes
+ * before it starts.
+ */
+export interface SshRemoteEnvOptions {
+  /**
+   * More keys to treat as secret. Keys matching `SENSITIVE_ENV_KEY`
+   * (sensitive-env.ts) always count as secret.
+   */
+  secretEnvKeys?: readonly string[] | null;
+  /**
+   * Keys to unset after the login profiles are sourced, so a value a profile
+   * exports never reaches the command. The command's own env still wins.
+   */
+  unsetEnvKeys?: readonly string[] | null;
+  /**
+   * Like `unsetEnvKeys`, for whole families of names that no fixed list can
+   * know in advance: every exported name that matches one of these shell
+   * globs is unset. A glob holds letters, digits, underscores, `*`, and
+   * bracket classes of letters, digits and underscores (`[Hh]`), and it must
+   * name at least one character besides `*`.
+   */
+  unsetEnvPatterns?: readonly string[] | null;
+}
+
+/**
  * Lets a caller expose an in-flight transfer process (for example to the run's
  * cancellation registry) for as long as the transfer runs. The returned
  * function unregisters it.
@@ -69,8 +97,12 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
+      const allEnvEntries = Object.entries(commandInput.env ?? {})
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+      // Secret values go through runSshCommand's staged env file instead of
+      // the command string, which the ssh argv carries.
+      const secretEnv = Object.fromEntries(allEnvEntries.filter(([key]) => isSensitiveEnvKey(key)));
+      const envEntries = allEnvEntries.filter(([key]) => !isSensitiveEnvKey(key));
       const envPrefix = envEntries.length > 0
         ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
         : "";
@@ -89,6 +121,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
+          ...(Object.keys(secretEnv).length > 0 ? { env: secretEnv } : {}),
         });
         if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
         if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
@@ -1343,6 +1376,230 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
+const SSH_LOGIN_PROFILE_STEPS = [
+  'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+  'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+] as const;
+
+const SSH_STAGED_ENV_MARKER = "PAPERCLIP_STAGED_ENV_DIR=";
+// mktemp output under the remote TMPDIR. The path is pasted into the remote
+// script, so quotes, `$`, backquotes and backslashes are refused.
+const SSH_STAGED_ENV_DIR_PATTERN = /^\/[^'"`$\\\r\n\0]*\/paperclip-env\.[A-Za-z0-9]+$/;
+const SSH_ENV_STAGING_TIMEOUT_MS = 30_000;
+const SSH_STAGED_ENV_DISCARD_TIMEOUT_MS = 10_000;
+
+/**
+ * The remote script of the staging call. It reads `KEY='value'` lines from
+ * stdin into a private file and prints the directory that holds it. It runs
+ * without the login profiles, so no profile can read the secrets on stdin.
+ */
+export const SSH_ENV_STAGING_SCRIPT = [
+  "umask 077",
+  'd=$(mktemp -d "${TMPDIR:-/tmp}/paperclip-env.XXXXXXXX") || exit 1',
+  `if cat > "$d/env"; then printf '${SSH_STAGED_ENV_MARKER}%s\\n' "$d"; else rm -rf "$d"; exit 1; fi`,
+].join("; ");
+
+/** The staging call's stdin: one `KEY='value'` line per secret. */
+export function buildSshStagedEnvFile(entries: ReadonlyArray<readonly [string, string]>): string {
+  return entries.map(([key, value]) => `${key}=${shellQuote(value)}\n`).join("");
+}
+
+/** The staged directory a staging call printed, or null when its output holds none. */
+export function parseSshStagedEnvDir(stdout: string): string | null {
+  const lines = stdout.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? "";
+    if (!line.startsWith(SSH_STAGED_ENV_MARKER)) continue;
+    const dir = line.slice(SSH_STAGED_ENV_MARKER.length);
+    return SSH_STAGED_ENV_DIR_PATTERN.test(dir) ? dir : null;
+  }
+  return null;
+}
+
+// A glob for `case`: letters, digits, underscores, `*` and bracket classes of
+// letters, digits and underscores. Nothing in it can quote, expand or end the
+// pattern, so it is pasted into the remote script as is.
+const SSH_ENV_NAME_GLOB_PATTERN = /^(?:[A-Za-z0-9_*]|\[[A-Za-z0-9_]+\])+$/;
+
+function isValidSshEnvNameGlob(value: string): boolean {
+  return SSH_ENV_NAME_GLOB_PATTERN.test(value) && value.replace(/\*/g, "").length > 0;
+}
+
+/**
+ * The script steps that run after the login profiles: unset the listed keys
+ * and every exported name that matches an unset glob, export the staged
+ * secrets, then delete the staged file. The secrets therefore win over values
+ * a profile exports. With nothing staged or unset there are no steps, so the
+ * script stays byte-identical to one without staging.
+ */
+export function buildSshEnvLoadSteps(input: {
+  stagedDir: string | null;
+  unsetEnvKeys: readonly string[];
+  unsetEnvPatterns?: readonly string[];
+}): string[] {
+  const steps: string[] = [];
+  if (input.unsetEnvKeys.length > 0) steps.push(`unset ${input.unsetEnvKeys.join(" ")}`);
+  const patterns = input.unsetEnvPatterns ?? [];
+  if (patterns.length > 0) {
+    for (const pattern of patterns) {
+      if (!isValidSshEnvNameGlob(pattern)) throw new Error(`Invalid SSH environment name pattern: ${pattern}`);
+    }
+    // `env` lists the exported names; BRE `sed` keeps the name of each
+    // `NAME=value` line, in the same form on GNU, BSD and BusyBox. A line from
+    // inside a multi-line value only adds one more candidate, and only names
+    // that match a glob are unset.
+    steps.push(
+      `for k in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do ` +
+        `case "$k" in ${patterns.join("|")}) unset "$k" ;; esac; done`,
+    );
+  }
+  if (input.stagedDir) {
+    steps.push(
+      "set -a",
+      `. ${shellQuote(`${input.stagedDir}/env`)}`,
+      "set +a",
+      `rm -rf ${shellQuote(input.stagedDir)}`,
+    );
+  }
+  return steps;
+}
+
+/** Removes the staged file when the script stops before it gets there. */
+function stagedEnvExitTrap(stagedDir: string | null): string {
+  return stagedDir ? `trap "rm -rf '${stagedDir}'" EXIT; ` : "";
+}
+
+/** Thrown when the call that stages secret env values fails. */
+export class SshEnvStagingError extends Error {
+  readonly code: number | null;
+  readonly signal: string | null;
+  readonly killed: boolean;
+  readonly stdout: string;
+  readonly stderr: string;
+
+  constructor(message: string, detail: {
+    code?: number | null;
+    signal?: string | null;
+    killed?: boolean;
+    stdout?: string;
+    stderr?: string;
+  } = {}) {
+    super(message);
+    this.name = "SshEnvStagingError";
+    this.code = detail.code ?? null;
+    this.signal = detail.signal ?? null;
+    this.killed = detail.killed ?? false;
+    this.stdout = detail.stdout ?? "";
+    this.stderr = detail.stderr ?? "";
+  }
+}
+
+interface SshRemoteEnvPlan {
+  /** Values that may ride the command line. */
+  inline: Array<[string, string]>;
+  /** Secret values, staged through a file. */
+  staged: Array<[string, string]>;
+  unset: string[];
+  unsetPatterns: string[];
+}
+
+function planSshRemoteEnv(
+  entries: Array<[string, string]>,
+  options: SshRemoteEnvOptions,
+): SshRemoteEnvPlan {
+  const secretKeys = new Set(options.secretEnvKeys ?? []);
+  const plan: SshRemoteEnvPlan = { inline: [], staged: [], unset: [], unsetPatterns: [] };
+  for (const entry of entries) {
+    if (isSensitiveEnvKey(entry[0]) || secretKeys.has(entry[0])) plan.staged.push(entry);
+    else plan.inline.push(entry);
+  }
+  for (const key of options.unsetEnvKeys ?? []) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid SSH environment variable key: ${key}`);
+    }
+    if (!plan.unset.includes(key)) plan.unset.push(key);
+  }
+  // Checked here, before anything is staged on the host.
+  for (const pattern of options.unsetEnvPatterns ?? []) {
+    if (!isValidSshEnvNameGlob(pattern)) {
+      throw new Error(`Invalid SSH environment name pattern: ${pattern}`);
+    }
+    if (!plan.unsetPatterns.includes(pattern)) plan.unsetPatterns.push(pattern);
+  }
+  return plan;
+}
+
+function sshDestinationArgs(config: SshConnectionConfig, remoteScript: string): string[] {
+  return [
+    "-p",
+    String(config.port),
+    `${config.username}@${config.host}`,
+    `sh -c ${shellQuote(remoteScript)}`,
+  ];
+}
+
+async function stageSshSecretEnv(
+  config: SshConnectionConfig,
+  authArgs: string[],
+  entries: Array<[string, string]>,
+): Promise<string> {
+  let result: SshCommandResult;
+  try {
+    result = await spawnText("ssh", [...authArgs, ...sshDestinationArgs(config, SSH_ENV_STAGING_SCRIPT)], {
+      stdin: buildSshStagedEnvFile(entries),
+      timeout: SSH_ENV_STAGING_TIMEOUT_MS,
+      maxBuffer: 64 * 1024,
+    });
+  } catch (error) {
+    const failure = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown };
+    const stderr = typeof failure.stderr === "string" ? failure.stderr : "";
+    throw new SshEnvStagingError(
+      stderr.trim() || "Could not stage the run's secret environment on the SSH host.",
+      {
+        code: typeof failure.code === "number" ? failure.code : null,
+        signal: typeof failure.signal === "string" ? failure.signal : null,
+        killed: failure.killed === true,
+        stdout: typeof failure.stdout === "string" ? failure.stdout : "",
+        stderr,
+      },
+    );
+  }
+  const stagedDir = parseSshStagedEnvDir(result.stdout);
+  if (!stagedDir) {
+    throw new SshEnvStagingError("The SSH host did not report where it staged the run's secret environment.", {
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
+  }
+  return stagedDir;
+}
+
+/** Best effort: removes a staged env file that the remote command never consumed. */
+async function discardStagedSshEnv(config: SshConnectionConfig, stagedDir: string): Promise<void> {
+  let cleanup: () => Promise<void> = () => Promise.resolve();
+  try {
+    const auth = await createSshAuthArgs(config);
+    cleanup = auth.cleanup;
+    await execFileText("ssh", [...auth.args, ...sshDestinationArgs(config, `rm -rf ${shellQuote(stagedDir)}`)], {
+      timeout: SSH_STAGED_ENV_DISCARD_TIMEOUT_MS,
+      maxBuffer: 16 * 1024,
+    });
+  } catch {
+    // The file stays private to the SSH user (0600 in a 0700 directory). A
+    // failed removal must not hide the original failure.
+  } finally {
+    await cleanup().catch(() => undefined);
+  }
+}
+
+/** True when ssh itself failed (exit 255, killed, or not started), so the remote script may never have run. */
+function sshTransportMayHaveSkippedScript(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code !== "number" || code === 255;
+}
+
 export async function runSshCommand(
   config: SshConnectionConfig,
   remoteCommand: string,
@@ -1351,7 +1608,7 @@ export async function runSshCommand(
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
-  } = {},
+  } & SshRemoteEnvOptions = {},
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
   try {
@@ -1365,6 +1622,10 @@ export async function runSshCommand(
         throw new Error(`Invalid SSH environment variable key: ${key}`);
       }
     }
+    const envPlan = planSshRemoteEnv(envEntries, options);
+    const stagedDir = envPlan.staged.length > 0
+      ? await stageSshSecretEnv(config, auth.args, envPlan.staged)
+      : null;
 
     // Mirror buildSshSpawnTarget: source the login profiles first, then run
     // `env KEY=VAL cmd` so user-supplied identity overrides win over anything a
@@ -1377,34 +1638,36 @@ export async function runSshCommand(
     // .bash_profile typically sources .bashrc itself; only source .bashrc
     // directly when no .bash_profile exists, so a host that adds nvm in
     // .bashrc still resolves node without a double-run of the setup.
-    const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
-    const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    // Secret values never ride the ssh argv: they arrive through the staged
+    // file, loaded after the profiles (buildSshEnvLoadSteps).
+    const envArgs = envPlan.inline.map(([key, value]) => `${key}=${shellQuote(value)}`);
+    const remoteScript = stagedEnvExitTrap(stagedDir) + [
+      ...SSH_LOGIN_PROFILE_STEPS,
+      ...buildSshEnvLoadSteps({ stagedDir, unsetEnvKeys: envPlan.unset, unsetEnvPatterns: envPlan.unsetPatterns }),
       envArgs.length > 0
         ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
         : `exec sh -c ${shellQuote(remoteCommand)}`,
     ].join(" && ");
 
-    sshArgs.push(
-      "-p",
-      String(config.port),
-      `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
-    );
+    sshArgs.push(...sshDestinationArgs(config, remoteScript));
 
-    return options.stdin != null
-      ? await spawnText("ssh", sshArgs, {
-          stdin: options.stdin,
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        })
-      : await execFileText("ssh", sshArgs, {
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        });
+    try {
+      return options.stdin != null
+        ? await spawnText("ssh", sshArgs, {
+            stdin: options.stdin,
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          })
+        : await execFileText("ssh", sshArgs, {
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          });
+    } catch (error) {
+      if (stagedDir && sshTransportMayHaveSkippedScript(error)) {
+        await discardStagedSshEnv(config, stagedDir);
+      }
+      throw error;
+    }
   } finally {
     await cleanup();
   }
@@ -1415,21 +1678,40 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   env: Record<string, string>;
-}): Promise<{
+} & SshRemoteEnvOptions): Promise<{
   command: string;
   args: string[];
   cleanup: () => Promise<void>;
+  /**
+   * Present when secret values were staged on the host. Best effort: removes
+   * the staged file. Call it when the ssh process failed to start, exited
+   * with 255, or was killed or timed out, because the remote script may never
+   * have consumed the file. Calling it after the script removed the file is
+   * harmless.
+   */
+  discardStagedEnv?: () => Promise<void>;
 }> {
   for (const key of Object.keys(input.env)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid SSH environment variable key: ${key}`);
     }
   }
+  const envPlan = planSshRemoteEnv(
+    Object.entries(input.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    input,
+  );
   const auth = await createSshAuthArgs(input.spec);
+  let stagedDir: string | null = null;
+  try {
+    stagedDir = envPlan.staged.length > 0
+      ? await stageSshSecretEnv(input.spec, auth.args, envPlan.staged)
+      : null;
+  } catch (error) {
+    await auth.cleanup();
+    throw error;
+  }
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const envArgs = envPlan.inline.map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
   // Source the login profiles first, then run `env KEY=VAL cmd` so
   // user-supplied identity overrides win over anything a profile re-exports.
@@ -1442,28 +1724,25 @@ export async function buildSshSpawnTarget(input: {
   // .bash_profile typically sources .bashrc itself; only source .bashrc
   // directly when no .bash_profile exists, so a host that adds nvm in
   // .bashrc still resolves node without a double-run of the setup.
-  const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+  // Secret values never ride the ssh argv, which every local user can list:
+  // they arrive through the staged file, loaded after the profiles.
+  const remoteScript = stagedEnvExitTrap(stagedDir) + [
+    ...SSH_LOGIN_PROFILE_STEPS,
+    ...buildSshEnvLoadSteps({ stagedDir, unsetEnvKeys: envPlan.unset, unsetEnvPatterns: envPlan.unsetPatterns }),
     `cd ${shellQuote(input.spec.remoteCwd)}`,
     envArgs.length > 0
       ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
       : `exec ${remoteCommandParts}`,
   ].join(" && ");
 
-  sshArgs.push(
-    "-p",
-    String(input.spec.port),
-    `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteScript)}`,
-  );
+  sshArgs.push(...sshDestinationArgs(input.spec, remoteScript));
 
+  const staged = stagedDir;
   return {
     command: "ssh",
     args: sshArgs,
     cleanup: auth.cleanup,
+    ...(staged ? { discardStagedEnv: () => discardStagedSshEnv(input.spec, staged) } : {}),
   };
 }
 

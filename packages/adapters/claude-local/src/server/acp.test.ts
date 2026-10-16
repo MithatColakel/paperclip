@@ -1221,6 +1221,71 @@ describe("claude_local ACP lane", () => {
     );
   });
 
+  it("gives a pool-account run its own config-<ref> directory with stripped settings and no stored login", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-pool-config-");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    const sharedClaudeConfig = path.join(root, "shared-claude-config");
+    const poolRef = "0123456789abcdef";
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.mkdir(sharedClaudeConfig, { recursive: true });
+    await fs.writeFile(
+      path.join(sharedClaudeConfig, "settings.json"),
+      JSON.stringify({ theme: "dark", env: { ANTHROPIC_BASE_URL: "http://proxy.invalid" }, apiKeyHelper: "/bin/helper" }),
+      "utf8",
+    );
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.CLAUDE_CONFIG_DIR = sharedClaudeConfig;
+    // A login a previous run left in the account's directory is removed. The
+    // ACP engine keeps its runtime under the adapter type.
+    const poolConfigDir = path.join(remoteCwd, ".paperclip-runtime", "claude_local", `config-${poolRef}`);
+    await fs.mkdir(poolConfigDir, { recursive: true });
+    await fs.writeFile(path.join(poolConfigDir, ".credentials.json"), '{"stale":"login"}', "utf8");
+
+    const meta: AdapterInvocationMeta[] = [];
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+    const result = await execute(
+      buildContext(localCwd, {
+        config: {
+          engine: "acp",
+          cwd: localCwd,
+          agentCommand: "node ./fake-acp.js",
+          stateDir: path.join(root, "state"),
+          promptTemplate: "Do the assigned work.",
+          // An explicit directory never beats the account's own directory.
+          env: { PAPERCLIP_AI_CREDENTIAL_REF: poolRef, CLAUDE_CONFIG_DIR: "/home/owner/.claude" },
+        },
+        context: {
+          issueId: "issue-1",
+          paperclipWorkspace: { cwd: localCwd, source: "project_workspace", workspaceId: "workspace-1" },
+        },
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          providerKey: "fake-plugin",
+          remoteCwd,
+          runner: createLocalSandboxRunner(),
+        } as never,
+        authToken: "real-run-jwt",
+        onMeta: async (payload: AdapterInvocationMeta) => {
+          meta.push(payload);
+        },
+      }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(String(meta[0]?.env?.CLAUDE_CONFIG_DIR ?? "")).toBe(poolConfigDir);
+    expect(JSON.parse(await fs.readFile(path.join(poolConfigDir, "settings.json"), "utf8"))).toEqual({
+      theme: "dark",
+      permissions: { defaultMode: "default" },
+    });
+    await expect(fs.access(path.join(poolConfigDir, ".credentials.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("reports unavailable ACP for a runner-less sandbox even when the ACP command is set", async () => {
     setNodeVersion("v24.11.0");
     await expect(

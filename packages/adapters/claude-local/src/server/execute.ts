@@ -39,7 +39,6 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
-  ensurePathInEnv,
   isForbiddenConfigEnvKey,
   isPaperclipRuntimeEnvKey,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -53,6 +52,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import { isDeviceWorktreePath } from "@paperclipai/adapter-utils/device-workspace";
 import {
@@ -80,11 +80,19 @@ import {
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
+  POOL_CLAUDE_CONFIG_MATERIALIZATION,
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
+import {
+  managedClaudeConfigDirName,
+  POOL_RUN_SSH_UNSET_ENV_KEYS,
+  POOL_RUN_SSH_UNSET_ENV_PATTERNS,
+  readAiCredentialRef,
+  sshPoolClaudeConfigDir,
+} from "./ai-credential-ref.js";
 import {
   claudeCliVersionAtLeast,
   claudeCommandLooksLike,
@@ -310,11 +318,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
-  const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+  // A remote target's install and probe commands get the run env only, never
+  // the server's own environment.
+  const runtimeEnv = remoteSafeRuntimeEnv(env, executionTarget);
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
     asNumber(config.timeoutSec, 0),
@@ -601,12 +607,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Confining Claude with ${scopes} scope.\n`,
     );
   }
+  // Fork: a pool-account run on a sandbox or SSH target gets the account's own
+  // managed config directory, seeded with stripped settings and never with a
+  // stored login. Local pool runs keep today's config directory.
+  const poolCredentialRef = executionTargetIsRemote ? readAiCredentialRef(configEnv) : null;
+  const executionTargetIsSsh = executionTarget?.kind === "remote" && executionTarget.transport === "ssh";
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&
-    adapterExecutionTargetUsesManagedHome(executionTarget) &&
-    (!hasExplicitClaudeConfigDir || Boolean(config.managedAiConnection));
+    (Boolean(poolCredentialRef) || (
+      adapterExecutionTargetUsesManagedHome(executionTarget) &&
+      (!hasExplicitClaudeConfigDir || Boolean(config.managedAiConnection))
+    ));
   const claudeConfigSeedDir = useManagedRemoteClaudeConfig
-    ? config.managedAiConnection ? sharedClaudeConfigDir : await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
+    ? poolCredentialRef
+      ? await prepareClaudeConfigSeed(process.env, onLog, agent.companyId, { stripAuthSettings: true })
+      : config.managedAiConnection ? sharedClaudeConfigDir : await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
     : null;
   // SSH device mode: the workspace already lives on the host, so only the
   // runtime assets move and the run ends with a push instead of a restore.
@@ -702,8 +717,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? preparedExecutionTargetRuntime?.assetDirs["config-seed"] ??
       path.posix.join(remoteClaudeRuntimeRoot, "config-seed")
     : null;
+  // Fork: an SSH runtime root is per-run scratch, removed after the run, so a
+  // pool account's config directory lives in a stable place on the host and
+  // its sessions survive for --resume. The seed is still materialized into it
+  // on every run.
   const remoteClaudeConfigDir = useManagedRemoteClaudeConfig && remoteClaudeRuntimeRoot
-    ? path.posix.join(remoteClaudeRuntimeRoot, "config")
+    ? poolCredentialRef && executionTarget?.kind === "remote" && executionTarget.transport === "ssh"
+      ? sshPoolClaudeConfigDir({
+          remoteWorkspacePath: executionTarget.spec.remoteWorkspacePath,
+          deviceMode: deviceWorkspaceRoot !== null,
+          credentialRef: poolCredentialRef,
+        })
+      : path.posix.join(remoteClaudeRuntimeRoot, managedClaudeConfigDirName(poolCredentialRef))
     : null;
   if (remoteClaudeConfigDir && remoteClaudeConfigSeedDir) {
     env.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
@@ -717,9 +742,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       target: executionTarget,
       remoteClaudeConfigDir,
       remoteClaudeConfigSeedDir,
+      ...(poolCredentialRef ? POOL_CLAUDE_CONFIG_MATERIALIZATION : {}),
       options: {
         cwd,
-        env,
+        // Fork: the pool materialization reads no env, so the token stays out of it.
+        env: poolCredentialRef ? {} : env,
         timeoutSec: Math.max(timeoutSec, 15),
         graceSec,
         onLog,
@@ -741,7 +768,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
-      const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+      const runtimeEnv = remoteSafeRuntimeEnv(env, executionTarget);
       loggedEnv = buildInvocationEnvForLogs(env, {
         runtimeEnv,
         includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
@@ -990,6 +1017,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
+      // Fork: on an SSH host a pool run drops what the login profiles export
+      // for routing, proxies and other credentials.
+      ...(poolCredentialRef && executionTargetIsSsh
+        ? {
+            remoteEnvOptions: {
+              unsetEnvKeys: POOL_RUN_SSH_UNSET_ENV_KEYS,
+              unsetEnvPatterns: POOL_RUN_SSH_UNSET_ENV_PATTERNS,
+            },
+          }
+        : {}),
     });
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);

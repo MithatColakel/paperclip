@@ -50,7 +50,7 @@
 
 import type { PluginCapability } from "@paperclipai/shared";
 import type { WorkerHostCallContext, WorkerToHostMethods, WorkerToHostMethodName } from "./protocol.js";
-import { PLUGIN_RPC_ERROR_CODES } from "./protocol.js";
+import { JSONRPC_ERROR_CODES, PLUGIN_RPC_ERROR_CODES } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -306,6 +306,23 @@ export interface HostServices {
     revokeInvite(params: WorkerToHostMethods["access.invites.revoke"][0]): Promise<WorkerToHostMethods["access.invites.revoke"][1]>;
   };
 
+  /**
+   * Fork: provides `environments.reportTargets` and `environments.ensureCompanyEnvironment`
+   * for environment driver plugins. The context carries the host-derived
+   * invocation scope (company, method and actor). A host without these
+   * services answers METHOD_NOT_FOUND, like a host that predates them.
+   */
+  environments?: {
+    reportTargets(
+      params: WorkerToHostMethods["environments.reportTargets"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["environments.reportTargets"][1]>;
+    ensureCompanyEnvironment(
+      params: WorkerToHostMethods["environments.ensureCompanyEnvironment"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<WorkerToHostMethods["environments.ensureCompanyEnvironment"][1]>;
+  };
+
   /** Provides authorization grant, policy, preview, and audit helpers. */
   authorization: {
     listGrants(params: WorkerToHostMethods["authorization.grants.list"][0]): Promise<WorkerToHostMethods["authorization.grants.list"][1]>;
@@ -523,6 +540,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "authorization.policies.previewAssignment": "authorization.policies.read",
   "authorization.policies.explainAssignment": "authorization.policies.read",
   "authorization.audit.search": "authorization.audit.read",
+
+  // Fork: environment targets — only a plugin that registers environment drivers.
+  "environments.reportTargets": "environment.drivers.register",
+  "environments.ensureCompanyEnvironment": "environment.drivers.register",
 };
 
 // ---------------------------------------------------------------------------
@@ -679,6 +700,36 @@ export function createHostClientHandlers(
     if (required === null) return; // No capability required
     if (capabilitySet.has(required)) return;
     throw new CapabilityDeniedError(pluginId, method, required);
+  }
+
+  /**
+   * Some host methods act for a person. They need a `performAction`
+   * invocation whose host-derived actor is a board user; the company match is
+   * already enforced by the invocation scope gate.
+   */
+  function requireBoardUserAction(
+    method: WorkerToHostMethodName,
+    context?: WorkerHostCallContext,
+  ): void {
+    const scope = context?.invocationScope;
+    if (
+      scope?.method !== "performAction"
+      || scope.actor?.type !== "user"
+      || !readNonEmptyString(scope.actor.userId)
+    ) {
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        "only a performAction invocation by a board user may do this",
+      );
+    }
+  }
+
+  function requireEnvironmentServices(method: WorkerToHostMethodName): NonNullable<HostServices["environments"]> {
+    if (services.environments) return services.environments;
+    throw Object.assign(new Error(`Host does not handle method "${method}"`), {
+      code: JSONRPC_ERROR_CODES.METHOD_NOT_FOUND,
+    });
   }
 
   /**
@@ -1067,6 +1118,18 @@ export function createHostClientHandlers(
     }),
     "authorization.audit.search": gated("authorization.audit.search", async (params) => {
       return services.authorization.searchAudit(params);
+    }),
+
+    // Fork: environment targets. `reportTargets` names no company, so the scope gate
+    // lets it run outside invocations. `ensureCompanyEnvironment` names one,
+    // so it must match the invocation company, and it must come from a board
+    // user's action.
+    "environments.reportTargets": gated("environments.reportTargets", async (params, context) => {
+      return requireEnvironmentServices("environments.reportTargets").reportTargets(params, context);
+    }),
+    "environments.ensureCompanyEnvironment": gated("environments.ensureCompanyEnvironment", async (params, context) => {
+      requireBoardUserAction("environments.ensureCompanyEnvironment", context);
+      return requireEnvironmentServices("environments.ensureCompanyEnvironment").ensureCompanyEnvironment(params, context);
     }),
   };
 }

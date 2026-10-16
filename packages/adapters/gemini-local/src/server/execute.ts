@@ -38,7 +38,6 @@ import {
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
   joinPromptSections,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
@@ -55,6 +54,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   describeGeminiFailure,
@@ -99,12 +99,12 @@ function buildGeminiHeadlessEnv(env: Record<string, string>): Record<string, str
   return next;
 }
 
-function buildGeminiRuntimeEnv(env: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...buildGeminiHeadlessEnv(env) })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+// A remote target gets the run env only, never the server's own environment.
+function buildGeminiRuntimeEnv(
+  env: Record<string, string>,
+  target: Parameters<typeof remoteSafeRuntimeEnv>[1],
+): Record<string, string> {
+  return remoteSafeRuntimeEnv(buildGeminiHeadlessEnv(env), target);
 }
 
 function renderPaperclipEnvNote(env: Record<string, string>): string {
@@ -327,7 +327,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const runtimeEnv = buildGeminiRuntimeEnv(env);
+  const runtimeEnv = buildGeminiRuntimeEnv(env, executionTarget);
   const billingType = resolveGeminiBillingType(runtimeEnv);
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,
@@ -620,7 +620,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ]);
     const args = buildArgs(resumeSessionId, prompt);
     const invocationEnv = buildGeminiHeadlessEnv(env);
-    const invocationRuntimeEnv = buildGeminiRuntimeEnv(env);
+    const invocationRuntimeEnv = buildGeminiRuntimeEnv(env, executionTarget);
     const loggedEnv = buildInvocationEnvForLogs(invocationEnv, {
       runtimeEnv: invocationRuntimeEnv,
       includeRuntimeKeys: ["HOME"],

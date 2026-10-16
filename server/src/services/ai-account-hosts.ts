@@ -54,6 +54,8 @@ const DRIVERS_FOR_KIND: Record<AiAccountHostKind, readonly string[]> = {
   // A Mac reached over SSH honours the token Paperclip sends; Mac Fleet
   // sandboxes do not yet (the Mac agent prefers its own vault login).
   mac: ["ssh"],
+  // A plugin-reported device; only the plugin's sandbox environments attach to it.
+  external: ["sandbox"],
 };
 
 /** Auth variables a host-pool run controls; the selected one is set, the others blanked. */
@@ -488,7 +490,7 @@ export function aiAccountHostService(db: Db) {
       });
     } catch (error) {
       if (isUniqueViolation(error, "ai_accounts_fingerprint_uq")) throw conflict("This credential is already on a host. A credential can serve one host only.");
-      if (isUniqueViolation(error, "ai_accounts_email_hint_uq")) throw conflict("An account with this email is already on a host. Each host uses its own accounts.");
+      if (isUniqueViolation(error, "ai_accounts_owner_email_hint_uq")) throw conflict("An account with this email is already on a host. Each host uses its own accounts.");
       throw error;
     }
   }
@@ -508,7 +510,7 @@ export function aiAccountHostService(db: Db) {
       const [updated] = await db.update(aiAccounts).set(patch).where(eq(aiAccounts.id, accountId)).returning();
       return { before: existing, account: updated! };
     } catch (error) {
-      if (isUniqueViolation(error, "ai_accounts_email_hint_uq")) throw conflict("An account with this email is already on a host. Each host uses its own accounts.");
+      if (isUniqueViolation(error, "ai_accounts_owner_email_hint_uq")) throw conflict("An account with this email is already on a host. Each host uses its own accounts.");
       throw error;
     }
   }

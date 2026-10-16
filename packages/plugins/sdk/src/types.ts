@@ -58,6 +58,12 @@ import type {
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
+import type {
+  PluginEnsureCompanyEnvironmentParams,
+  PluginEnsureCompanyEnvironmentResult,
+  PluginEnvironmentReportTargetsParams,
+  PluginEnvironmentReportTargetsResult,
+} from "./environment-availability.js";
 
 // ---------------------------------------------------------------------------
 // Re-exports from @paperclipai/shared (plugin authors import from one place)
@@ -2093,6 +2099,30 @@ export interface PluginDuplexChannelClient {
   ): void;
 }
 
+/**
+ * Fork: `ctx.environments` — target availability and per-company environments for
+ * an environment driver plugin. Both methods require
+ * `environment.drivers.register` and act only on `sandbox_provider` driver
+ * keys this plugin declares. A host that predates them answers
+ * METHOD_NOT_FOUND; stop calling them after that.
+ */
+export interface PluginEnvironmentsClient {
+  /**
+   * Report the state of this driver's targets (devices): available or not,
+   * accepted credential types, display owner, served companies and aliases.
+   * At most 500 targets per call. It carries no company, so it also works
+   * outside invocations, for example from timers.
+   */
+  reportTargets(params: PluginEnvironmentReportTargetsParams): Promise<PluginEnvironmentReportTargetsResult>;
+
+  /**
+   * Find, or create, this driver's environment for one company. Allowed only
+   * inside a `performAction` for that company whose actor is a board user
+   * with write access to it. Idempotent by `match`.
+   */
+  ensureCompanyEnvironment(params: PluginEnsureCompanyEnvironmentParams): Promise<PluginEnsureCompanyEnvironmentResult>;
+}
+
 // ---------------------------------------------------------------------------
 // Full plugin context
 // ---------------------------------------------------------------------------
@@ -2216,6 +2246,10 @@ export interface PluginContext {
   /** Stream one persistent duplex channel's data and exit to the host. The
    * default is a no-op for a provider that opens no duplex channel. */
   duplexChannel: PluginDuplexChannelClient;
+
+  /** Report target availability and ensure per-company environments.
+   * Requires `environment.drivers.register`. */
+  environments: PluginEnvironmentsClient;
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;

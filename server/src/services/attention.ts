@@ -78,6 +78,7 @@ const ATTENTION_SOURCE_KINDS: AttentionSourceKind[] = [
   "failed_run",
   "budget_alert",
   "agent_error_alert",
+  "resource_wait_alert",
 ];
 
 const SEVERITY_RANK: Record<AttentionSeverity, number> = {
@@ -99,6 +100,7 @@ const SOURCE_RANK: Record<AttentionSourceKind, number> = {
   review: 8,
   productivity_review: 9,
   join_request: 10,
+  resource_wait_alert: 11,
 };
 
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;

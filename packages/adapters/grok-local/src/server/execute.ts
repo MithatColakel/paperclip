@@ -29,7 +29,6 @@ import {
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   ensureAbsoluteDirectory,
-  ensurePathInEnv,
   joinPromptSections,
   materializePaperclipSkillCopy,
   parseObject,
@@ -45,6 +44,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { grokHomeHasUsableAuth, resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
@@ -484,7 +484,8 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const runtimeEnv = ensurePathInEnv(effectiveEnv);
+    // A remote target's probe gets the run env only, never the server's own.
+    const runtimeEnv = remoteSafeRuntimeEnv(env, executionTarget);
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
       installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
       timeoutSec,

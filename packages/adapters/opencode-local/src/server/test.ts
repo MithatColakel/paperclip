@@ -13,8 +13,8 @@ import {
   asString,
   asStringArray,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
   maybeRunSandboxInstallCommand,
@@ -180,7 +180,8 @@ export async function testEnvironment(
         configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
       });
     }
-    const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env }));
+    // A remote target's probes get the configured env only, never the server's.
+    const runtimeEnv = normalizeEnv(remoteSafeRuntimeEnv(preparedRuntimeConfig.env, target ?? null));
 
     const cwdInvalid = checks.some((check) => check.code === "opencode_cwd_invalid");
     if (cwdInvalid) {

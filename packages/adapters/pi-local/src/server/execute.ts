@@ -37,7 +37,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
@@ -53,6 +52,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
@@ -349,7 +349,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const skillBinDirs = piSkillEntries
       .filter((entry) => injectedSkillKeys.has(entry.key) && entry.source.length > 0)
       .map((entry) => path.join(entry.source, "bin"));
-    const mergedEnv = ensurePathInEnv({ ...process.env, ...env });
+    // A remote target's install, probe and hello commands get the run env
+    // only, never the server's own environment.
+    const mergedEnv = remoteSafeRuntimeEnv(env, executionTarget);
     const pathKey =
       typeof mergedEnv.Path === "string" && mergedEnv.Path.length > 0 && !mergedEnv.PATH
         ? "Path"
@@ -493,11 +495,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (paperclipBridge) {
         Object.assign(env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(env, {
-          runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-              (entry): entry is [string, string] => typeof entry[1] === "string",
-            ),
-          ),
+          runtimeEnv: remoteSafeRuntimeEnv(env, executionTarget),
           includeRuntimeKeys: ["HOME"],
           resolvedCommand,
         });

@@ -9,9 +9,9 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
   maybeRunSandboxInstallCommand,
@@ -121,7 +121,8 @@ export async function testEnvironment(
   if (targetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  // A remote target's probe gets the configured env only, never the server's.
+  const runtimeEnv = remoteSafeRuntimeEnv(env, target);
   const installCheck = await maybeRunSandboxInstallCommand({
     runId,
     target,

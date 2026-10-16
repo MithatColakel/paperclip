@@ -105,6 +105,7 @@ export type {
   PluginWebhookInput,
   PluginApiRequestInput,
   PluginApiResponse,
+  PluginEnvironmentDriverFeatures,
 } from "./define-plugin.js";
 export type {
   TestHarness,
@@ -148,6 +149,7 @@ export type {
   JsonRpcErrorCode,
   PluginRpcErrorCode,
   PluginInvocationScope,
+  PluginInvocationActor,
   PluginInvocationContext,
   WorkerHostCallContext,
   InitializeParams,
@@ -293,6 +295,7 @@ export type {
   PluginLogger,
   PluginTracer,
   PluginSpan,
+  PluginEnvironmentsClient,
 } from "./types.js";
 
 // Tracer no-op default (a value, so it re-exports here, not in the type block).
@@ -451,5 +454,46 @@ export {
 
 export { PluginEnvironmentCreationCleanupError, environmentCreationCleanupErrorData, readEnvironmentCreationCleanupError } from "./environment-creation-cleanup.js";
 export type { PluginEnvironmentCreationCleanup } from "./environment-creation-cleanup.js";
+
+// Fork: environment availability. The typed unavailable signal, availability
+// checks, target reports and per-company environments for environment driver
+// plugins.
+export {
+  ENVIRONMENT_UNAVAILABLE_SCHEMA,
+  ENVIRONMENT_PROJECT_ID_FEATURE,
+  PLUGIN_ENVIRONMENT_UNAVAILABLE_SCOPES,
+  PLUGIN_ENVIRONMENT_UNAVAILABLE_REASONS,
+  PLUGIN_ENVIRONMENT_TARGET_REASONS,
+  PLUGIN_ENVIRONMENT_ADMISSION_REASONS,
+  PLUGIN_ENVIRONMENT_CREDENTIAL_TYPES,
+  ENVIRONMENT_UNAVAILABLE_LIMITS,
+  ENVIRONMENT_TARGET_REPORT_LIMITS,
+  ENSURE_COMPANY_ENVIRONMENT_LIMITS,
+  PluginEnvironmentUnavailableError,
+  environmentUnavailableErrorData,
+  readEnvironmentUnavailableError,
+  findEnvironmentUnavailable,
+  isEnvironmentUnavailableReasonAllowed,
+  readEnvironmentAvailabilityResult,
+  sanitizeEnvironmentText,
+  normalizeEnvironmentTargetReports,
+  pluginEnvironmentReportTargetsParamsSchema,
+  pluginEnsureCompanyEnvironmentParamsSchema,
+} from "./environment-availability.js";
+export type {
+  PluginEnvironmentUnavailable,
+  PluginEnvironmentUnavailableScope,
+  PluginEnvironmentUnavailableReason,
+  PluginEnvironmentTargetReason,
+  PluginEnvironmentAdmissionReason,
+  PluginEnvironmentCheckAvailabilityParams,
+  PluginEnvironmentAvailability,
+  PluginEnvironmentCredentialType,
+  PluginEnvironmentTargetReport,
+  PluginEnvironmentReportTargetsParams,
+  PluginEnvironmentReportTargetsResult,
+  PluginEnsureCompanyEnvironmentParams,
+  PluginEnsureCompanyEnvironmentResult,
+} from "./environment-availability.js";
 
 export type { AiConnectionPool, AiConnectionPoolConfig, AiConnectionPoolMember, AiConnectionRouterRequest, AiConnectionRouterResult, AiConnectionRouterSelection } from "@paperclipai/shared";

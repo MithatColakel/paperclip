@@ -18,6 +18,8 @@ export const ATTENTION_SOURCE_KINDS = [
   "failed_run",
   "budget_alert",
   "agent_error_alert",
+  // Fork: a task waiting for a device or a Claude account (one item per wait episode).
+  "resource_wait_alert",
 ] as const;
 
 export type AttentionSourceKind = (typeof ATTENTION_SOURCE_KINDS)[number];

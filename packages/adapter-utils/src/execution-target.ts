@@ -77,6 +77,7 @@ import {
   parseSshRemoteExecutionSpec,
   runSshCommand,
   shellQuote,
+  type SshRemoteEnvOptions,
   type SshTransferProcessRegistrar,
 } from "./ssh.js";
 import {
@@ -312,6 +313,8 @@ export interface AdapterExecutionTargetProcessOptions {
    */
   settleRunDisposition?: (() => DuplexBrokerRunDisposition) | null;
   localProcessSandbox?: LocalProcessSandboxOptions | null;
+  /** SSH only: extra secret keys to keep off the ssh argv, and keys to unset after the login profiles. */
+  remoteEnvOptions?: SshRemoteEnvOptions | null;
 }
 
 export interface AdapterExecutionTargetShellOptions {
@@ -320,6 +323,8 @@ export interface AdapterExecutionTargetShellOptions {
   timeoutSec?: number;
   graceSec?: number;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /** SSH only: extra secret keys to keep off the ssh argv, and keys to unset after the login profiles. */
+  remoteEnvOptions?: SshRemoteEnvOptions | null;
 }
 
 export interface AdapterExecutionTargetPaperclipBridgeHandle {
@@ -932,6 +937,7 @@ export async function runAdapterExecutionTargetProcess(
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
+    ...(options.remoteEnvOptions ? { remoteEnvOptions: options.remoteEnvOptions } : {}),
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote
   // provider exited. SSH status 255 is transport failure, never a stop receipt.
@@ -962,6 +968,7 @@ export async function runAdapterExecutionTargetShellCommand(
         const result = await runSshCommand(target.spec, command, {
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
+          ...(options.remoteEnvOptions ?? {}),
         });
         if (result.stdout) await onLog("stdout", result.stdout);
         if (result.stderr) await onLog("stderr", result.stderr);

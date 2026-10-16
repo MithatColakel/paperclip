@@ -147,6 +147,11 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "environment.captureTemplate": ["environment.drivers.register"],
   "environment.cancelInteractiveSetup": ["environment.drivers.register"],
   "environment.deleteTemplate": ["environment.drivers.register"],
+  "environment.checkAvailability": ["environment.drivers.register"],
+  // Fork: environment targets reported by a driver plugin (worker→host). No
+  // new capability: a driver plugin already controls its own environments.
+  "environments.reportTargets": ["environment.drivers.register"],
+  "environments.ensureCompanyEnvironment": ["environment.drivers.register"],
 };
 
 /**

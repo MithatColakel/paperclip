@@ -37,7 +37,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
   hydrateFreshSessionHandoff,
@@ -52,6 +51,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -332,11 +332,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    // A remote target's install and probe commands get the run env only,
+    // never the server's own environment.
+    const runtimeEnv = remoteSafeRuntimeEnv(preparedRuntimeConfig.env, executionTarget);
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),
@@ -490,11 +488,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (paperclipBridge) {
         Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
-          runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-              (entry): entry is [string, string] => typeof entry[1] === "string",
-            ),
-          ),
+          runtimeEnv: remoteSafeRuntimeEnv(preparedRuntimeConfig.env, executionTarget),
           includeRuntimeKeys: ["HOME"],
           resolvedCommand,
         });

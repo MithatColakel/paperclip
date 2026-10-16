@@ -52,6 +52,10 @@ import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paper
 
 import type { PluginContext } from "./types.js";
 import type {
+  PluginEnvironmentAvailability,
+  PluginEnvironmentCheckAvailabilityParams,
+} from "./environment-availability.js";
+import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
@@ -208,6 +212,24 @@ export interface PluginConfigChangeContext {
 }
 
 // ---------------------------------------------------------------------------
+// Environment driver features
+// ---------------------------------------------------------------------------
+
+/**
+ * Fork: optional environment driver protocol features a plugin opts into.
+ * The worker advertises each one to the host, which then changes what it
+ * sends.
+ */
+export interface PluginEnvironmentDriverFeatures {
+  /**
+   * Receive `projectId` (a string, or null for a run without a project) in
+   * acquire, resume and checkAvailability params. Without this opt-in the
+   * host never sends the key.
+   */
+  projectId?: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin definition
 // ---------------------------------------------------------------------------
 
@@ -263,6 +285,9 @@ export interface PluginDefinition {
    * config for a different company (idempotent replay) is still allowed.
    */
   multiCompanyConfig?: boolean;
+
+  /** Environment driver protocol features this plugin opts into. */
+  environmentDriverFeatures?: PluginEnvironmentDriverFeatures;
 
   /**
    * Called when the operator updates this plugin's company-scoped configuration
@@ -463,6 +488,17 @@ export interface PluginDefinition {
   onEnvironmentDeleteTemplate?(
     params: PluginEnvironmentDeleteTemplateParams,
   ): Promise<PluginEnvironmentDeleteTemplateResult>;
+
+  /**
+   * Fork, optional: report whether the environment's target can take runs. It must
+   * be cheap and free of side effects, and it reports target-level state only
+   * (no company or project admission). The host calls it only while runs wait
+   * for the target. Defining it advertises `environmentCheckAvailability`.
+   * It may also throw `PluginEnvironmentUnavailableError`.
+   */
+  onEnvironmentCheckAvailability?(
+    params: PluginEnvironmentCheckAvailabilityParams,
+  ): Promise<PluginEnvironmentAvailability>;
 
   /**
    * Called to open one live Claude `setup-token` login pseudo-terminal.

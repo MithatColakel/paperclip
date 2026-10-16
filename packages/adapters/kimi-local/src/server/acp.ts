@@ -25,6 +25,7 @@ import {
   asString,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "../index.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -219,7 +220,8 @@ async function commandIsResolvable(
         token,
         target,
         resolveAdapterExecutionTargetCwd(target, asString(input?.config.cwd, ""), process.cwd()),
-        process.env,
+        // Never the server's own env: a sandbox probe would carry it to the target.
+        remoteSafeRuntimeEnv({}, target),
       );
       return true;
     } catch {

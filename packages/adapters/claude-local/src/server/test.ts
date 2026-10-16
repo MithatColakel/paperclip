@@ -9,8 +9,8 @@ import {
   asNumber,
   asStringArray,
   parseObject,
-  ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetDirectory,
@@ -148,7 +148,8 @@ export async function testEnvironment(
       helloProbeTimeoutSec: asNumber(config.helloProbeTimeoutSec, targetIsSandbox ? 90 : 45),
     })),
   );
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  // A remote target's probe gets the configured env only, never the server's.
+  const runtimeEnv = remoteSafeRuntimeEnv(env, target);
   let localRuntimeCommand: string | null = null;
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);

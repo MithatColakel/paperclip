@@ -2150,6 +2150,20 @@
       "when": 1791972189545,
       "tag": "0308_spicy_silk_fever",
       "breakpoints": true
+    },
+    {
+      "idx": 309,
+      "version": "7",
+      "when": 1792177610956,
+      "tag": "0309_smooth_killmonger",
+      "breakpoints": true
+    },
+    {
+      "idx": 310,
+      "version": "7",
+      "when": 1792177623369,
+      "tag": "0310_productive_veda",
+      "breakpoints": true
     }
   ]
 }

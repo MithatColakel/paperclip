@@ -83,6 +83,14 @@ import type {
   PluginConfigValidationResult,
   PluginWebhookInput,
 } from "./define-plugin.js";
+import type {
+  PluginEnsureCompanyEnvironmentParams,
+  PluginEnsureCompanyEnvironmentResult,
+  PluginEnvironmentAvailability,
+  PluginEnvironmentCheckAvailabilityParams,
+  PluginEnvironmentReportTargetsParams,
+  PluginEnvironmentReportTargetsResult,
+} from "./environment-availability.js";
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 — Core Protocol Types
@@ -283,6 +291,23 @@ export type PluginRpcErrorCode =
  */
 export interface PluginInvocationScope {
   companyId: string;
+  /**
+   * Fork: the host→worker method that opened the invocation. Host-derived:
+   * the host fills it from its own record; a worker never supplies it.
+   */
+  method?: HostToWorkerMethodName;
+  /**
+   * Fork: the authenticated principal behind a `performAction` invocation,
+   * host-derived from the action's actor context. Workers never supply it.
+   */
+  actor?: PluginInvocationActor;
+}
+
+/** Host-derived actor of an invocation. */
+export interface PluginInvocationActor {
+  type: PluginPerformActionActorType;
+  /** The board user id when `type === "user"`, otherwise null. */
+  userId: string | null;
 }
 
 /**
@@ -430,6 +455,12 @@ export interface PluginPerformActionActorContext {
   runId: string | null;
   /** Company id authorized by the host bridge for this action, when applicable. */
   companyId: string | null;
+  /**
+   * Fork: true when the host resolved a board actor that is an instance admin.
+   * Host-derived only; a host that predates it leaves it unset, which plugins
+   * must treat as false.
+   */
+  isInstanceAdmin?: boolean;
 }
 
 export interface PluginPerformActionContext {
@@ -585,6 +616,12 @@ export interface PluginEnvironmentDriverBaseParams {
   companyId: string;
   environmentId: string;
   issueId?: string | null;
+  /**
+   * Fork: the run's project (or null for a run without one). Sent on acquire, resume
+   * and checkAvailability only to workers that opt in through
+   * `environmentDriverFeatures.projectId`; others never receive the key.
+   */
+  projectId?: string | null;
   config: Record<string, unknown>;
 }
 
@@ -1428,6 +1465,11 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentDeleteTemplateParams,
     result: PluginEnvironmentDeleteTemplateResult,
   ];
+  /** Fork: cheap, side-effect free, target-level availability check. */
+  environmentCheckAvailability: [
+    params: PluginEnvironmentCheckAvailabilityParams,
+    result: PluginEnvironmentAvailability,
+  ];
   /** Open one live login pseudo-terminal keyed by a host-owned route identifier. */
   loginPtyOpen: [
     params: PluginLoginPtyOpenParams,
@@ -1500,6 +1542,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentCaptureTemplate",
   "environmentCancelInteractiveSetup",
   "environmentDeleteTemplate",
+  "environmentCheckAvailability",
   "loginPtyOpen",
   "loginPtyInput",
   "loginPtyStop",
@@ -2272,6 +2315,19 @@ export interface WorkerToHostMethods {
       offset?: number;
     },
     result: PluginAuthorizationAuditEntry[],
+  ];
+
+  // Fork: environment targets (environment driver plugins). `reportTargets` carries
+  // no company, so it is allowed outside invocations.
+  // `ensureCompanyEnvironment` needs a `performAction` invocation for that
+  // company by a board user.
+  "environments.reportTargets": [
+    params: PluginEnvironmentReportTargetsParams,
+    result: PluginEnvironmentReportTargetsResult,
+  ];
+  "environments.ensureCompanyEnvironment": [
+    params: PluginEnsureCompanyEnvironmentParams,
+    result: PluginEnsureCompanyEnvironmentResult,
   ];
 }
 

@@ -17,9 +17,20 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
+import { managedClaudeConfigDirName, readAiCredentialRef } from "./ai-credential-ref.js";
 import { classifyThrownErrorClass, logSandboxProbeDiagnostic } from "./probe-diagnostics.js";
 
 const SEEDED_SHARED_FILES = ["settings.json", "CLAUDE.md"] as const;
+
+// Fork: settings keys that can route a run or supply a credential. A pool
+// account's config seed drops them, so neither the server's settings nor a
+// helper script can override the account's own token.
+const AUTH_ROUTING_SETTINGS_KEYS = ["env", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] as const;
+
+export interface ClaudeConfigSeedOptions {
+  /** Fork: also drop the auth and routing settings (pool-account runs). */
+  stripAuthSettings?: boolean;
+}
 
 interface SeedFile {
   name: string;
@@ -41,7 +52,7 @@ function isAlreadyExistsError(error: unknown): boolean {
   return code === "EEXIST" || code === "ENOTEMPTY";
 }
 
-function sanitizeRemoteClaudeSettings(raw: string): string {
+function sanitizeRemoteClaudeSettings(raw: string, options: ClaudeConfigSeedOptions = {}): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -59,17 +70,20 @@ function sanitizeRemoteClaudeSettings(raw: string): string {
   delete settings.mcpServers;
   delete settings.permissionMode;
   delete settings.skipDangerousModePermissionPrompt;
+  if (options.stripAuthSettings) {
+    for (const key of AUTH_ROUTING_SETTINGS_KEYS) delete settings[key];
+  }
   return JSON.stringify(settings);
 }
 
-async function collectSeedFiles(sourceDir: string): Promise<SeedFile[]> {
+async function collectSeedFiles(sourceDir: string, options: ClaudeConfigSeedOptions = {}): Promise<SeedFile[]> {
   const files: SeedFile[] = [];
   for (const name of SEEDED_SHARED_FILES) {
     const sourcePath = path.join(sourceDir, name);
     if (!(await pathExists(sourcePath))) continue;
     const rawContents = await fs.readFile(sourcePath);
     const contents = name === "settings.json"
-      ? Buffer.from(sanitizeRemoteClaudeSettings(rawContents.toString("utf8")), "utf8")
+      ? Buffer.from(sanitizeRemoteClaudeSettings(rawContents.toString("utf8"), options), "utf8")
       : rawContents;
     files.push({ name, sourcePath, contents });
   }
@@ -187,15 +201,18 @@ export async function prepareClaudeConfigSeed(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
+  options: ClaudeConfigSeedOptions = {},
 ): Promise<string> {
   const sourceDir = resolveSharedClaudeConfigDir(env);
   const targetRootDir = resolveManagedClaudeConfigSeedDir(env, companyId);
 
-  if (path.resolve(sourceDir) === path.resolve(targetRootDir)) {
+  if (!options.stripAuthSettings && path.resolve(sourceDir) === path.resolve(targetRootDir)) {
     return targetRootDir;
   }
 
-  const copiedFiles = await collectSeedFiles(sourceDir);
+  // Snapshots are content-addressed, so a stripped seed gets its own snapshot
+  // whenever stripping changes the settings.
+  const copiedFiles = await collectSeedFiles(sourceDir, options);
   const snapshotKey = await buildSeedSnapshotKey(copiedFiles);
   const targetDir = await materializeSeedSnapshot({
     rootDir: targetRootDir,
@@ -218,19 +235,38 @@ export async function prepareClaudeConfigSeed(
   return targetDir;
 }
 
+export interface RemoteClaudeConfigMaterializationOptions {
+  /**
+   * "copy" (default) copies the target user's stored Claude login from
+   * `$HOME/.claude` when the config dir has none. Fork: "remove" never reads
+   * `$HOME` and deletes any stored login from the config dir, so a pool
+   * account's directory can never fall back to someone else's login.
+   */
+  hostCredentials?: "copy" | "remove";
+  /**
+   * Fork: drop the settings a previous run left in the config dir before the
+   * seed is copied, so the only user settings are the seed's stripped ones.
+   */
+  sanitizeSettings?: boolean;
+}
+
 export function buildRemoteClaudeConfigMaterializationCommand(input: {
   remoteClaudeConfigDir: string;
   remoteClaudeConfigSeedDir: string;
-}): string {
-  return `mkdir -p ${shellQuote(input.remoteClaudeConfigDir)} && ` +
+} & RemoteClaudeConfigMaterializationOptions): string {
+  const configDir = shellQuote(input.remoteClaudeConfigDir);
+  return `mkdir -p ${configDir} && ` +
+    (input.sanitizeSettings ? `rm -f ${configDir}/settings.json && ` : "") +
     `if [ -d ${shellQuote(input.remoteClaudeConfigSeedDir)} ]; then ` +
-    `cp -R ${shellQuote(`${input.remoteClaudeConfigSeedDir}/.`)} ${shellQuote(input.remoteClaudeConfigDir)}/; ` +
+    `cp -R ${shellQuote(`${input.remoteClaudeConfigSeedDir}/.`)} ${configDir}/; ` +
     `fi; ` +
-    `for file in .credentials.json credentials.json; do ` +
-    `if [ -n "\${HOME:-}" ] && [ -f "\${HOME}/.claude/\${file}" ] && [ ! -f ${shellQuote(input.remoteClaudeConfigDir)}/"\${file}" ]; then ` +
-    `cp "\${HOME}/.claude/\${file}" ${shellQuote(input.remoteClaudeConfigDir)}/"\${file}"; ` +
-    `fi; ` +
-    `done`;
+    (input.hostCredentials === "remove"
+      ? `rm -f ${configDir}/.credentials.json ${configDir}/credentials.json`
+      : `for file in .credentials.json credentials.json; do ` +
+        `if [ -n "\${HOME:-}" ] && [ -f "\${HOME}/.claude/\${file}" ] && [ ! -f ${configDir}/"\${file}" ]; then ` +
+        `cp "\${HOME}/.claude/\${file}" ${configDir}/"\${file}"; ` +
+        `fi; ` +
+        `done`);
 }
 
 export async function materializeRemoteClaudeConfig(input: {
@@ -239,17 +275,29 @@ export async function materializeRemoteClaudeConfig(input: {
   remoteClaudeConfigDir: string;
   remoteClaudeConfigSeedDir: string;
   options: AdapterExecutionTargetShellOptions;
-}): Promise<void> {
+} & RemoteClaudeConfigMaterializationOptions): Promise<void> {
   await runAdapterExecutionTargetShellCommand(
     input.runId,
     input.target,
     buildRemoteClaudeConfigMaterializationCommand({
       remoteClaudeConfigDir: input.remoteClaudeConfigDir,
       remoteClaudeConfigSeedDir: input.remoteClaudeConfigSeedDir,
+      ...(input.hostCredentials ? { hostCredentials: input.hostCredentials } : {}),
+      ...(input.sanitizeSettings ? { sanitizeSettings: true } : {}),
     }),
     input.options,
   );
 }
+
+/**
+ * Fork: the managed Claude config of a pool-account run on a sandbox or SSH
+ * target. The account gets its own directory and keychain item, seeded with
+ * stripped settings and never with a stored login.
+ */
+export const POOL_CLAUDE_CONFIG_MATERIALIZATION: Required<RemoteClaudeConfigMaterializationOptions> = {
+  hostCredentials: "remove",
+  sanitizeSettings: true,
+};
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -293,15 +341,19 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
   if (installCheck) checks.push(installCheck);
 
   const hasExplicitClaudeConfigDir = isNonEmptyString(input.env.CLAUDE_CONFIG_DIR);
+  // Fork: a pool-account probe always uses the account's own managed config.
+  const credentialRef = readAiCredentialRef(input.env);
   if (
     input.targetIsRemote &&
     adapterExecutionTargetUsesManagedHome(input.target) &&
-    (!hasExplicitClaudeConfigDir || input.managedAiConnection)
+    (!hasExplicitClaudeConfigDir || input.managedAiConnection || credentialRef)
   ) {
     let tempWorkspaceDir: string | null = null;
     let preparedRuntime: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | null = null;
     try {
-      const seedDir = input.managedAiConnection ? input.env.CLAUDE_CONFIG_DIR : await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId);
+      const seedDir = credentialRef
+        ? await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId, { stripAuthSettings: true })
+        : input.managedAiConnection ? input.env.CLAUDE_CONFIG_DIR : await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId);
       const managedRemoteCwd =
         input.target?.kind === "remote" ? input.target.remoteCwd : input.cwd;
       tempWorkspaceDir = await fs.mkdtemp(
@@ -328,16 +380,18 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
       const remoteClaudeConfigSeedDir =
         preparedRuntime.assetDirs["config-seed"] ??
         path.posix.join(runtimeRootDir, "config-seed");
-      const remoteClaudeConfigDir = path.posix.join(runtimeRootDir, "config");
+      const remoteClaudeConfigDir = path.posix.join(runtimeRootDir, managedClaudeConfigDirName(credentialRef));
       input.env.CLAUDE_CONFIG_DIR = remoteClaudeConfigDir;
       await materializeRemoteClaudeConfig({
         runId: input.runId,
         target: input.target,
         remoteClaudeConfigDir,
         remoteClaudeConfigSeedDir,
+        ...(credentialRef ? POOL_CLAUDE_CONFIG_MATERIALIZATION : {}),
         options: {
           cwd: input.cwd,
-          env: input.env,
+          // Fork: the pool materialization reads no env, so the token stays out of it.
+          env: credentialRef ? {} : input.env,
           timeoutSec: Math.max(15, input.helloProbeTimeoutSec),
           graceSec: 5,
           onLog: async () => {},

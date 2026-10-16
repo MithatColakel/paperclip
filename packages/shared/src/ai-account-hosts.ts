@@ -1,11 +1,12 @@
 import { z } from "zod";
 
 /**
- * Fork: Claude credentials per execution host. A host is a machine that runs
- * agents (the Paperclip server, a runner server, later a Mac). Every run on a
- * host draws a credential from that host's pool, balanced across its
- * available accounts, and moves to another account of the same host when one
- * reaches its usage limit.
+ * Fork: execution hosts (devices) and their Claude accounts. A host is a
+ * machine that runs agents: the Paperclip server, an SSH runner, or a device
+ * that an environment driver plugin registered (`external`). Accounts are now
+ * user-owned pool accounts bound per agent (see ai-account-pool.ts); the
+ * per-host shapes below remain for the legacy host routes. Paperclip never
+ * moves a task to another account.
  */
 
 /** Operator rule: at most this many credentials per host. */
@@ -17,8 +18,16 @@ export const AI_ACCOUNT_DEFAULT_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
 /** An API key whose credit balance ran out rests this long before it is tried again. */
 export const AI_ACCOUNT_CREDIT_BALANCE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-export const AI_ACCOUNT_HOST_KINDS = ["server", "ssh_host", "mac"] as const;
+/** `external`: registered by an environment driver plugin's target report. */
+export const AI_ACCOUNT_HOST_KINDS = ["server", "ssh_host", "mac", "external"] as const;
 export type AiAccountHostKind = (typeof AI_ACCOUNT_HOST_KINDS)[number];
+
+/**
+ * The kinds a person may add by hand. An `external` device comes only from an
+ * environment driver plugin's target report, which also gives it its target
+ * key and its managing plugin.
+ */
+export const AI_ACCOUNT_HOST_CREATABLE_KINDS = ["server", "ssh_host", "mac"] as const satisfies readonly AiAccountHostKind[];
 
 export const AI_ACCOUNT_CREDENTIAL_TYPES = ["subscription", "api_key"] as const;
 export type AiAccountCredentialType = (typeof AI_ACCOUNT_CREDENTIAL_TYPES)[number];
@@ -66,7 +75,8 @@ export interface AiAccountUsage {
 
 export interface AiAccountSummary {
   id: string;
-  hostId: string;
+  /** The legacy host the account was added to; null for pool accounts. */
+  hostId: string | null;
   provider: "anthropic";
   credentialType: AiAccountCredentialType;
   label: string;
@@ -135,7 +145,11 @@ const trimmed = z.string().trim();
 
 export const createAiAccountHostSchema = z.object({
   name: trimmed.min(1).max(80),
-  kind: z.enum(AI_ACCOUNT_HOST_KINDS),
+  // Fork: the type keeps every kind so existing callers compile; `external` is refused.
+  kind: z.enum(AI_ACCOUNT_HOST_KINDS).refine(
+    (kind) => (AI_ACCOUNT_HOST_CREATABLE_KINDS as readonly string[]).includes(kind),
+    "Plugin devices come only from their environment driver plugin's reports",
+  ),
   maxAccounts: z.number().int().min(1).max(MAX_AI_ACCOUNTS_PER_HOST).optional(),
   overflowToOtherAccounts: z.boolean().optional(),
 }).strict();

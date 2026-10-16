@@ -18,12 +18,14 @@ export const HOST_KIND_LABELS: Record<AiAccountHostKind, string> = {
   server: "Paperclip server",
   ssh_host: "Runner server (SSH)",
   mac: "Mac over SSH",
+  external: "Plugin device",
 };
 
 export const HOST_KIND_DESCRIPTIONS: Record<AiAccountHostKind, string> = {
   server: "Runs every Local environment.",
   ssh_host: "A runner machine reached over SSH.",
   mac: "A Mac reached over an SSH environment.",
+  external: "A device an environment driver plugin registered.",
 };
 
 /** Mirrors the server rule: which environment drivers can run on each host kind. */
@@ -31,6 +33,7 @@ export const HOST_KIND_DRIVERS: Record<AiAccountHostKind, readonly string[]> = {
   server: ["local"],
   ssh_host: ["ssh"],
   mac: ["ssh"],
+  external: ["sandbox"],
 };
 
 export const CREDENTIAL_TYPE_LABELS: Record<AiAccountCredentialType, string> = {

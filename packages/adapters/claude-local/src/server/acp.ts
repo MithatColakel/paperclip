@@ -40,11 +40,14 @@ import {
   asString,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { remoteSafeRuntimeEnv } from "@paperclipai/adapter-utils/remote-execution-env";
 import {
   materializeRemoteClaudeConfig,
+  POOL_CLAUDE_CONFIG_MATERIALIZATION,
   prepareClaudeConfigSeed,
   prepareSandboxClaudeProbeRuntime,
 } from "./claude-config.js";
+import { managedClaudeConfigDirName, readAiCredentialRef } from "./ai-credential-ref.js";
 import {
   buildAdapterTestTargetCheck,
   buildClaudeLoginRequiredHint,
@@ -230,7 +233,10 @@ async function prepareClaudeRemoteManagedHome(
     typeof envConfig.CLAUDE_CONFIG_DIR === "string" && envConfig.CLAUDE_CONFIG_DIR.trim().length > 0
       ? envConfig.CLAUDE_CONFIG_DIR.trim()
       : "";
-  if (explicitClaudeConfigDir && !input.config.managedAiConnection) {
+  // Fork: a pool-account run always uses the account's own managed config,
+  // seeded with stripped settings and never with a stored login.
+  const poolCredentialRef = readAiCredentialRef(envConfig);
+  if (explicitClaudeConfigDir && !input.config.managedAiConnection && !poolCredentialRef) {
     // User-managed escape hatch. Unlike the Claude CLI lane
     // (`claude-local/execute.ts`), which runs the process on the same host and can
     // forward the operator's path verbatim, the remote ACP lane spawns Claude
@@ -270,7 +276,9 @@ async function prepareClaudeRemoteManagedHome(
 
   // Content-addressed sanitized seed (managed cache under the instance root, not
   // a temp dir — reused across runs, so no teardown cleanup).
-  const claudeConfigSeedDir = input.config.managedAiConnection
+  const claudeConfigSeedDir = poolCredentialRef
+    ? await prepareClaudeConfigSeed(process.env, onLog, input.companyId, { stripAuthSettings: true })
+    : input.config.managedAiConnection
     ? explicitClaudeConfigDir
     : await prepareClaudeConfigSeed(process.env, onLog, input.companyId);
   // Ship the per-run skill bundle, staged only when the run selected at
@@ -295,7 +303,7 @@ async function prepareClaudeRemoteManagedHome(
     path.posix.join(stagedRuntime.workspaceRemoteDir ?? input.workspaceLocalDir, ".paperclip-runtime", "claude");
   const remoteClaudeConfigSeedDir =
     stagedRuntime.assetDirs["config-seed"] ?? path.posix.join(remoteClaudeRuntimeRoot, "config-seed");
-  const remoteClaudeConfigDir = path.posix.join(remoteClaudeRuntimeRoot, "config");
+  const remoteClaudeConfigDir = path.posix.join(remoteClaudeRuntimeRoot, managedClaudeConfigDirName(poolCredentialRef));
 
   await onLog("stdout", `[paperclip] Materializing Claude auth/config into ${remoteClaudeConfigDir}.\n`);
   await materializeRemoteClaudeConfig({
@@ -303,9 +311,11 @@ async function prepareClaudeRemoteManagedHome(
     target: executionTarget,
     remoteClaudeConfigDir,
     remoteClaudeConfigSeedDir,
+    ...(poolCredentialRef ? POOL_CLAUDE_CONFIG_MATERIALIZATION : {}),
     options: {
       cwd: stagedRuntime.workspaceRemoteDir ?? input.workspaceLocalDir,
-      env,
+      // Fork: the pool materialization reads no env, so the token stays out of it.
+      env: poolCredentialRef ? {} : env,
       timeoutSec: Math.max(input.timeoutSec, 15),
       graceSec: 20,
       onLog,
@@ -505,7 +515,8 @@ async function commandIsResolvable(
         trimmed,
         target,
         resolveAdapterExecutionTargetCwd(target, asString(input?.config.cwd, ""), process.cwd()),
-        process.env,
+        // Never the server's own env: a sandbox probe would carry it to the target.
+        remoteSafeRuntimeEnv({}, target),
       );
       return true;
     } catch {

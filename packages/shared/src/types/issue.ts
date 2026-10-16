@@ -1,4 +1,5 @@
 import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
+import type { ScheduledRetryResourceWait } from "../resource-waits.js";
 import type {
   IssueCommentAuthorType,
   IssueCommentMetadataRowType,
@@ -601,6 +602,8 @@ export interface IssueScheduledRetry {
   retryExhaustedReason?: string | null;
   error?: string | null;
   errorCode?: string | null;
+  /** Fork: set when the retry waits for a device, a Claude account or device account slots. */
+  resourceWait?: ScheduledRetryResourceWait | null;
 }
 
 export type IssueRetryNowOutcome =

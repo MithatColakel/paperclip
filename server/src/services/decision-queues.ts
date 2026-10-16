@@ -280,6 +280,10 @@ async function sourceIssueId(
         .then((rows) => rows[0] ?? null);
       return { exists: Boolean(row), issueId: null };
     }
+    // Fork: resource-wait alerts are derived on read from open wait episodes
+    // and are not kept in decision queues.
+    case "resource_wait_alert":
+      return { exists: false, issueId: null };
   }
 }
 

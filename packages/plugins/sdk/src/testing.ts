@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { createIssueThreadInteractionSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import type {
@@ -45,6 +46,12 @@ import type {
   PrincipalType,
 } from "./types.js";
 import { NOOP_PLUGIN_TRACER } from "./types.js";
+import {
+  normalizeEnvironmentTargetReports,
+  pluginEnsureCompanyEnvironmentParamsSchema,
+  pluginEnvironmentReportTargetsParamsSchema,
+} from "./environment-availability.js";
+import { InvocationScopeDeniedError } from "./host-client-factory.js";
 import type {
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentValidationResult,
@@ -583,6 +590,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     (params: Record<string, unknown>, context: PluginPerformActionContext) => Promise<unknown>
   >();
   const toolHandlers = new Map<string, (params: unknown, runCtx: ToolRunContext) => Promise<ToolResult>>();
+  // Fork: the action invocation a host call runs in, like the host's invocation
+  // scope. Only `performAction` sets one.
+  const actionInvocation = new AsyncLocalStorage<PluginPerformActionContext>();
 
   function localFolderKey(companyId: string, folderKey: string): string {
     return `${companyId}:${folderKey}`;
@@ -612,6 +622,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       agentId: stringOrNull(actorInput?.agentId),
       runId: stringOrNull(actorInput?.runId),
       companyId,
+      ...(typeof actorInput?.isInstanceAdmin === "boolean" ? { isInstanceAdmin: actorInput.isInstanceAdmin } : {}),
     });
     return Object.freeze({ actor, companyId });
   }
@@ -2506,6 +2517,47 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         // No-op in test harness — the host duplex route is not wired here.
       },
     },
+    environments: (() => {
+      // Fork: in-memory stand-in that refuses what the host refuses. Reports
+      // are normalized like the worker sends them, then checked with the
+      // host's validator and counted. Environments are created once per
+      // (company, driver, match), only from a board user's action in that
+      // company, with params the host's validator accepts.
+      const ensured = new Map<string, { environmentId: string; name: string }>();
+      return {
+        async reportTargets(params) {
+          requireCapability(manifest, capabilitySet, "environment.drivers.register");
+          const report = pluginEnvironmentReportTargetsParamsSchema.parse(normalizeEnvironmentTargetReports(params));
+          return { accepted: report.targets.length };
+        },
+        async ensureCompanyEnvironment(params) {
+          requireCapability(manifest, capabilitySet, "environment.drivers.register");
+          const action = actionInvocation.getStore();
+          if (
+            !action
+            || action.actor.type !== "user"
+            || !action.actor.userId
+            || !action.companyId
+            || action.companyId !== params.companyId
+          ) {
+            throw new InvocationScopeDeniedError(
+              manifest.id,
+              "environments.ensureCompanyEnvironment",
+              "only a performAction invocation by a board user of this company may do this",
+            );
+          }
+          const request = pluginEnsureCompanyEnvironmentParamsSchema.parse(params);
+          const cid = requireCompanyId(request.companyId);
+          const matchKey = JSON.stringify(Object.entries(request.match).sort(([a], [b]) => a.localeCompare(b)));
+          const key = `${cid}:${request.driverKey}:${matchKey}`;
+          const existing = ensured.get(key);
+          if (existing) return { ...existing, created: false };
+          const environment = { environmentId: randomUUID(), name: request.name };
+          ensured.set(key, environment);
+          return { ...environment, created: true };
+        },
+      };
+    })(),
     tools: {
       register(name, _decl, fn) {
         requireCapability(manifest, capabilitySet, "agent.tools.register");
@@ -2634,7 +2686,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       const handler = actionHandlers.get(key);
       if (!handler) throw new Error(`No action handler registered for '${key}'`);
       const context = actionContextFor(params, options);
-      return await handler(paramsWithHostCompanyScope(params, context, options), context) as T;
+      return await actionInvocation.run(
+        context,
+        () => handler(paramsWithHostCompanyScope(params, context, options), context),
+      ) as T;
     },
     async executeTool<T = ToolResult>(name: string, params: unknown, runCtx: Partial<ToolRunContext> = {}) {
       const handler = toolHandlers.get(name);
