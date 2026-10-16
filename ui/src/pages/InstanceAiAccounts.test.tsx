@@ -4,30 +4,65 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AiAccountHostsResponse, AiAccountProjectSummary, AiAccountSummary, AiAccountUsageWindow } from "@paperclipai/shared";
+import type {
+  AiAccountHostsResponse,
+  AiAccountMigrationReport,
+  AiAccountSummary,
+  AiAccountUsageWindow,
+  EnvironmentAvailabilitySummary,
+  InstanceAiAccountSummary,
+  InstanceExecutionDeviceSummary,
+} from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
+import { formatResetTime } from "@/lib/ai-account-pool";
 import { formatDateTime } from "@/lib/utils";
 import { InstanceAiAccounts } from "./InstanceAiAccounts";
 
 const mocks = vi.hoisted(() => ({
-  list: vi.fn(),
-  createHost: vi.fn(),
-  updateHost: vi.fn(),
-  deleteHost: vi.fn(),
-  setEnvironments: vi.fn(),
-  addAccount: vi.fn(),
-  updateAccount: vi.fn(),
-  clearLimit: vi.fn(),
-  setAccountProjects: vi.fn(),
-  deleteAccount: vi.fn(),
-  listConnections: vi.fn(),
-  listPlugins: vi.fn(),
+  devices: {
+    list: vi.fn(),
+    get: vi.fn(),
+    checkNow: vi.fn(),
+    getWaitSettings: vi.fn(),
+    updateWaitSettings: vi.fn(),
+    listInstance: vi.fn(),
+    updateInstance: vi.fn(),
+    linkTarget: vi.fn(),
+  },
+  pool: {
+    listInstanceAccounts: vi.fn(),
+    updateInstanceAccount: vi.fn(),
+    setAdminDisabled: vi.fn(),
+    transferOwner: vi.fn(),
+    clearInstanceLimit: vi.fn(),
+    removeInstanceAccount: vi.fn(),
+    getMigrationReport: vi.fn(),
+    runMigration: vi.fn(),
+  },
+  hosts: {
+    list: vi.fn(),
+    createHost: vi.fn(),
+    updateHost: vi.fn(),
+    deleteHost: vi.fn(),
+    setEnvironments: vi.fn(),
+  },
+  searchAdminUsers: vi.fn(),
   setBreadcrumbs: vi.fn(),
 }));
 
-vi.mock("@/api/ai-account-hosts", () => ({ aiAccountHostsApi: mocks }));
-vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: { list: mocks.listConnections } }));
-vi.mock("@/api/plugins", () => ({ pluginsApi: { list: mocks.listPlugins } }));
+vi.mock("@/api/execution-devices", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/execution-devices")>();
+  return { ...actual, executionDevicesApi: mocks.devices };
+});
+vi.mock("@/api/ai-account-pool", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/ai-account-pool")>();
+  return { ...actual, aiAccountPoolApi: mocks.pool };
+});
+vi.mock("@/api/ai-account-hosts", () => ({ aiAccountHostsApi: mocks.hosts }));
+vi.mock("@/api/access", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/access")>();
+  return { ...actual, accessApi: { ...actual.accessApi, searchAdminUsers: mocks.searchAdminUsers } };
+});
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: mocks.setBreadcrumbs }) }));
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
@@ -36,30 +71,223 @@ vi.mock("@/context/CompanyContext", () => ({
   }),
 }));
 
-const PASTED_TOKEN = `sk-ant-oat01-${"x".repeat(90)}`;
-const FUTURE = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+const PLUGIN_ID = "0b9a3c52-1f0e-4a77-9b51-6d9c2a1e4f10";
+// A minute ago, so the expectations hold at any time of day.
+const SINCE = new Date(Date.now() - 60_000).toISOString();
+const SINCE_TEXT = formatResetTime(SINCE)!;
+const LATER = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
 const LAST_LIMIT = "2026-10-13T09:30:00.000Z";
-const EMPTY_WINDOW: AiAccountUsageWindow = { runs: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costCents: 0 };
-const usage = (
-  lastFiveHours: Partial<AiAccountUsageWindow>,
-  lastSevenDays: Partial<AiAccountUsageWindow>,
-  thisMonth: Partial<AiAccountUsageWindow> = {},
-) => ({
-  lastFiveHours: { ...EMPTY_WINDOW, ...lastFiveHours },
-  lastSevenDays: { ...EMPTY_WINDOW, ...lastSevenDays },
-  thisMonth: { ...EMPTY_WINDOW, ...thisMonth },
-});
-const MOBILE: AiAccountProjectSummary = { id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Cleanio", issuePrefix: "CLE" };
-const WEBSITE: AiAccountProjectSummary = { id: "project-web", name: "Website", companyId: "company-a", companyName: "Cleanio", issuePrefix: "CLE" };
-const VPN: AiAccountProjectSummary = { id: "project-vpn", name: "VPN core", companyId: "company-b", companyName: "Presto", issuePrefix: "PRE" };
 
-function account(overrides: Partial<AiAccountSummary>): AiAccountSummary {
+const AVAILABLE: EnvironmentAvailabilitySummary = {
+  state: "available",
+  reason: null,
+  label: null,
+  message: null,
+  unavailableSince: null,
+  retryAfter: null,
+  checkedAt: null,
+  acceptedCredentialTypes: null,
+};
+const OFFLINE: EnvironmentAvailabilitySummary = {
+  ...AVAILABLE,
+  state: "unavailable",
+  reason: "unreachable",
+  message: "Connection timed out during banner exchange",
+  unavailableSince: SINCE,
+};
+
+function device(overrides: Partial<InstanceExecutionDeviceSummary>): InstanceExecutionDeviceSummary {
+  return {
+    id: "dev-server",
+    name: "Paperclip server",
+    kind: "server",
+    maxAccounts: 3,
+    limit: 3,
+    inUse: 0,
+    overLimit: false,
+    overLimitSince: null,
+    externalKey: null,
+    targetKey: null,
+    targetProvider: null,
+    targetMatch: null,
+    targetReportedAt: null,
+    managedByPluginId: null,
+    managedByPluginName: null,
+    owner: null,
+    aliases: [],
+    servedCompanyIds: [],
+    availability: AVAILABLE,
+    acceptedCredentialTypes: null,
+    environments: [],
+    accounts: [],
+    companies: [],
+    duplicateHints: [],
+    createdAt: "2026-10-16T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+const SERVER = device({
+  externalKey: "local",
+  inUse: 2,
+  environments: [{ id: "env-local", name: "Local", driver: "local", companyId: null, explicit: false, availability: AVAILABLE }],
+  accounts: [
+    { id: "acc-max", label: "Max-2", credentialType: "subscription", state: "active", owner: { userId: "user-ada", name: "Ada", email: "ada@example.com" } },
+    { id: "acc-team", label: "Team", credentialType: "subscription", state: "limited", owner: { userId: "user-bob", name: "Bob", email: "bob@example.com" } },
+  ],
+  companies: [
+    { companyId: "company-a", companyName: "Cleanio", agentCount: 3 },
+    { companyId: "company-b", companyName: "Presto", agentCount: 1 },
+  ],
+});
+const SSH_BOX = device({
+  id: "dev-ssh",
+  name: "SSH · Build tunnel",
+  kind: "ssh_host",
+  externalKey: "ssh:build.internal:2222",
+  availability: OFFLINE,
+  inUse: 4,
+  overLimit: true,
+  overLimitSince: SINCE,
+  environments: [{ id: "env-ssh", name: "Build tunnel", driver: "ssh", companyId: "company-a", explicit: true, availability: OFFLINE }],
+  duplicateHints: [{ deviceId: "dev-studio", deviceName: "Studio", matchedBy: "alias" }],
+});
+const STUDIO = device({
+  id: "dev-studio",
+  name: "Studio",
+  kind: "external",
+  targetKey: `target:${PLUGIN_ID}:remote-box:studio`,
+  targetProvider: "remote-box",
+  targetReportedAt: SINCE,
+  managedByPluginId: PLUGIN_ID,
+  managedByPluginName: "Remote devices",
+  owner: { userId: "user-ada", name: "Ada", email: "ada@example.com" },
+  aliases: ["build.internal"],
+  acceptedCredentialTypes: ["subscription"],
+  duplicateHints: [{ deviceId: "dev-ssh", deviceName: "SSH · Build tunnel", matchedBy: "alias" }],
+});
+const RETIRED_BOX = device({
+  id: "dev-retired",
+  name: "Old studio",
+  kind: "external",
+  availability: { ...AVAILABLE, state: "retired" },
+});
+
+const EMPTY_WINDOW: AiAccountUsageWindow = { runs: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costCents: 0 };
+
+function account(overrides: Partial<InstanceAiAccountSummary>): InstanceAiAccountSummary {
   return {
     id: "account",
-    hostId: "host-server",
     provider: "anthropic",
     credentialType: "subscription",
     label: "Account",
+    plan: null,
+    emailHint: null,
+    credentialHint: null,
+    owner: { userId: "user-ada", name: "Ada", email: "ada@example.com" },
+    origin: "pool",
+    status: "active",
+    statusMessage: null,
+    state: "active",
+    adminDisabled: false,
+    adminDisabledAt: null,
+    adminDisabledReason: null,
+    exhaustedUntil: null,
+    limitReason: null,
+    limitSource: null,
+    limitStrikes: 0,
+    lastLimitedAt: null,
+    legacyHostId: null,
+    legacyHostName: null,
+    reservedProjects: [],
+    companies: [],
+    usage: { lastFiveHours: EMPTY_WINDOW, lastSevenDays: EMPTY_WINDOW, thisMonth: EMPTY_WINDOW },
+    lastUsedAt: null,
+    createdAt: "2026-10-16T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+const MAX = account({
+  id: "acc-max",
+  label: "Max-2",
+  plan: "Max 20x",
+  emailHint: "ad•••@example.com",
+  credentialHint: "…a1b2",
+  companies: [{ companyId: "company-a", companyName: "Cleanio", agentCount: 2 }],
+  lastLimitedAt: LAST_LIMIT,
+  usage: {
+    lastFiveHours: { runs: 3, inputTokens: 12_300_000, cachedInputTokens: 9_800_000, outputTokens: 840_000, costCents: 0 },
+    lastSevenDays: { runs: 1, inputTokens: 999, cachedInputTokens: 0, outputTokens: 1_500, costCents: 0 },
+    thisMonth: EMPTY_WINDOW,
+  },
+});
+const TEAM = account({
+  id: "acc-team",
+  label: "Team",
+  owner: { userId: "user-bob", name: "Bob", email: "bob@example.com" },
+  state: "limited",
+  exhaustedUntil: LATER,
+  limitReason: "provider_quota",
+  limitSource: "estimated",
+  limitStrikes: 2,
+});
+const LEGACY = account({
+  id: "acc-legacy",
+  label: "Old shared",
+  owner: null,
+  origin: "legacy_host_pool",
+  legacyHostId: "dev-server",
+  legacyHostName: "Paperclip server",
+  adminDisabled: true,
+  adminDisabledAt: SINCE,
+  adminDisabledReason: "Shared outside the team",
+  state: "admin_disabled",
+  reservedProjects: [{ id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Cleanio", issuePrefix: "CLE" }],
+});
+const KEY = account({
+  id: "acc-key",
+  label: "Console key",
+  credentialType: "api_key",
+  status: "auth_failed",
+  state: "signed_out",
+  statusMessage: "The key was revoked.",
+  usage: { lastFiveHours: EMPTY_WINDOW, lastSevenDays: EMPTY_WINDOW, thisMonth: { ...EMPTY_WINDOW, runs: 12, costCents: 1_234 } },
+});
+
+const REPORT: AiAccountMigrationReport = {
+  key: "ai-account-bindings-v1",
+  status: "completed",
+  attempts: 1,
+  lastError: null,
+  completedAt: "2026-10-16T10:02:00.000Z",
+  summary: {
+    bound: 1,
+    unassigned: 1,
+    unbound: 1,
+    agents: [
+      { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", companyName: "Cleanio", outcome: "bound", accountId: "acc-max", accountLabel: "Max-2", rule: "agent_history", note: null },
+      { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", companyName: "Cleanio", outcome: "unassigned", accountId: null, accountLabel: null, rule: null, note: "Over the device's account limit" },
+      { agentId: "agent-carol", agentName: "Carol", companyId: "company-a", companyName: "Cleanio", outcome: "unbound", accountId: null, accountLabel: null, rule: null, note: "No host pool runs in 45 days" },
+    ],
+    overLimitDevices: [{ deviceId: "dev-ssh", deviceName: "SSH · Build tunnel", limit: 3, inUse: 4 }],
+  },
+  goNoGo: {
+    go: false,
+    agents: [
+      { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", plan: "use", reason: null },
+      { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", plan: "wait", reason: "unassigned" },
+    ],
+  },
+};
+
+function legacyAccount(overrides: Partial<AiAccountSummary>): AiAccountSummary {
+  return {
+    id: "acc-legacy",
+    hostId: "dev-server",
+    provider: "anthropic",
+    credentialType: "subscription",
+    label: "Old shared",
     emailHint: null,
     plan: null,
     poolEnabled: true,
@@ -68,10 +296,10 @@ function account(overrides: Partial<AiAccountSummary>): AiAccountSummary {
     credentialHint: null,
     exhaustedUntil: null,
     limitReason: null,
+    lastLimitedAt: null,
+    usage: { lastFiveHours: EMPTY_WINDOW, lastSevenDays: EMPTY_WINDOW, thisMonth: EMPTY_WINDOW },
     runningRuns: 0,
     projects: [],
-    lastLimitedAt: null,
-    usage: usage({}, {}),
     lastSelectedAt: null,
     lastUsedAt: null,
     createdAt: "2026-10-14T00:00:00.000Z",
@@ -79,50 +307,42 @@ function account(overrides: Partial<AiAccountSummary>): AiAccountSummary {
   };
 }
 
-function response(): AiAccountHostsResponse {
-  return {
-    maxAccountsPerHost: 3,
-    projects: [VPN, WEBSITE, MOBILE],
-    unmappedEnvironments: [{ id: "env-mac", name: "Mac mini tunnel", driver: "ssh", companyId: "company-a" }],
-    hosts: [
-      {
-        id: "host-server",
-        name: "Main server",
-        kind: "server",
-        maxAccounts: 3,
-        overflowToOtherAccounts: true,
-        createdAt: "2026-10-14T00:00:00.000Z",
-        environments: [{ id: "env-local", name: "Local", driver: "local", companyId: "company-a" }],
-        accounts: [
-          account({
-            id: "acc-s", label: "Account S", emailHint: "mithat@example.com", plan: "Max 20x", credentialHint: "…a1b2", runningRuns: 2,
-            lastLimitedAt: LAST_LIMIT,
-            usage: usage(
-              { runs: 3, inputTokens: 12_300_000, cachedInputTokens: 9_800_000, outputTokens: 840_000, costCents: 4_200 },
-              { runs: 1, inputTokens: 999, outputTokens: 1_500 },
-              { runs: 40, costCents: 98_765 },
-            ),
-          }),
-          account({ id: "acc-m", label: "Account M", exhaustedUntil: FUTURE, limitReason: "provider_quota", projects: [MOBILE] }),
-          account({
-            id: "acc-b", label: "Account B", credentialType: "api_key", status: "auth_failed", statusMessage: "The token was revoked.",
-            usage: usage({}, { runs: 12, inputTokens: 2_000_000, outputTokens: 50_000 }, { runs: 12, costCents: 1_234 }),
-          }),
-        ],
-      },
-      {
-        id: "host-runner",
-        name: "Runner",
-        kind: "ssh_host",
-        maxAccounts: 3,
-        overflowToOtherAccounts: false,
-        createdAt: "2026-10-14T00:00:00.000Z",
-        environments: [],
-        accounts: [account({ id: "acc-t", hostId: "host-runner", label: "Account T", status: "disabled" })],
-      },
-    ],
-  };
-}
+const HOSTS: AiAccountHostsResponse = {
+  maxAccountsPerHost: 3,
+  projects: [],
+  unmappedEnvironments: [
+    { id: "env-runner-2", name: "Runner 2", driver: "ssh", companyId: "company-a" },
+    { id: "env-sandbox", name: "Studio sandbox", driver: "sandbox", companyId: "company-a" },
+    { id: "env-local-2", name: "Local 2", driver: "local", companyId: null },
+  ],
+  hosts: [
+    {
+      id: "dev-server",
+      name: "Paperclip server",
+      kind: "server",
+      maxAccounts: 3,
+      overflowToOtherAccounts: true,
+      createdAt: "2026-10-14T00:00:00.000Z",
+      environments: [{ id: "env-local", name: "Local", driver: "local", companyId: null }],
+      accounts: [legacyAccount({})],
+    },
+    {
+      id: "dev-ssh",
+      name: "SSH · Build tunnel",
+      kind: "ssh_host",
+      maxAccounts: 3,
+      overflowToOtherAccounts: false,
+      createdAt: "2026-10-14T00:00:00.000Z",
+      environments: [{ id: "env-ssh", name: "Build tunnel", driver: "ssh", companyId: "company-a" }],
+      accounts: [],
+    },
+  ],
+};
+
+const USERS = [
+  { id: "user-ada", email: "ada@example.com", name: "Ada", image: null, isInstanceAdmin: true, activeCompanyMembershipCount: 2 },
+  { id: "user-cem", email: "cem@example.com", name: "Cem", image: null, isInstanceAdmin: false, activeCompanyMembershipCount: 1 },
+];
 
 let container: HTMLDivElement;
 let root: Root;
@@ -155,6 +375,14 @@ function row(name: string) {
   return container.querySelector<HTMLElement>(`li[aria-label="${name}"]`)!;
 }
 
+function section(headingId: string) {
+  return container.querySelector<HTMLElement>(`section[aria-labelledby="${headingId}"]`)!;
+}
+
+function dialog() {
+  return document.body.querySelector<HTMLElement>('[role="dialog"]')!;
+}
+
 function buttonIn(scope: ParentNode, text: string) {
   return [...scope.querySelectorAll("button")].find((element) => element.textContent?.trim() === text) as HTMLButtonElement | undefined;
 }
@@ -172,12 +400,31 @@ async function type(input: HTMLInputElement, value: string) {
   });
 }
 
+async function choose(select: HTMLSelectElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value")!.set!;
+  await act(async () => {
+    setter.call(select, value);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+async function renderLoaded() {
+  await renderPage();
+  await eventually(() => {
+    expect(region("Studio")).toBeTruthy();
+    expect(row("Max-2")).toBeTruthy();
+    expect(region("Migration report")).toBeTruthy();
+  });
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-  mocks.list.mockResolvedValue(response());
-  mocks.listPlugins.mockResolvedValue([]);
-  mocks.listConnections.mockResolvedValue({ currentUserId: "me", canManageConnections: true, connections: [] });
+  mocks.devices.listInstance.mockResolvedValue({ limitPerDevice: 3, devices: [SERVER, SSH_BOX, STUDIO, RETIRED_BOX] });
+  mocks.pool.listInstanceAccounts.mockResolvedValue({ accounts: [MAX, TEAM, LEGACY, KEY] });
+  mocks.pool.getMigrationReport.mockResolvedValue(REPORT);
+  mocks.hosts.list.mockResolvedValue(HOSTS);
+  mocks.searchAdminUsers.mockResolvedValue(USERS);
   client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -192,199 +439,325 @@ afterEach(async () => {
 });
 
 describe("InstanceAiAccounts", () => {
-  it("shows each host with its environments, accounts and states", async () => {
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
-
-    const server = region("Main server");
-    expect(server.textContent).toContain("Paperclip server · 3 of 3 accounts");
-    expect(server.textContent).toContain("Local· Cleanio");
-    expect(region("Runner").textContent).toContain("Runner server (SSH) · 1 of 3 accounts");
-
-    const s = row("Account S");
-    expect(s.textContent).toContain("Available");
-    expect(s.textContent).toContain("Subscription");
-    expect(s.textContent).toContain("mi•••@example.com · Max 20x");
-    expect(s.textContent).not.toContain("mithat@example.com");
-    expect(s.textContent).toContain("…a1b2");
-    expect(s.textContent).toContain("Running now: 2");
-
-    const m = row("Account M");
-    expect(m.textContent).toContain("Limited until");
-    expect(m.textContent).toContain("(usage limit)");
-    expect(buttonIn(m, "Clear limit")).toBeDefined();
-
-    const b = row("Account B");
-    expect(b.textContent).toContain("API key");
-    expect(b.textContent).toContain("Sign-in failed");
-    expect(b.textContent).toContain("The token was revoked.");
-    expect(buttonIn(b, "Set active again")).toBeDefined();
-
-    const t = row("Account T");
-    expect(t.textContent).toContain("Switched off");
-    expect(buttonIn(t, "Set active again")).toBeDefined();
-    expect(buttonIn(t, "Clear limit")).toBeUndefined();
-
-    expect(container.textContent).toContain("Mac mini tunnel");
-    expect(mocks.setBreadcrumbs).toHaveBeenCalled();
+  it("is the Devices & Claude accounts page, without product names", async () => {
+    await renderLoaded();
+    expect(container.querySelector("h1")?.textContent).toBe("Devices & Claude accounts");
+    expect(mocks.setBreadcrumbs).toHaveBeenCalledWith([
+      { label: "Settings", href: "/company/settings" },
+      { label: "Devices & Claude accounts" },
+    ]);
+    expect(container.textContent).toContain("Paperclip never moves a task to another account.");
+    expect(container.textContent).not.toMatch(/\bmacs?\b/i);
   });
 
-  it("shows Paperclip's usage per account, money only for API keys, and the last limit", async () => {
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
-    const usageOf = (name: string) => row(name).querySelector<HTMLElement>('[data-testid="account-usage"]')!.textContent ?? "";
+  it("shows every device with its availability, keys, owner, limit, environments and duplicate hints", async () => {
+    await renderLoaded();
 
-    const subscription = usageOf("Account S");
-    expect(subscription).toContain("Last 5 h: 3 runs · 12.3M in · 840.0k out + 9.8M cached");
-    expect(subscription).toContain("Last 7 days: 1 run · 999 in · 1.5k out");
-    const sevenDays = [...row("Account S").querySelectorAll('[data-testid="account-usage"] p')]
-      .find((line) => line.textContent?.startsWith("Last 7 days"));
-    expect(sevenDays?.textContent).toBe("Last 7 days: 1 run · 999 in · 1.5k out");
-    expect(subscription).not.toContain("$");
-    expect(subscription).not.toContain("This month");
-    expect(subscription).toContain(`Last limit: ${formatDateTime(LAST_LIMIT)}`);
+    const server = region("Paperclip server");
+    expect(server.querySelector("[data-device-availability]")?.textContent).toBe("Available");
+    expect(server.textContent).toContain("Paperclip server");
+    expect(server.textContent).toContain("local");
+    expect(server.textContent).toContain("2 of 3 Claude accounts · Cleanio: 3 agents · Presto: 1 agent");
+    expect(server.textContent).toContain("Max-2· Ada");
+    expect(server.textContent).toContain("Team· Bob");
+    expect(server.textContent).toContain("Limited");
+    expect(server.textContent).toContain("Local · Local · shared");
 
-    const apiKey = usageOf("Account B");
-    expect(apiKey).toContain("Last 5 h: 0 runs · 0 in · 0 out");
-    expect(apiKey).toContain("Last 7 days: 12 runs · 2.0M in · 50.0k out");
-    expect(apiKey).not.toContain("cached");
-    expect(apiKey).toContain("This month: $12.34");
-    expect(apiKey).not.toContain("Last limit");
+    const ssh = region("SSH · Build tunnel");
+    expect(ssh.querySelector("[data-device-availability]")?.textContent).toBe(`Unreachable since ${SINCE_TEXT}`);
+    // Instance admins see the host and the connection's own words.
+    expect(ssh.textContent).toContain("ssh:build.internal:2222");
+    expect(ssh.textContent).toContain("Build tunnel · SSH · Cleanio · mapped by hand");
+    expect(ssh.textContent).toContain(`Unreachable since ${SINCE_TEXT}: Connection timed out during banner exchange`);
+    expect(ssh.textContent).toContain("Over limit");
+    expect(ssh.textContent).toContain("Likely the same machine as Studio");
 
-    expect(container.textContent).toContain("Usage shows what Paperclip ran on each account.");
+    const studio = region("Studio");
+    expect(studio.textContent).toContain("— owner ada@example.com");
+    expect(studio.textContent).toContain(`Managed by Remote devices · Takes subscription accounts only · last report ${SINCE_TEXT}`);
+    expect(studio.textContent).toContain(`target:${PLUGIN_ID}:remote-box:studio`);
+    expect(studio.textContent).toContain("Also known as build.internal");
+
+    expect(region("Old studio").querySelector("[data-device-availability]")?.textContent).toBe("Removed");
   });
 
-  it("disables Add account on a host that has three accounts", async () => {
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
-    expect(buttonIn(region("Main server"), "Add account")?.disabled).toBe(true);
-    expect(region("Main server").textContent).toContain("This host has 3 accounts, the most it can have.");
-    expect(buttonIn(region("Runner"), "Add account")?.disabled).toBe(false);
-  });
+  it("links a likely duplicate through the API and refreshes the devices", async () => {
+    mocks.devices.linkTarget.mockResolvedValue(SSH_BOX);
+    await renderLoaded();
+    const before = mocks.devices.listInstance.mock.calls.length;
 
-  it("runs the account actions against the API", async () => {
-    mocks.clearLimit.mockResolvedValue({});
-    mocks.updateAccount.mockResolvedValue({});
-    mocks.deleteAccount.mockResolvedValue({ ok: true });
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
+    await click(buttonIn(region("SSH · Build tunnel"), "Link"));
+    await eventually(() => expect(dialog().textContent).toContain("Link SSH · Build tunnel and Studio?"));
+    expect(dialog().textContent).toContain("Studio is merged into SSH · Build tunnel");
+    await click(buttonIn(dialog(), "Link devices"));
 
-    await click(buttonIn(row("Account M"), "Clear limit"));
-    await eventually(() => expect(mocks.clearLimit).toHaveBeenCalledWith("acc-m"));
-
-    await click(row("Account S").querySelector<HTMLButtonElement>('[role="switch"]')!);
-    await eventually(() => expect(mocks.updateAccount).toHaveBeenCalledWith("acc-s", { poolEnabled: false }));
-
-    await click(buttonIn(row("Account B"), "Set active again"));
-    await eventually(() => expect(mocks.updateAccount).toHaveBeenCalledWith("acc-b", { status: "active" }));
-
-    await click(buttonIn(row("Account T"), "Remove"));
-    await eventually(() => expect(buttonIn(document.body, "Remove account")).toBeDefined());
-    expect(mocks.deleteAccount).not.toHaveBeenCalled();
-    await click(buttonIn(document.body, "Remove account"));
-    await eventually(() => expect(mocks.deleteAccount).toHaveBeenCalledWith("acc-t"));
-  });
-
-  it("adds a pasted token without ever rendering it, and shows the server's refusal", async () => {
-    mocks.addAccount.mockRejectedValueOnce(
-      new ApiError("This credential is already on a host. A credential can serve one host only.", 409, {}),
-    );
-    await renderPage();
-    await eventually(() => expect(region("Runner")).toBeTruthy());
-
-    await click(buttonIn(region("Runner"), "Add account"));
-    await eventually(() => expect(document.body.querySelector("#ai-account-label")).toBeTruthy());
-    // The server's own token can only be imported on the Paperclip server host.
-    expect(document.body.textContent).not.toContain("Import the server's own token");
-    expect(document.body.textContent).toContain("Import my saved Claude subscription");
-    expect(document.body.textContent).toContain("Get it from a Mac");
-
-    await type(document.body.querySelector<HTMLInputElement>("#ai-account-label")!, "Account R");
-    const secret = document.body.querySelector<HTMLInputElement>("#ai-account-value")!;
-    expect(secret.type).toBe("password");
-    await type(secret, PASTED_TOKEN);
-    expect(document.body.textContent).not.toContain(PASTED_TOKEN);
-
-    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!;
-    await click(buttonIn(dialog, "Add account"));
-    await eventually(() => expect(mocks.addAccount).toHaveBeenCalledWith("host-runner", {
-      label: "Account R",
-      credentialType: "subscription",
-      value: PASTED_TOKEN,
-    }));
     await eventually(() =>
-      expect(document.body.textContent).toContain("This credential is already on a host. A credential can serve one host only."));
-    expect(document.body.textContent).not.toContain(PASTED_TOKEN);
+      expect(mocks.devices.linkTarget).toHaveBeenCalledWith("dev-ssh", { pluginId: PLUGIN_ID, provider: "remote-box", targetKey: "studio" }));
+    await eventually(() => expect(mocks.devices.listInstance.mock.calls.length).toBeGreaterThan(before));
+    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
   });
 
-  it("shows shared and reserved accounts and saves a project reservation", async () => {
-    mocks.setAccountProjects.mockResolvedValue({ accountId: "acc-s", projects: [WEBSITE, VPN] });
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
+  it("shows a refused link inline", async () => {
+    mocks.devices.linkTarget.mockRejectedValue(new ApiError("This target is already linked to Build box", 409, { error: "This target is already linked to Build box" }));
+    await renderLoaded();
+    await click(buttonIn(region("Studio"), "Link"));
+    await eventually(() => expect(buttonIn(dialog(), "Link devices")?.disabled).toBe(false));
+    await click(buttonIn(dialog(), "Link devices"));
+    await eventually(() => expect(dialog().textContent).toContain("This target is already linked to Build box"));
+  });
 
-    const shared = row("Account S").querySelector<HTMLElement>('[data-testid="account-projects"]')!;
-    expect(shared.textContent).toContain("Shared (any project)");
-    const reserved = row("Account M").querySelector<HTMLElement>('[data-testid="account-projects"]')!;
-    expect(reserved.textContent).not.toContain("Shared (any project)");
-    const chip = [...reserved.querySelectorAll<HTMLElement>('[data-slot="badge"]')].find((badge) => badge.textContent === "CLE · Mobile app");
-    expect(chip?.getAttribute("title")).toBe("Cleanio");
+  it("edits a device's name and account limit, and shows a refused lower limit inline", async () => {
+    mocks.devices.updateInstance
+      .mockRejectedValueOnce(new ApiError("2 Claude accounts are in use on Paperclip server", 409, { error: "2 Claude accounts are in use on Paperclip server" }))
+      .mockResolvedValueOnce(SERVER);
+    await renderLoaded();
 
-    await click(buttonIn(row("Account S"), "Edit projects"));
-    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeTruthy());
-    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!;
-    expect(dialog.textContent).toContain("With nothing selected, the account is shared by every run on Main server.");
-    // Grouped by company, companies and projects in name order.
-    expect([...dialog.querySelectorAll("legend")].map((legend) => legend.textContent)).toEqual(["Cleanio", "Presto"]);
-    expect(dialog.textContent).toContain("Nothing selected: this account is shared (any project).");
+    await click(buttonIn(region("Paperclip server"), "Edit"));
+    await eventually(() => expect(dialog().querySelector("select")).toBeTruthy());
+    expect(buttonIn(dialog(), "Save device")?.disabled).toBe(true);
+    await choose(dialog().querySelector<HTMLSelectElement>("select")!, "1");
+    await click(buttonIn(dialog(), "Save device"));
+    await eventually(() => expect(dialog().textContent).toContain("2 Claude accounts are in use on Paperclip server"));
+    expect(mocks.devices.updateInstance).toHaveBeenCalledWith("dev-server", { maxAccounts: 1 });
 
-    const checkbox = (label: string) => {
-      const target = [...dialog.querySelectorAll("label")].find((element) => element.textContent === label)!;
-      return dialog.querySelector<HTMLButtonElement>(`#${CSS.escape(target.htmlFor)}`)!;
+    await choose(dialog().querySelector<HTMLSelectElement>("select")!, "2");
+    await type(dialog().querySelector<HTMLInputElement>("input")!, "Main server");
+    await click(buttonIn(dialog(), "Save device"));
+    await eventually(() => expect(mocks.devices.updateInstance).toHaveBeenLastCalledWith("dev-server", { name: "Main server", maxAccounts: 2 }));
+    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
+  });
+
+  it("maps environments to a device by hand through the host routes", async () => {
+    mocks.hosts.setEnvironments.mockRejectedValueOnce(new ApiError("SSH · Build tunnel would run 4 Claude accounts", 409, {}));
+    await renderLoaded();
+    expect(mocks.hosts.list).not.toHaveBeenCalled();
+
+    await click(buttonIn(region("SSH · Build tunnel"), "Map environments"));
+    await eventually(() => expect(dialog().textContent).toContain("Runner 2"));
+    // An SSH host takes SSH environments only.
+    expect(dialog().textContent).not.toContain("Studio sandbox");
+    expect(dialog().textContent).not.toContain("Local 2");
+    const checkbox = (name: string) => {
+      const label = [...dialog().querySelectorAll("label")].find((element) => element.textContent?.startsWith(name))!;
+      return dialog().querySelector<HTMLButtonElement>(`#${CSS.escape(label.htmlFor)}`)!;
     };
-    await click(checkbox("CLE · Website"));
-    await click(checkbox("PRE · VPN core"));
-    expect(dialog.textContent).toContain("Reserved for 2 projects.");
-    await click(buttonIn(dialog, "Save projects"));
-    await eventually(() => expect(mocks.setAccountProjects).toHaveBeenCalledWith("acc-s", ["project-web", "project-vpn"]));
+    expect(checkbox("Build tunnel").getAttribute("aria-checked")).toBe("true");
+    await click(checkbox("Runner 2"));
+    await click(buttonIn(dialog(), "Save mappings"));
+    await eventually(() => expect(mocks.hosts.setEnvironments).toHaveBeenCalledWith("dev-ssh", ["env-ssh", "env-runner-2"]));
+    await eventually(() => expect(dialog().textContent).toContain("SSH · Build tunnel would run 4 Claude accounts"));
   });
 
-  it("makes a reserved account shared again with an empty selection", async () => {
-    mocks.setAccountProjects.mockResolvedValue({ accountId: "acc-m", projects: [] });
-    await renderPage();
-    await eventually(() => expect(region("Main server")).toBeTruthy());
+  it("lists every account with its owner, state, use and usage", async () => {
+    await renderLoaded();
 
-    await click(buttonIn(row("Account M"), "Edit projects"));
-    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeTruthy());
-    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!;
-    expect(dialog.textContent).toContain("Reserved for 1 project.");
-    const mobile = dialog.querySelector<HTMLButtonElement>('[role="checkbox"][aria-checked="true"]')!;
-    await click(mobile);
-    expect(dialog.textContent).toContain("Nothing selected: this account is shared (any project).");
-    await click(buttonIn(dialog, "Save projects"));
-    await eventually(() => expect(mocks.setAccountProjects).toHaveBeenCalledWith("acc-m", []));
+    const max = row("Max-2");
+    expect(max.textContent).toContain("Subscription");
+    expect(max.textContent).toContain("Active");
+    expect(max.textContent).toContain("Owner: Ada · ada@example.com · ad•••@example.com · Max 20x · …a1b2");
+    expect(max.textContent).toContain("Used by Cleanio: 2 agents");
+    expect(max.textContent).toContain("Last 5 h: 3 runs · 12.3M in · 840.0k out + 9.8M cached");
+    expect(max.textContent).toContain(`Last limit: ${formatDateTime(LAST_LIMIT)}`);
+    expect(max.textContent).not.toContain("This month");
+    expect(buttonIn(max, "Clear limit")).toBeUndefined();
+
+    const team = row("Team");
+    expect(team.textContent).toContain(`Limited until ${formatResetTime(LATER, { estimated: true })}`);
+    expect(team.textContent).toContain("Reached its limit 2 times in a row without a successful run in between.");
+    expect(team.textContent).toContain("Not assigned to any agent.");
+    expect(buttonIn(team, "Clear limit")).toBeDefined();
+
+    const legacy = row("Old shared");
+    expect(legacy.textContent).toContain("No owner");
+    expect(legacy.textContent).not.toContain("Owner:");
+    expect(legacy.textContent).toContain("Disabled by admin");
+    expect(legacy.textContent).toContain("Reason: Shared outside the team");
+    expect(legacy.textContent).toContain("From the host pool");
+    expect(legacy.textContent).toContain("Added to Paperclip server before accounts had owners.");
+    expect(legacy.textContent).toContain("Reserved forCLE · Mobile app");
+
+    const key = row("Console key");
+    expect(key.textContent).toContain("API key");
+    expect(key.textContent).toContain("Signed out");
+    expect(key.textContent).toContain("The key was revoked.");
+    expect(key.textContent).toContain("This month: $12.34");
   });
 
-  it("switches a host's overflow to other accounts", async () => {
-    mocks.updateHost.mockResolvedValue({});
-    await renderPage();
-    await eventually(() => expect(region("Runner")).toBeTruthy());
+  it("disables an account for everyone after asking for a reason, and enables it again at once", async () => {
+    mocks.pool.setAdminDisabled.mockResolvedValue({});
+    await renderLoaded();
 
-    const overflow = (name: string) => region(name).querySelector<HTMLButtonElement>('[role="switch"][aria-labelledby]')!;
-    expect(overflow("Main server").getAttribute("aria-checked")).toBe("true");
-    expect(region("Runner").textContent).toContain("Off: a project waits for its own accounts' reset.");
-    expect(overflow("Runner").getAttribute("aria-checked")).toBe("false");
+    const maxSwitch = row("Max-2").querySelector<HTMLButtonElement>('[role="switch"]')!;
+    expect(maxSwitch.getAttribute("aria-checked")).toBe("false");
+    await click(maxSwitch);
+    await eventually(() => expect(dialog().textContent).toContain("Disable Max-2 for everyone?"));
+    expect(mocks.pool.setAdminDisabled).not.toHaveBeenCalled();
+    await type(dialog().querySelector<HTMLInputElement>("input")!, "  Shared outside the team  ");
+    await click(buttonIn(dialog(), "Disable account"));
+    await eventually(() => expect(mocks.pool.setAdminDisabled).toHaveBeenCalledWith("acc-max", true, "Shared outside the team"));
+    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
 
-    await click(overflow("Runner"));
-    await eventually(() => expect(mocks.updateHost).toHaveBeenCalledWith("host-runner", { overflowToOtherAccounts: true }));
-    await click(overflow("Main server"));
-    await eventually(() => expect(mocks.updateHost).toHaveBeenCalledWith("host-server", { overflowToOtherAccounts: false }));
+    const legacySwitch = row("Old shared").querySelector<HTMLButtonElement>('[role="switch"]')!;
+    expect(legacySwitch.getAttribute("aria-checked")).toBe("true");
+    await click(legacySwitch);
+    await eventually(() => expect(mocks.pool.setAdminDisabled).toHaveBeenCalledWith("acc-legacy", false));
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("clears a limit", async () => {
+    mocks.pool.clearInstanceLimit.mockResolvedValue(TEAM);
+    await renderLoaded();
+    await click(buttonIn(row("Team"), "Clear limit"));
+    await eventually(() => expect(mocks.pool.clearInstanceLimit).toHaveBeenCalledWith("acc-team"));
+  });
+
+  it("transfers an account to an existing user, showing a 422 inline", async () => {
+    mocks.pool.transferOwner
+      .mockRejectedValueOnce(new ApiError("User not found", 422, { error: "User not found" }))
+      .mockResolvedValueOnce(MAX);
+    await renderLoaded();
+
+    await click(buttonIn(row("Max-2"), "Transfer owner"));
+    await eventually(() => expect(dialog().textContent).toContain("Cem"));
+    expect(dialog().textContent).toContain("Owner now: Ada · ada@example.com");
+    // The current owner is not offered.
+    expect([...dialog().querySelectorAll('[role="radio"]')].map((option) => option.textContent)).toEqual([
+      "Cemcem@example.com · 1 company",
+    ]);
+    expect(buttonIn(dialog(), "Transfer account")?.disabled).toBe(true);
+
+    await type(dialog().querySelector<HTMLInputElement>("input")!, "cem");
+    await eventually(() => expect(mocks.searchAdminUsers).toHaveBeenCalledWith("cem"));
+
+    await click(dialog().querySelector<HTMLButtonElement>('[role="radio"]')!);
+    await click(buttonIn(dialog(), "Transfer account"));
+    await eventually(() => expect(mocks.pool.transferOwner).toHaveBeenCalledWith("acc-max", "user-cem"));
+    await eventually(() => expect(dialog().textContent).toContain("That user does not exist. Choose an existing user."));
+
+    await click(buttonIn(dialog(), "Transfer account"));
+    await eventually(() => expect(mocks.pool.transferOwner).toHaveBeenCalledTimes(2));
+    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
+  });
+
+  it("removes an account, releasing its agents after the server says it is in use", async () => {
+    mocks.pool.removeInstanceAccount
+      .mockRejectedValueOnce(new ApiError("Account in use", 409, {
+        code: "ai_account_in_use",
+        details: { code: "ai_account_in_use", bindings: [{ agentId: "a", agentName: "Alice", companyId: "company-a", companyName: "Cleanio" }], otherCompanies: 1 },
+      }))
+      .mockResolvedValueOnce(undefined);
+    await renderLoaded();
+
+    await click(buttonIn(row("Team"), "Remove"));
+    await eventually(() => expect(dialog().textContent).toContain("Remove Team?"));
+    await click(buttonIn(dialog(), "Remove account"));
+    await eventually(() => expect(mocks.pool.removeInstanceAccount).toHaveBeenCalledWith("acc-team", { release: false }));
+    await eventually(() => expect(dialog().textContent).toContain("This account is still assigned to 2 agents."));
+
+    await click(buttonIn(dialog(), "Remove and release agents"));
+    await eventually(() => expect(mocks.pool.removeInstanceAccount).toHaveBeenLastCalledWith("acc-team", { release: true }));
+    await eventually(() => expect(document.body.querySelector('[role="dialog"]')).toBeNull());
+  });
+
+  it("shows the migration report with its go/no-go and runs it again", async () => {
+    mocks.pool.runMigration.mockResolvedValue({ ...REPORT, attempts: 2 });
+    await renderLoaded();
+
+    const report = region("Migration report");
+    expect(report.textContent).toContain(`Completed ${formatDateTime(REPORT.completedAt!)} · 1 attempt`);
+    expect(report.textContent).toContain("No-go");
+    expect(report.textContent).toContain("Bob (Cleanio) would wait: no account chosen");
+    expect(report.textContent).not.toContain("Alice (Cleanio) would");
+    expect(report.textContent).toContain("1 assigned · 1 waiting for an account · 1 not assigned");
+    expect(report.textContent).toContain("Bob (Cleanio) · Waiting for an account · Over the device's account limit");
+    expect(report.textContent).toContain("Carol (Cleanio) · Not assigned · No host pool runs in 45 days");
+    expect(report.textContent).toContain("Assigned agents (1)");
+    expect(report.textContent).toContain("Over their limit: SSH · Build tunnel (4 of 3)");
+
+    await click(buttonIn(section("instance-migration-heading"), "Run again"));
+    await eventually(() => expect(mocks.pool.runMigration).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the legacy host pool collapsed until opened, and adds devices of the kinds a person may add", async () => {
+    mocks.hosts.createHost.mockResolvedValue({});
+    await renderLoaded();
+    const legacy = section("instance-legacy-heading");
+    expect(legacy.textContent).not.toContain("Accounts added here");
+    expect(mocks.hosts.list).not.toHaveBeenCalled();
+
+    await click(buttonIn(legacy, "Show"));
+    await eventually(() => expect(legacy.textContent).toContain("Accounts added here: Old shared"));
+    expect(mocks.hosts.list).toHaveBeenCalledTimes(1);
+    expect(legacy.textContent).toContain("Mapped by hand: Build tunnel");
+    expect(legacy.textContent).toContain("Not mapped by hand: Runner 2, Studio sandbox, Local 2.");
+
+    await click(buttonIn(legacy, "Add device"));
+    await eventually(() => expect(dialog().querySelector("#legacy-device-name")).toBeTruthy());
+    const kinds = [...dialog().querySelectorAll('[role="radio"]')].map((option) => option.textContent ?? "");
+    expect(kinds).toHaveLength(3);
+    expect(kinds[0]).toMatch(/^Paperclip server/);
+    expect(kinds[1]).toMatch(/^SSH host/);
+    expect(kinds[2]).toMatch(/^Computer over SSH/);
+    // The server refuses plugin devices made by hand.
+    expect(dialog().textContent).not.toContain("Plugin device");
+
+    await type(dialog().querySelector<HTMLInputElement>("#legacy-device-name")!, "Build machine");
+    await click(buttonIn(dialog(), "Add device"));
+    await eventually(() => expect(mocks.hosts.createHost).toHaveBeenCalledWith({ name: "Build machine", kind: "ssh_host" }));
+  });
+
+  it("removes a device from the legacy host pool after confirming", async () => {
+    mocks.hosts.deleteHost.mockResolvedValue({ ok: true });
+    await renderLoaded();
+    await click(buttonIn(section("instance-legacy-heading"), "Show"));
+    await eventually(() => expect(section("instance-legacy-heading").textContent).toContain("Accounts added here"));
+
+    const legacyCard = section("instance-legacy-heading").querySelector<HTMLElement>('[role="region"][aria-label="SSH · Build tunnel"]')!;
+    await click(buttonIn(legacyCard, "Remove"));
+    await eventually(() => expect(dialog().textContent).toContain("Remove SSH · Build tunnel?"));
+    expect(mocks.hosts.deleteHost).not.toHaveBeenCalled();
+    await click(buttonIn(dialog(), "Remove device"));
+    await eventually(() => expect(mocks.hosts.deleteHost).toHaveBeenCalledWith("dev-ssh"));
+  });
+
+  it("never renders anything that looks like a credential, even when a response carries one", async () => {
+    // A server regression that put a credential into these responses must still show none of it.
+    const token = `sk-ant-oat01-${"x".repeat(80)}`;
+    const leak = { credential: token, value: token, token };
+    mocks.devices.listInstance.mockResolvedValue({
+      limitPerDevice: 3,
+      devices: [SERVER, SSH_BOX, STUDIO, RETIRED_BOX].map((entry) => ({
+        ...entry,
+        ...leak,
+        accounts: entry.accounts.map((deviceAccount) => ({ ...deviceAccount, ...leak })),
+      }) as InstanceExecutionDeviceSummary),
+    });
+    mocks.pool.listInstanceAccounts.mockResolvedValue({
+      accounts: [MAX, TEAM, LEGACY, KEY].map((entry) => ({ ...entry, ...leak }) as InstanceAiAccountSummary),
+    });
+    mocks.hosts.list.mockResolvedValue({
+      ...HOSTS,
+      hosts: HOSTS.hosts.map((host) => ({
+        ...host,
+        ...leak,
+        accounts: host.accounts.map((hostAccount) => ({ ...hostAccount, ...leak })),
+      })),
+    } as AiAccountHostsResponse);
+    await renderLoaded();
+    await click(buttonIn(section("instance-legacy-heading"), "Show"));
+    await eventually(() => expect(section("instance-legacy-heading").textContent).toContain("Accounts added here"));
+    expect(document.body.textContent).not.toMatch(/sk-ant-[a-z]{3}/i);
+    // The only credential trace is the recognition hint the server derives, shown exactly as given.
+    expect([...row("Max-2").querySelectorAll("span")].some((element) => element.textContent === "…a1b2")).toBe(true);
   });
 
   it("explains when the viewer is not an instance admin", async () => {
-    mocks.list.mockRejectedValue(new ApiError("Instance admin access required", 403, {}));
+    mocks.devices.listInstance.mockRejectedValue(new ApiError("Instance admin access required", 403, {}));
+    mocks.pool.listInstanceAccounts.mockRejectedValue(new ApiError("Instance admin access required", 403, {}));
+    mocks.pool.getMigrationReport.mockRejectedValue(new ApiError("Instance admin access required", 403, {}));
     await renderPage();
     await eventually(() =>
-      expect(container.textContent).toContain("Instance admin access is required to manage Claude accounts."));
-    expect(buttonIn(container, "Add host")).toBeUndefined();
+      expect(container.textContent).toContain("Instance admin access is required to manage devices and Claude accounts."));
+    expect(container.querySelector('section[aria-labelledby="instance-devices-heading"]')).toBeNull();
   });
 });

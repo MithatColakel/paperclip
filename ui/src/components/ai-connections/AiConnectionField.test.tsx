@@ -2,9 +2,10 @@
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import type { AiManagedConnectionSummary } from "@paperclipai/shared";
+import { CLAUDE_ROUTER_RETIRED_TEXT } from "@/lib/agent-claude-account";
 import { AiConnectionField } from "./AiConnectionField";
 import type { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
 
@@ -180,4 +181,83 @@ it("offers no agent-only account before the agent exists", async () => {
   click("Connect another account");
   expect(document.body.textContent).not.toContain("Only Nova");
   expect(credentialProps).toMatchObject({ ownership: "personal", agentIds: [] });
+});
+
+// Fork: Paperclip never moves a task to another account, so a claude_local
+// agent gets no new router binding, and the company pool takes no new agents.
+describe("account switching choices", () => {
+  const pool = (id: string, name: string, provider: "anthropic" | "openai") => ({
+    id, companyId: "company", pluginKey: "router", revision: 1, name, enabled: true,
+    mode: "round_robin", thresholdPercent: 90,
+    members: [{
+      id: `${id.slice(0, -1)}9`,
+      binding: { provider, method: "subscription", mode: "shared", connectionId: "33333333-3333-4333-8333-333333333333", grantId: "44444444-4444-4444-8444-444444444444" },
+      profile: provider === "anthropic" ? { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet" } : { provider: "codex", model: "gpt-5" },
+    }],
+  });
+  const CLAUDE_POOL = pool("11111111-1111-4111-8111-111111111111", "Claude rotation", "anthropic");
+  const OTHER_CLAUDE_POOL = pool("22222222-2222-4222-8222-222222222222", "Second rotation", "anthropic");
+  const CODEX_POOL = pool("55555555-5555-4555-8555-555555555555", "Codex rotation", "openai");
+
+  async function mountField(input: {
+    adapterType?: string;
+    value?: ComponentProps<typeof AiConnectionField>["value"];
+    pools?: unknown[];
+    connections?: AiManagedConnectionSummary[];
+  }) {
+    const adapterType = input.adapterType ?? "claude_local";
+    mocks.list.mockResolvedValue({ currentUserId: "owner", connections: input.connections ?? [], canManageConnections: true, pools: input.pools ?? [] });
+    flushSync(() => root.render(<QueryClientProvider client={client}>
+      <AiConnectionField companyId="company" agentId="agent" agentName="Nova" adapterType={adapterType} routerAdapterType={adapterType}
+        value={input.value ?? { provider: "anthropic", method: "subscription", mode: "responsible_user" }} onChange={onChange} />
+    </QueryClientProvider>));
+    await settle();
+  }
+  const routerOptions = () => Array.from(document.querySelectorAll("select option")).map((option) => option.textContent);
+
+  it("hides router pools from a claude_local agent", async () => {
+    await mountField({ pools: [CLAUDE_POOL] });
+    expect(document.querySelector("select")).toBeNull();
+    expect(document.body.textContent).not.toContain("Experimental pool");
+    expect(document.body.textContent).toContain("Responsible user’s connection");
+  });
+
+  it("keeps router pools for other adapters", async () => {
+    await mountField({ adapterType: "codex_local", value: { provider: "openai", method: "subscription", mode: "responsible_user" }, pools: [CODEX_POOL] });
+    expect(routerOptions()).toEqual(["Individual account", "Codex rotation · Experimental pool"]);
+  });
+
+  it("says a codex agent's router rotates, as before", async () => {
+    await mountField({ adapterType: "codex_local", value: { mode: "router", connectionId: CODEX_POOL.id }, pools: [CODEX_POOL] });
+    expect(document.body.textContent).toContain("New tasks rotate. Existing tasks keep their account.");
+    expect(document.body.textContent).not.toContain(CLAUDE_ROUTER_RETIRED_TEXT);
+  });
+
+  it("keeps a claude_local agent's current router listed so it can move off, and offers no other", async () => {
+    await mountField({ value: { mode: "router", connectionId: CLAUDE_POOL.id }, pools: [CLAUDE_POOL, OTHER_CLAUDE_POOL] });
+    expect(routerOptions()).toEqual(["Individual account", "Claude rotation · Experimental pool"]);
+    // The router is retired for Claude agents: no rotation is promised.
+    expect(document.body.textContent).toContain(CLAUDE_ROUTER_RETIRED_TEXT);
+    expect(document.body.textContent).not.toContain("New tasks rotate");
+    const select = document.querySelector("select")!;
+    flushSync(() => {
+      select.value = "";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(onChange).toHaveBeenCalledWith({ mode: "responsible_user", provider: "anthropic", method: "subscription" });
+  });
+
+  it("offers the retired company pool only to an agent already on it", async () => {
+    const shared = account({ id: "shared-connection", ownership: "shared", status: "connected", isDefault: false, name: "Team Claude" });
+    await mountField({ connections: [shared] });
+    expect(document.querySelector('button[aria-label="Team Claude"]')).not.toBeNull();
+    expect(document.body.textContent).not.toContain("Company account pool");
+    flushSync(() => root.render(<div />));
+
+    await mountField({ connections: [shared], value: { provider: "anthropic", method: "subscription", mode: "company_pool" } });
+    const retired = document.querySelector('button[aria-label="Company account pool (retired)"]');
+    expect(retired?.getAttribute("aria-pressed")).toBe("true");
+    expect(retired?.textContent).toContain("waits for that account’s reset at a usage limit");
+    expect(retired?.textContent).not.toContain("moves to the next account");
+  });
 });

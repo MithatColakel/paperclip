@@ -380,6 +380,35 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }
 
   describe("evaluateScheduledRetryGate", () => {
+    // Fork: device, account and slot waits hold the issue lock like a subscription wait (spec 7.6).
+    it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("enforces the issue lock for a %s run and exempts a non-assignee wait", async (lane) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const waitingId = await seedRun({ companyId, agentId, status: "scheduled_retry", scheduledRetryReason: lane, contextSnapshot: { issueId, retryReason: lane } });
+      const competingId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const gate = () => adapter.evaluateScheduledRetryGate({ companyId, runId: waitingId, retryReasonOverride: lane, now: new Date() });
+
+      await db.update(issues).set({ executionRunId: waitingId }).where(eq(issues.id, issueId));
+      expect(await gate()).toEqual({ allowed: true });
+      await db.update(issues).set({ executionRunId: competingId }).where(eq(issues.id, issueId));
+      expect(await gate()).toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
+
+      // A wait deferred outside assignee-ship never held the lock.
+      await db.update(heartbeatRuns)
+        .set({ contextSnapshot: { issueId, retryReason: lane, resourceWaitDeferredWhileAssignee: false } })
+        .where(eq(heartbeatRuns.id, waitingId));
+      expect(await gate()).toEqual({ allowed: true });
+
+      // A task moved to blocked ends the wait.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      expect(await gate()).toMatchObject({ allowed: false, errorCode: "issue_blocked" });
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      expect(await gate()).toMatchObject({ allowed: false, errorCode: "issue_terminal_status" });
+    });
+
     it("maps a disabled on-demand wake into a blocked scheduled-retry gate decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       await db

@@ -5,6 +5,8 @@
 // independently maintained copy in either file could silently drift out of
 // sync with the other and change only one of the two gates that read it.
 
+import { isResourceWaitRetryReason } from "@paperclipai/shared";
+
 function parseObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -45,7 +47,9 @@ export function isNonAssigneeWorkspaceBusyRetry(
     (retryReason === WORKSPACE_BUSY_RETRY_REASON &&
       contextSnapshot.workspaceBusyDeferredWhileAssignee === false) ||
     ((retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON) &&
-      contextSnapshot.aiConnectionBusyDeferredWhileAssignee === false)
+      contextSnapshot.aiConnectionBusyDeferredWhileAssignee === false) ||
+    // Fork: a device, account or slot wait deferred outside assignee-ship.
+    (isResourceWaitRetryReason(retryReason) && contextSnapshot.resourceWaitDeferredWhileAssignee === false)
   );
 }
 

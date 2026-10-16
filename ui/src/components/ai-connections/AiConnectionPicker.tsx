@@ -113,9 +113,10 @@ export function AiConnectionPicker({
                 <span className="block">For you: {personalDefault?.name ?? "Not connected"}</span>
                 <span className="block">Other users’ tasks use their own {AI_PROVIDERS[requirement.provider].name} connection.</span>
               </> },
-              ...(compatible.some((connection) => connection.ownership === "shared") ? [{
-                id: "company_pool", name: "Company account pool",
-                description: <>Uses this company’s shared {AI_PROVIDERS[requirement.provider].name} accounts in pool order and moves to the next account when one reaches its usage limit.</>,
+              // Fork: the company pool is retired. Only an agent already on it still sees it, so it can move off.
+              ...(value?.mode === "company_pool" ? [{
+                id: "company_pool", name: "Company account pool (retired)",
+                description: <>The agent stays on the pool account it used last and waits for that account’s reset at a usage limit. Once you choose another connection, the pool cannot be chosen again.</>,
               }] : []),
               ...compatible.filter((connection) => connection.ownership === "shared").map((connection) => ({
                 id: connection.id, name: connection.name,

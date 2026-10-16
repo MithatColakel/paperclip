@@ -1,5 +1,5 @@
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, isResourceWaitErrorCode, isResourceWaitRetryReason, RESOURCE_WAIT_RECOVERY_KIND } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
@@ -17,7 +17,7 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "startedAt" | "processPid" | "runtimeModeResolvedAt">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
@@ -48,6 +48,11 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // Fork: a resource-wait deferral, or a lane run cancelled before it ever started
+  // (pause, budget, comment), never reached a provider (spec 7.6).
+  if (run.status === "cancelled" && ((isResourceWaitErrorCode(run.errorCode) && evidence?.kind === RESOURCE_WAIT_RECOVERY_KIND &&
+      evidence.providerWorkStarted === false) || (isResourceWaitRetryReason(run.scheduledRetryReason) && !run.startedAt &&
+      run.processPid == null && !run.runtimeModeResolvedAt))) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false

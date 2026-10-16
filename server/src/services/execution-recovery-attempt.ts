@@ -1,3 +1,5 @@
+import { isResourceWaitRetryReason, RESOURCE_WAIT_RETRY_REASONS } from "@paperclipai/shared";
+
 type RetryRun = {
   scheduledRetryAttempt?: number | null;
   scheduledRetryReason?: string | null;
@@ -37,13 +39,19 @@ function historicalFailureCount(run: RetryRun): number {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeWorkspaceWait);
     if (saved !== null) return saved;
   }
+  // Fork: device, account and slot waits keep the count from before the wait.
+  if (isResourceWaitRetryReason(run.scheduledRetryReason)) {
+    const saved = count(run.contextSnapshot?.failureRetriesBeforeResourceWait);
+    if (saved !== null) return saved;
+  }
   // Historical ambiguous counters remain conservative rather than resetting.
   return count(run.scheduledRetryAttempt) ?? 0;
 }
 
 // Resource waits keep their own attempt counter and never spend failures. A
 // provider-quota recovery is the wait for a usage limit to reset.
-const RESOURCE_WAIT_LANES = ["workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "ai_connection_failover", "provider_quota_recovery"];
+// Fork: plus the device, account and slot wait lanes.
+const RESOURCE_WAIT_LANES = ["workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "ai_connection_failover", "provider_quota_recovery", ...RESOURCE_WAIT_RETRY_REASONS];
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);

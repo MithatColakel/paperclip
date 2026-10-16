@@ -96,3 +96,13 @@ describe("wake context", () => {
    expect(isNonAssigneeWorkspaceBusyRetry("ai_connection_pool_wait", { aiConnectionBusyDeferredWhileAssignee: false })).toBe(true);
    expect(isNonAssigneeWorkspaceBusyRetry("ai_connection_pool_wait", { aiConnectionBusyDeferredWhileAssignee: true })).toBe(false);
  });
+
+// Fork: device, account and slot waits (spec 7.6).
+it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("treats a %s run deferred outside assignee-ship as a non-assignee wake", (lane) => {
+  expect(isNonAssigneeWorkspaceBusyRetry(lane, { resourceWaitDeferredWhileAssignee: false })).toBe(true);
+  expect(isNonAssigneeWorkspaceBusyRetry(lane, { resourceWaitDeferredWhileAssignee: true })).toBe(false);
+  expect(isNonAssigneeWorkspaceBusyRetry(lane, {})).toBe(false);
+  // Another lane's receipt does not count.
+  expect(isNonAssigneeWorkspaceBusyRetry(lane, { workspaceBusyDeferredWhileAssignee: false })).toBe(false);
+  expect(isNonAssigneeWorkspaceBusyRetry("transient_failure", { resourceWaitDeferredWhileAssignee: false })).toBe(false);
+});

@@ -105,6 +105,8 @@ export type ScheduledRetryFacts = {
   dispositionRepair: DispositionRepairFacts | null;
   /** A conversation retry must wait for unresolved questions and approvals. */
   pendingResponse?: "interaction" | "approval" | null;
+  /** Fork: a device, account or slot wait (its kind is "ai_connection_wait" too). */
+  isResourceWaitLane?: boolean;
 };
 
 export type QueuedRunStalenessErrorCode =
@@ -163,6 +165,8 @@ export type QueuedRunFacts = {
   retryReason: string | null;
 
   reviewParticipant: ReviewParticipantFacts;
+  /** Fork: a device, account or slot wait (its kind is "ai_connection_wait" too). */
+  isResourceWaitLane?: boolean;
 };
 
 type OwnershipFacts = {
@@ -364,6 +368,13 @@ export function decideScheduledRetryGate(
   if (facts.retryReasonKind === "native_safe_replacement" && facts.issueStatus === "blocked") {
     return { allowed: false, issueId: facts.issueId, errorCode: "issue_blocked",
       reason: "Scheduled replacement suppressed because the task was blocked after recovery",
+      details: { issueId: facts.issueId } };
+  }
+
+  // Fork: a task moved to blocked ends its device, account or slot wait.
+  if (facts.isResourceWaitLane && facts.issueStatus === "blocked") {
+    return { allowed: false, issueId: facts.issueId, errorCode: "issue_blocked",
+      reason: "Scheduled resource wait suppressed because the task was blocked",
       details: { issueId: facts.issueId } };
   }
 
@@ -597,6 +608,13 @@ export function decideQueuedRunStaleness(
   if (facts.retryReasonKind === "native_safe_replacement" && facts.issueStatus === "blocked") {
     return { stale: true, errorCode: "issue_blocked",
       reason: "Cancelled because the task was blocked before replacement dispatch",
+      details: { issueId: facts.issueId } };
+  }
+
+  // Fork: a task moved to blocked ends its device, account or slot wait.
+  if (facts.isResourceWaitLane && facts.issueStatus === "blocked") {
+    return { stale: true, errorCode: "issue_blocked",
+      reason: "Cancelled because the task was blocked before the resource wait could resume",
       details: { issueId: facts.issueId } };
   }
 

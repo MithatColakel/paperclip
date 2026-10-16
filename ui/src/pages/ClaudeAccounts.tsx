@@ -1,25 +1,30 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
-import { UserRoundCog } from "lucide-react";
+import { Plus, UserRoundCog } from "lucide-react";
 import { DEVICE_POOL_ACCOUNT_LIMIT } from "@paperclipai/shared";
 import { aiAccountPoolApi, aiAccountPoolKeys } from "@/api/ai-account-pool";
-import { AiAccountStateBadge } from "@/components/ai-account-pool/AccountSelect";
+import { AddPoolAccountDialog } from "@/components/ai-account-pool/AddPoolAccountDialog";
+import { BindingsTable } from "@/components/ai-account-pool/BindingsTable";
+import { CompanyAccountsPanel } from "@/components/ai-account-pool/CompanyAccountsPanel";
+import { MyAccountsPanel } from "@/components/ai-account-pool/MyAccountsPanel";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
-import {
-  AI_ACCOUNT_BINDING_STATE_TEXT,
-  POOL_CREDENTIAL_TYPE_LABELS,
-  POOL_PRODUCT_LINE,
-  aiAccountPoolErrorMessage,
-  aiAccountStateDisplay,
-} from "@/lib/ai-account-pool";
+import { POOL_PRODUCT_LINE, aiAccountPoolErrorMessage } from "@/lib/ai-account-pool";
+
+/**
+ * Limits lift and owners change accounts on their own; keep the company lists
+ * current. "My Claude accounts" is not polled: it sums Paperclip usage over
+ * 5 hours, 7 days and the month. It refreshes on focus and after every change.
+ */
+const REFRESH_MS = 60_000;
 
 /** Loading, error and empty states for one section; the data renders through `children`. */
 function PoolSection<T>({
   title,
   description,
+  actions,
   query,
   isEmpty,
   empty,
@@ -27,6 +32,7 @@ function PoolSection<T>({
 }: {
   title: string;
   description?: string;
+  actions?: ReactNode;
   query: UseQueryResult<T>;
   isEmpty: (data: T) => boolean;
   empty: string;
@@ -47,9 +53,12 @@ function PoolSection<T>({
   }
   return (
     <Card className="block space-y-3 p-4" role="region" aria-label={title}>
-      <div className="space-y-1">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        {description ? <p className="text-sm text-muted-foreground">{description}</p> : null}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1">
+          <h2 className="text-sm font-semibold">{title}</h2>
+          {description ? <p className="text-sm text-muted-foreground">{description}</p> : null}
+        </div>
+        {actions}
       </div>
       {body}
     </Card>
@@ -63,6 +72,7 @@ function PoolSection<T>({
 export function ClaudeAccounts() {
   const { selectedCompanyId, selectedCompany } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const [addOpen, setAddOpen] = useState(false);
   const companyId = selectedCompanyId ?? "";
 
   useEffect(() => {
@@ -82,12 +92,14 @@ export function ClaudeAccounts() {
     queryFn: () => aiAccountPoolApi.listCompanyAccounts(companyId),
     enabled: Boolean(selectedCompanyId),
     retry: false,
+    refetchInterval: REFRESH_MS,
   });
   const bindings = useQuery({
     queryKey: aiAccountPoolKeys.bindings(companyId),
     queryFn: () => aiAccountPoolApi.listBindings(companyId),
     enabled: Boolean(selectedCompanyId),
     retry: false,
+    refetchInterval: REFRESH_MS,
   });
   const companyName = selectedCompany?.name ?? "this company";
 
@@ -98,32 +110,26 @@ export function ClaudeAccounts() {
           <UserRoundCog className="h-5 w-5 text-muted-foreground" aria-hidden="true" />
           <h1 className="text-lg font-semibold">Claude accounts</h1>
         </div>
-        <div className="max-w-3xl space-y-2 text-sm text-muted-foreground">
-          <p>
-            A Claude account belongs to the person who adds it. It runs agents only in companies where its owner is a
-            member, and each device runs at most {DEVICE_POOL_ACCOUNT_LIMIT} Claude accounts.
-          </p>
-          <p>{POOL_PRODUCT_LINE}</p>
-        </div>
+        <p className="max-w-3xl text-sm text-muted-foreground">
+          A Claude account belongs to the person who adds it. It runs agents only in companies where its owner is a
+          member, and each device runs at most {DEVICE_POOL_ACCOUNT_LIMIT} Claude accounts.
+        </p>
       </div>
 
       <PoolSection
         title="My Claude accounts"
+        description={POOL_PRODUCT_LINE}
+        actions={(
+          <Button type="button" size="sm" variant="outline" onClick={() => setAddOpen(true)}>
+            <Plus />
+            Add account
+          </Button>
+        )}
         query={mine}
         isEmpty={(data) => data.accounts.length === 0}
         empty="You have not added a Claude account yet."
       >
-        {(data) => (
-          <ul className="divide-y divide-border">
-            {data.accounts.map((account) => (
-              <li key={account.id} className="flex flex-wrap items-center gap-2 py-2" aria-label={account.label}>
-                <span className="text-sm font-medium">{account.label}</span>
-                <span className="text-xs text-muted-foreground">{POOL_CREDENTIAL_TYPE_LABELS[account.credentialType]}</span>
-                <AiAccountStateBadge display={aiAccountStateDisplay(account)} />
-              </li>
-            ))}
-          </ul>
-        )}
+        {(data) => <MyAccountsPanel accounts={data.accounts} />}
       </PoolSection>
 
       <PoolSection
@@ -133,43 +139,20 @@ export function ClaudeAccounts() {
         isEmpty={(data) => data.accounts.length === 0}
         empty="No Claude account is available in this company yet."
       >
-        {(data) => (
-          <ul className="divide-y divide-border">
-            {data.accounts.map((account) => (
-              <li key={account.id} className="flex flex-wrap items-center gap-2 py-2" aria-label={account.label}>
-                <span className="text-sm font-medium">{account.label}</span>
-                <span className="text-xs text-muted-foreground">
-                  {account.ownedByMe ? "Yours" : account.owner.name ?? "Another member"}
-                </span>
-                <AiAccountStateBadge display={aiAccountStateDisplay(account)} />
-              </li>
-            ))}
-          </ul>
-        )}
+        {(data) => <CompanyAccountsPanel accounts={data.accounts} />}
       </PoolSection>
 
       <PoolSection
         title="Agent assignments"
-        description="The Claude account each Claude agent uses. A change applies from the agent's next run."
+        description="The Claude account each Claude agent uses. A change applies from the agent's next run; a run in progress keeps its account."
         query={bindings}
         isEmpty={(data) => data.bindings.length === 0}
         empty="This company has no Claude agents yet."
       >
-        {(data) => (
-          <ul className="divide-y divide-border">
-            {data.bindings.map((binding) => (
-              <li key={binding.agentId} className="flex flex-wrap items-center gap-2 py-2" aria-label={binding.agentName}>
-                <span className="text-sm font-medium">{binding.agentName}</span>
-                <span className="text-xs text-muted-foreground">
-                  {binding.state === "pool_account" && binding.account
-                    ? binding.account.label
-                    : AI_ACCOUNT_BINDING_STATE_TEXT[binding.state]}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
+        {(data) => <BindingsTable companyId={companyId} bindings={data.bindings} accounts={available.data} />}
       </PoolSection>
+
+      <AddPoolAccountDialog open={addOpen} onOpenChange={setAddOpen} />
     </div>
   );
 }

@@ -59,3 +59,21 @@ describe("persisted independent accounting", () => {
     })).toBe(2);
   });
 });
+
+// Fork: device, account and slot waits (spec 7.6).
+describe("resource-wait lanes", () => {
+  it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("%s keeps the failures from before the wait and counts its own attempts", (lane) => {
+    const waiting = { scheduledRetryReason: lane, scheduledRetryAttempt: 30, contextSnapshot: { failureRetriesBeforeResourceWait: 1 } };
+    expect(executionFailureRetryCount(waiting)).toBe(1);
+    expect(executionRetryAttemptCount(waiting, lane)).toBe(30);
+    // Another lane starts its own count.
+    expect(executionRetryAttemptCount({ ...waiting, scheduledRetryReason: "transient_failure" }, lane)).toBe(0);
+    // Scheduling a lane successor never spends a failure.
+    expect(accountingForScheduledRetry(waiting, lane, 31)).toEqual({ version: 1, failureRetries: 1, maxTurnContinuations: 0 });
+  });
+
+  it("does not trust the saved count outside a lane", () => {
+    expect(executionFailureRetryCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2,
+      contextSnapshot: { failureRetriesBeforeResourceWait: 0 } })).toBe(2);
+  });
+});

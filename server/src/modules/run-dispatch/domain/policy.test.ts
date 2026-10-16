@@ -510,6 +510,21 @@ describe("native replacement execution authority", () => {
 });
 
 
+// Fork: device, account and slot waits (spec 18).
+describe("resource wait lanes", () => {
+  it("end on a task moved to blocked, at both retry gates; subscription waits keep their behaviour", () => {
+    const lane = { retryReasonKind: "ai_connection_wait" as const, isResourceWaitLane: true, issueStatus: "blocked" };
+    expect(decideScheduledRetryGate({ ...baseGateFacts(), ...lane }, NOW))
+      .toMatchObject({ allowed: false, errorCode: "issue_blocked", issueId: "issue-1" });
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), ...lane }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_blocked" });
+    const subscription = { ...lane, isResourceWaitLane: false };
+    expect(decideScheduledRetryGate({ ...baseGateFacts(), ...subscription }, NOW)).toEqual({ allowed: true });
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), ...subscription }, NOW)).toEqual({ stale: false });
+    expect(decideScheduledRetryGate({ ...baseGateFacts(), ...lane, issueStatus: "in_progress" }, NOW)).toEqual({ allowed: true });
+  });
+});
+
 describe("AI subscription wait ownership", () => {
   it.each([null, "another-run"])("preserves assignee lock guards and admits only recorded non-assignee waits: %s", (issueExecutionRunId) => {
     const gate = {

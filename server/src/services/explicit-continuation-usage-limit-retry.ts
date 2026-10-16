@@ -1,5 +1,6 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, issues } from "@paperclipai/db";
+import { RESOURCE_WAIT_RETRY_REASONS } from "@paperclipai/shared";
 import { AI_CONNECTION_FAILOVER_RETRY_REASON } from "../modules/run-dispatch/index.js";
 import { admitExplicitContinuationRetry } from "./explicit-native-continuation.js";
 import { PROVIDER_QUOTA_RECOVERY_RETRY_REASON } from "./recovery/provider-quota-recovery.js";
@@ -13,6 +14,8 @@ import { PROVIDER_QUOTA_RECOVERY_RETRY_REASON } from "./recovery/provider-quota-
 export const EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS: ReadonlySet<string> = new Set([
   PROVIDER_QUOTA_RECOVERY_RETRY_REASON,
   AI_CONNECTION_FAILOVER_RETRY_REASON,
+  // Fork: device, account and slot waits renew the continuation too.
+  ...RESOURCE_WAIT_RETRY_REASONS,
 ]);
 
 /**

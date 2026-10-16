@@ -10,6 +10,7 @@ import {
   type AiManagedConnectionSummary,
 } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
+import { CLAUDE_ROUTER_RETIRED_TEXT, routerPoolsOffered, usesPoolAccounts } from "@/lib/agent-claude-account";
 import { AiConnectionPicker } from "./AiConnectionPicker";
 import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
@@ -115,7 +116,8 @@ export function AiConnectionField({
   const method: AiAuthMethod = (value && value.mode !== "router" && value.mode !== "responsible_user" ? value.method : undefined)
     ?? accounts.data?.connections.find((account) => account.provider === provider && account.isDefault)?.method
     ?? (provider === "openrouter" ? "api_key" : "subscription");
-  const compatiblePools = agentId ? accounts.data?.pools?.filter(pool => pool.enabled && pool.members.some(member => isAiConnectionCompatible(member.binding, routerAdapterType ?? adapterType, member.profile.model, member.profile.provider, member.profile.acpxAgent))) ?? [] : [];
+  // Fork: no new router binding for claude_local; a router switches accounts on its own.
+  const compatiblePools = routerPoolsOffered(routerAdapterType ?? adapterType, value, agentId ? accounts.data?.pools?.filter(pool => pool.enabled && pool.members.some(member => isAiConnectionCompatible(member.binding, routerAdapterType ?? adapterType, member.profile.model, member.profile.provider, member.profile.acpxAgent))) ?? [] : []);
   if (!provider) return null;
   if (legacy && !value && !adopting)
     return (
@@ -142,7 +144,8 @@ export function AiConnectionField({
           {compatiblePools.map(pool => <option key={pool.id} value={pool.id}>{pool.name} · Experimental pool</option>)}
           {value?.mode === "router" && !compatiblePools.some(pool => pool.id === value.connectionId) && <option value={value.connectionId}>Pool unavailable — enable routing and the pool</option>}
         </select>
-        {value?.mode === "router" && <span className="text-muted-foreground">New tasks rotate. Existing tasks keep their account.</span>}
+        {/* Fork: a claude_local agent's router is retired; Paperclip never moves a task to another account. */}
+        {value?.mode === "router" && <span className="text-muted-foreground">{usesPoolAccounts(routerAdapterType ?? adapterType) ? CLAUDE_ROUTER_RETIRED_TEXT : "New tasks rotate. Existing tasks keep their account."}</span>}
       </label>}
       {value?.mode !== "router" && <AiConnectionPicker
         requirement={{ companyId, provider }}
@@ -178,7 +181,8 @@ export function AiConnectionField({
             {pendingAdoption?.mode === "responsible_user"
               ? `Responsible user’s default. For you: ${accounts.data?.connections.find((account) => account.isDefault && account.provider === provider)?.name ?? "Not connected"}. Other users use their own default.`
               : pendingAdoption?.mode === "company_pool"
-              ? "Company account pool. Runs use the company’s shared accounts in pool order and move to the next account at a usage limit."
+              // Fork: the company pool is retired and pinned; it never moves a task to another account.
+              ? "Company account pool (retired). The agent stays on the pool account it used last and waits for that account’s reset at a usage limit."
               : accounts.data?.connections.find(
                   (account) => account.id === pendingAdoption?.connectionId,
                 )?.name}

@@ -14,7 +14,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isResourceWaitRetryReason } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService } from "../../../services/budgets.js";
@@ -128,6 +128,8 @@ function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
   if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) return "max_turn_continuation";
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
   if ((retryReason === "ai_connection_busy" || retryReason === "ai_connection_pool_wait")) return "ai_connection_wait";
+  // Fork: device, account and slot waits hold the issue lock like a subscription wait.
+  if (isResourceWaitRetryReason(retryReason)) return "ai_connection_wait";
   if (retryReason === "native_safe_replacement" || retryReason === "native_provider_overloaded") return "native_safe_replacement";
   return "other";
 }
@@ -291,6 +293,8 @@ export function createPostgresRunDispatchAdapter(
       retryReasonKind,
       enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
+      // Fork: device, account and slot waits end when the task is blocked.
+      isResourceWaitLane: isResourceWaitRetryReason(retryReason),
       budgetBlock: null,
       agentInvokable: true,
       agentInvokabilityDetails: {},
@@ -607,6 +611,8 @@ export function createPostgresRunDispatchAdapter(
       isInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
+      // Fork: device, account and slot waits end when the task is blocked.
+      isResourceWaitLane: isResourceWaitRetryReason(retryReason),
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),
       isCompletedOnboardingHandoffWake: await isCompletedOnboardingHandoffWake(dbOrTx, {

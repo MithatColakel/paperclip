@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Agent, Environment, UserSecretDefinition } from "@paperclipai/shared";
+import type { Agent, AgentAiAccountBindingDetail, Environment, UserSecretDefinition } from "@paperclipai/shared";
 import { getEnvironmentCapabilities } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ToastProvider } from "../context/ToastContext";
@@ -62,6 +62,15 @@ const mockSecretsApi = vi.hoisted(() => ({
   listUserSecretDefinitions: vi.fn(async () => [] as unknown[]),
 }));
 
+// Fork: the agent's Claude account selection. By default an agent has none
+// the form can load, as before the selection existed.
+const noAgentBinding = vi.hoisted(
+  () => (): Promise<AgentAiAccountBindingDetail> => Promise.reject(new Error("No Claude account selection in this test")),
+);
+const mockAiAccountPoolApi = vi.hoisted(() => ({
+  getAgentBinding: vi.fn<(agentId: string) => Promise<AgentAiAccountBindingDetail>>(noAgentBinding),
+}));
+
 vi.mock("../api/agents", () => ({
   agentsApi: mockAgentsApi,
 }));
@@ -77,6 +86,11 @@ vi.mock("../api/instanceSettings", () => ({
 vi.mock("../api/secrets", () => ({
   secretsApi: mockSecretsApi,
 }));
+
+vi.mock("../api/ai-account-pool", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../api/ai-account-pool")>();
+  return { ...actual, aiAccountPoolApi: { ...actual.aiAccountPoolApi, ...mockAiAccountPoolApi } };
+});
 
 vi.mock("../lib/clipboard", () => ({
   copyTextToClipboard: mockClipboard.copyTextToClipboard,
@@ -3913,6 +3927,97 @@ describe("AgentConfigForm managed-sandbox-only host surfaces", () => {
     const adapterFields = result.container.querySelector('[data-testid="adapter-config-fields"]');
     expect(adapterFields?.getAttribute("data-managed-sandbox-only")).toBe("true");
     expect(adapterFields?.getAttribute("data-hide-instructions-file")).toBe("true");
+  });
+});
+
+// Fork: a Claude agent's account selection decides its credential, not the AI connection field.
+describe("AgentConfigForm Claude account override note", () => {
+  let roots: Root[] = [];
+  const NOTE_TITLE = "Overridden by the Claude account selection";
+
+  const poolBinding: AgentAiAccountBindingDetail = {
+    agentId: "agent-1",
+    agentName: "Cody",
+    companyId: "company-1",
+    adapterType: "claude_local",
+    supported: true,
+    state: "pool_account",
+    mode: "pool_account",
+    account: {
+      id: "acct-team",
+      label: "Team Max",
+      credentialType: "subscription",
+      state: "active",
+      ownedByMe: false,
+      ownerName: "Ada",
+      exhaustedUntil: null,
+      limitSource: null,
+    },
+    source: "manual",
+    migrationNote: null,
+    reviewedAt: null,
+    needsReview: false,
+    devices: [],
+    pinned: true,
+    overridesAiConnection: true,
+    canChange: true,
+    updatedAt: null,
+    options: [],
+  };
+
+  beforeEach(() => {
+    mockAgentsApi.adapterModels.mockResolvedValue([]);
+    mockAgentsApi.detectModel.mockResolvedValue(null);
+    mockAgentsApi.list.mockResolvedValue([]);
+    mockAgentsApi.getActiveAdapterAuthLoginSession.mockImplementation(noActiveSession);
+    mockAgentsApi.getActiveClaudeSetupTokenLoginSession.mockImplementation(noActiveSession);
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue(null);
+    mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: null });
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableEnvironments: true });
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ executionMode: "any" });
+    mockEnvironmentsApi.capabilities.mockResolvedValue(SANDBOX_CAPABILITIES);
+    mockSecretsApi.list.mockResolvedValue([]);
+    mockSecretsApi.listProposals.mockResolvedValue([]);
+    mockAiAccountPoolApi.getAgentBinding.mockClear();
+  });
+
+  afterEach(async () => {
+    for (const root of roots) {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+    roots = [];
+    document.body.innerHTML = "";
+    mockAiAccountPoolApi.getAgentBinding.mockImplementation(noAgentBinding);
+    vi.clearAllMocks();
+  });
+
+  it("notes a Claude agent's account selection above its AI connection", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(poolBinding);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local" },
+    );
+    roots.push(result.root);
+    await flushUntil(() => result.container.textContent?.includes(NOTE_TITLE) ?? false);
+
+    expect(mockAiAccountPoolApi.getAgentBinding).toHaveBeenCalledWith("agent-1");
+    expect(result.container.textContent).toContain(NOTE_TITLE);
+    expect(result.container.textContent).toContain("This agent uses the Claude account Team Max.");
+  });
+
+  it("shows no note for an agent on another adapter", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue({ ...poolBinding, adapterType: "codex_local" });
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "codex_local" },
+    );
+    roots.push(result.root);
+    await flushReact();
+
+    expect(mockAiAccountPoolApi.getAgentBinding).not.toHaveBeenCalled();
+    expect(result.container.textContent).not.toContain(NOTE_TITLE);
   });
 });
 
