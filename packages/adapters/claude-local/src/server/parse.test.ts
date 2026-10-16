@@ -147,6 +147,72 @@ describe("detectClaudeLoginRequired", () => {
   });
 });
 
+describe("fork: transcript text never classifies the account", () => {
+  const toolResult = (text: string) =>
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: text }] } });
+  const assistantText = (text: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }], ...extra } });
+
+  it("ignores a tool's 401 Unauthorized in a run that succeeded", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: { is_error: false, subtype: "success", result: "Done." },
+        stdout: [toolResult("HTTP/1.1 401 Unauthorized"), assistantText("The API said unauthorized; I used the other endpoint.")].join("\n"),
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("ignores a tool's Unauthorized in a run that failed for another reason", () => {
+    const input = {
+      parsed: { is_error: true, subtype: "error_during_execution", result: "API Error: 529 overloaded" },
+      stdout: toolResult("curl: 401 Unauthorized"),
+      stderr: "",
+    };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(true);
+  });
+
+  it("classifies a usage limit as provider quota even when the output also says unauthorized", () => {
+    const input = {
+      parsed: { is_error: true, subtype: "success", result: "You've hit your limit · resets 5pm (UTC)" },
+      stdout: "",
+      stderr: "unauthorized",
+    };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
+  });
+
+  it("does not read a usage limit from a tool result", () => {
+    const input = {
+      parsed: { is_error: true, subtype: "error_during_execution", result: "Claude exited unexpectedly" },
+      stdout: toolResult("docs: when the weekly limit reached message appears, wait for the reset"),
+      stderr: "",
+    };
+    expect(isClaudeProviderQuotaError(input)).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+  });
+
+  it("reads a usage limit the CLI injected as a synthetic assistant message", () => {
+    const input = {
+      parsed: null,
+      stdout: assistantText("You've hit your limit · resets 5pm (UTC)", { model: "<synthetic>" }),
+      stderr: "",
+    };
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
+  });
+
+  it("still reads the login prompt the CLI prints as plain text", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "Invalid API key · Please run /login",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+});
+
 describe("isClaudeModelNotFoundError", () => {
   it("detects model resolution failures from structured and fallback output", () => {
     expect(isClaudeModelNotFoundError({
@@ -604,5 +670,28 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 20,
     });
     expect(parsed.usageBasis).toBe("per_run");
+  });
+});
+
+describe("fork: reset clock forms", () => {
+  it("parses a 24-hour reset clock", () => {
+    const now = new Date("2026-10-16T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore({ errorMessage: "You've hit your limit · resets at 16:00 (UTC)" }, now)?.toISOString(),
+    ).toBe("2026-10-16T16:00:00.000Z");
+  });
+
+  it("never parses a bare hour without am/pm", () => {
+    const now = new Date("2026-10-16T10:00:00.000Z");
+    expect(extractClaudeRetryNotBefore({ errorMessage: "You've hit your limit · resets 5 (UTC)" }, now)).toBeNull();
+  });
+
+  it("ignores a reset time quoted inside tool output", () => {
+    const now = new Date("2026-10-16T10:00:00.000Z");
+    const stdout = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: "You've hit your weekly limit · resets Oct 20, 6am (UTC)" }] },
+    });
+    expect(extractClaudeRetryNotBefore({ parsed: { is_error: true, result: "Claude exited unexpectedly" }, stdout }, now)).toBeNull();
   });
 });

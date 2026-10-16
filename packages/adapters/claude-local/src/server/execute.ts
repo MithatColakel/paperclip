@@ -64,6 +64,7 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   claudeModelUsageTotals,
+  claudeTranscriptMentionsAccountProblem,
   parseClaudeStreamJson,
   describeClaudeFailure,
   detectClaudeLoginRequired,
@@ -1040,7 +1041,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
-      const transientUpstream =
+      const terminalTransientUpstream =
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1050,7 +1051,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
-      const transientRetryNotBefore = providerQuota || transientUpstream
+      // Fork: a limit or sign-in phrase only in the transcript retries the run
+      // as transient and never touches the account.
+      const transcriptOnly =
+        !loginMeta.requiresLogin &&
+        !providerQuota &&
+        !terminalTransientUpstream &&
+        (proc.exitCode ?? 0) !== 0 &&
+        !proc.errorCode &&
+        claudeTranscriptMentionsAccountProblem(proc.stdout);
+      const transientUpstream = terminalTransientUpstream || transcriptOnly;
+      const classificationSource =
+        loginMeta.requiresLogin || providerQuota || terminalTransientUpstream
+          ? ("terminal" as const)
+          : transcriptOnly
+          ? ("transcript" as const)
+          : null;
+      const transientRetryNotBefore = providerQuota || terminalTransientUpstream
         ? extractClaudeRetryNotBefore({
             parsed: null,
             stdout: proc.stdout,
@@ -1087,6 +1104,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
+        classificationSource,
+        retryNotBeforeSource: transientRetryNotBefore ? "provider_terminal" : null,
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
@@ -1177,7 +1196,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: proc.stderr,
         errorMessage,
       });
-    const transientUpstream =
+    const terminalTransientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
@@ -1189,7 +1208,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: proc.stderr,
         errorMessage,
       });
-    const transientRetryNotBefore = providerQuota || transientUpstream
+    // Fork: a limit or sign-in phrase only in the transcript retries the run
+    // as transient and never touches the account.
+    const transcriptOnly =
+      failed &&
+      !proc.errorCode &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !providerQuota &&
+      !terminalTransientUpstream &&
+      !isClaudeUnknownSessionError(parsed) &&
+      !isClaudeImageProcessingError(parsed) &&
+      !isClaudeModelNotFoundError({ parsed, stdout: proc.stdout, stderr: proc.stderr, errorMessage }) &&
+      claudeTranscriptMentionsAccountProblem(proc.stdout);
+    const transientUpstream = terminalTransientUpstream || transcriptOnly;
+    const classificationSource =
+      (failed && loginMeta.requiresLogin) || providerQuota || terminalTransientUpstream
+        ? ("terminal" as const)
+        : transcriptOnly
+        ? ("transcript" as const)
+        : null;
+    const transientRetryNotBefore = providerQuota || terminalTransientUpstream
       ? extractClaudeRetryNotBefore({
           parsed,
           stdout: proc.stdout,
@@ -1202,7 +1242,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
-      : loginMeta.requiresLogin
+      // Fork: a run that succeeded has signed in, whatever its output says.
+      : failed && loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
         parsed,
@@ -1249,6 +1290,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
+      classificationSource,
+      retryNotBeforeSource: transientRetryNotBefore ? "provider_terminal" : null,
       errorMeta,
       usage,
       ...(usageBasis ? { usageBasis } : {}),

@@ -1850,3 +1850,96 @@ describe("claude execute", () => {
     }
   });
 });
+
+describe("fork: claude execute classification provenance", () => {
+  const toolResultLine = (text: string) =>
+    JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: text }] } });
+
+  async function runWithStdout(stdout: string, exitCode: number) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-provenance-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeTextFailingClaudeCommand(commandPath, { stdout, exitCode });
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    try {
+      return await execute({
+        runId: "run-claude-provenance",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: commandPath, cwd: workspace, promptTemplate: "Follow the paperclip heartbeat." },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("classifies a usage limit from the result event even when a tool printed 401 Unauthorized", async () => {
+    const result = await runWithStdout(
+      [
+        toolResultLine("HTTP/1.1 401 Unauthorized"),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          is_error: true,
+          result: "You've hit your limit · resets at 16:00 (UTC)",
+        }),
+      ].join("\n") + "\n",
+      1,
+    );
+    expect(result.errorCode).toBe("provider_quota");
+    expect(result.classificationSource).toBe("terminal");
+    expect(result.retryNotBeforeSource).toBe("provider_terminal");
+    expect(result.retryNotBefore).toBeTruthy();
+  });
+
+  it("never reports sign-in required for a run that succeeded", async () => {
+    const result = await runWithStdout(
+      [
+        toolResultLine("curl: (22) The requested URL returned error: 401 Unauthorized"),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          is_error: false,
+          result: "Done.",
+        }),
+      ].join("\n") + "\n",
+      0,
+    );
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.classificationSource ?? null).toBeNull();
+  });
+
+  it("retries a transcript-only limit mention as transient without account provenance", async () => {
+    const result = await runWithStdout(
+      [
+        toolResultLine("Release notes: the weekly limit reached banner now shows the reset time"),
+        JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          is_error: true,
+          result: "Claude exited unexpectedly",
+        }),
+      ].join("\n") + "\n",
+      1,
+    );
+    expect(result.errorCode).toBe("claude_transient_upstream");
+    expect(result.classificationSource).toBe("transcript");
+    expect(result.retryNotBefore ?? null).toBeNull();
+  });
+});

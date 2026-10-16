@@ -203,23 +203,64 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+// Fork: the raw stdout of a stream-json run is the whole transcript. Its JSON
+// event lines carry the model's text and tool results, e.g. an HTTP 401
+// "Unauthorized" or a "429" from a tool, so classifiers read only what the CLI
+// itself printed:
+// - plain text lines (the login command, or a CLI that failed before streaming);
+// - the notices the CLI injects as assistant messages: usage limits and API or
+//   sign-in errors (`<synthetic>` model, `isApiErrorMessage`, or an `error`).
+function claudeCliOutputLines(text: string): string[] {
+  const lines: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = line.startsWith("{") ? parseJson(line) : null;
+    if (!event) {
+      lines.push(line);
+      continue;
+    }
+    if (asString(event.type, "") !== "assistant") continue;
+    const message = parseObject(event.message);
+    const cliNotice =
+      asString(message.model, "") === "<synthetic>" ||
+      asBoolean(event.isApiErrorMessage, false) ||
+      asString(event.error, "").trim().length > 0;
+    if (!cliNotice) continue;
+    for (const entry of Array.isArray(message.content) ? message.content : []) {
+      const entryText = asString(parseObject(entry).text, "");
+      lines.push(...entryText.split(/\r?\n/).map((part) => part.trim()).filter(Boolean));
+    }
+  }
+  return lines;
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
+  // The parsed terminal fields hold the model's answer when the run succeeded,
+  // so they count only for a failed run, like the token markers below.
+  const terminalText =
+    parsed !== null && claudeResultIndicatesAuthFailure(parsed)
+      ? collectClaudeTerminalText(parsed)
+      : "";
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
+  // The legacy login-prompt markers match the failed result, stderr and the
+  // CLI's plain stdout lines.
+  const promptLines = [
+    ...terminalText.split(/\r?\n/),
+    ...claudeCliOutputLines(input.stdout),
+    ...input.stderr.split(/\r?\n/),
+  ]
     .map((line) => line.trim())
     .filter(Boolean);
   const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
+  // A usage-limit message outranks the broad legacy markers (a bare
+  // "unauthorized"), so a limited account is never reported as signed out.
+  const quotaMessage = promptLines.some((line) => CLAUDE_PROVIDER_QUOTA_RE.test(line));
 
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
@@ -230,7 +271,7 @@ export function detectClaudeLoginRequired(input: {
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
 
   return {
-    requiresLogin: loginPrompt || tokenFailure,
+    requiresLogin: (loginPrompt && !quotaMessage) || tokenFailure,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
 }
@@ -355,7 +396,7 @@ function buildClaudeTransientHaystack(input: {
     input.errorMessage ?? "",
     resultText,
     ...parsedErrors,
-    input.stdout ?? "",
+    ...claudeCliOutputLines(input.stdout ?? ""),
     input.stderr ?? "",
   ]
     .join("\n")
@@ -521,16 +562,25 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   }
 
   const dated = normalized.match(CLAUDE_RESET_DATED_CLOCK_RE);
-  const match = (dated ? dated[3] ?? "" : normalized).match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
+  // "4pm", "4:30 p.m." or a 24-hour "16:00". A bare hour without am/pm is
+  // ambiguous and never parsed.
+  const match = (dated ? dated[3] ?? "" : normalized).match(/^(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?/i);
   if (!match) return null;
+  const meridiem = (match[3] ?? "").toLowerCase();
+  if (!meridiem && match[2] === undefined) return null;
 
-  const hour12 = Number.parseInt(match[1] ?? "", 10);
+  const hourText = Number.parseInt(match[1] ?? "", 10);
   const minute = Number.parseInt(match[2] ?? "0", 10);
-  if (!Number.isInteger(hour12) || hour12 < 1 || hour12 > 12) return null;
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
-
-  let hour24 = hour12 % 12;
-  if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
+  if (!Number.isInteger(hourText)) return null;
+  let hour24: number;
+  if (meridiem) {
+    if (hourText < 1 || hourText > 12) return null;
+    hour24 = (hourText % 12) + (meridiem === "p" ? 12 : 0);
+  } else {
+    if (hourText > 23) return null;
+    hour24 = hourText;
+  }
 
   if (dated) {
     const month = CLAUDE_RESET_MONTHS.indexOf((dated[1] ?? "").slice(0, 3).toLowerCase()) + 1;
@@ -555,6 +605,18 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
     retryAt.setDate(retryAt.getDate() + 1);
   }
   return retryAt;
+}
+
+/**
+ * Fork: true when the raw transcript (model text or tool output) mentions a
+ * usage limit or a sign-in prompt. Used only after the CLI's own output did not
+ * classify a failed run: such a run is retried as transient and never changes
+ * the state of its AI account.
+ */
+export function claudeTranscriptMentionsAccountProblem(stdout: string): boolean {
+  return stdout
+    .split(/\r?\n/)
+    .some((line) => CLAUDE_PROVIDER_QUOTA_RE.test(line) || CLAUDE_LOGIN_PROMPT_RE.test(line));
 }
 
 export function extractClaudeRetryNotBefore(

@@ -91,6 +91,15 @@ export interface AdapterExecutionResult {
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;
+  /**
+   * Fork: where an auth, quota or transient classification came from.
+   * "terminal" is the CLI's own result, error or stderr output; "transcript"
+   * means only model text or tool output matched, which never changes the
+   * state of the run's AI account.
+   */
+  classificationSource?: "terminal" | "transcript" | null;
+  /** Fork: "provider_terminal" when `retryNotBefore` is the provider's own reset time. */
+  retryNotBeforeSource?: "provider_terminal" | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /**

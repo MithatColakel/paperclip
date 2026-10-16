@@ -393,13 +393,30 @@ const CLAUDE_AUTH_REQUIRED_ERROR_CODE = "claude_auth_required";
 export function mapClaudeAcpAuthErrorCode(
   result: AdapterExecutionResult,
 ): AdapterExecutionResult {
-  if (result.errorCode !== ACPX_AUTH_REQUIRED_ERROR_CODE) return result;
+  const classified = withClaudeAcpClassificationSource(result);
+  if (classified.errorCode !== ACPX_AUTH_REQUIRED_ERROR_CODE) return classified;
   return {
-    ...result,
+    ...classified,
     errorCode: CLAUDE_AUTH_REQUIRED_ERROR_CODE,
-    ...(result.errorMessage === "ACP agent reported a terminal access failure."
+    ...(classified.errorMessage === "ACP agent reported a terminal access failure."
       ? { errorMessage: "Claude sign-in failed. Sign in again and try again." }
       : {}),
+  };
+}
+
+// Fork: the ACP lane classifies sign-in and quota failures from the agent's
+// typed terminal failure, never from transcript text, so they are terminal.
+function withClaudeAcpClassificationSource(result: AdapterExecutionResult): AdapterExecutionResult {
+  if (result.classificationSource !== undefined) return result;
+  const quota = result.errorFamily === "provider_quota";
+  const auth =
+    result.errorCode === ACPX_AUTH_REQUIRED_ERROR_CODE ||
+    result.errorCode === CLAUDE_AUTH_REQUIRED_ERROR_CODE;
+  if (!quota && !auth) return result;
+  return {
+    ...result,
+    classificationSource: "terminal",
+    retryNotBeforeSource: quota && result.retryNotBefore ? "provider_terminal" : null,
   };
 }
 
