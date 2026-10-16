@@ -55,6 +55,8 @@ import { extractProviderIdWithFallback } from "../../lib/model-utils";
 import { formatRetryReason } from "../../lib/runRetryState";
 import { useRetryNowMutation } from "../../hooks/useRetryNowMutation";
 import { RetryErrorBand } from "../IssueScheduledRetryCard";
+import { ResourceWaitPropertyValue } from "../ResourceWaitBanner";
+import { scheduledResourceWait } from "../../lib/resource-wait";
 import { StatusIcon } from "../StatusIcon";
 import { PriorityIcon } from "../PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../../lib/ui-flags";
@@ -2649,6 +2651,8 @@ export function IssueProperties({
           <PropertyRow label="Workspace">
             <span className="text-sm text-muted-foreground">Waiting for workspace</span>
           </PropertyRow>
+        ) : scheduledResourceWait(scheduledRetry) ? (
+          <PropertyRow label="Waiting"><ResourceWaitPropertyValue scheduledRetry={scheduledRetry} /></PropertyRow>
         ) : showScheduledRetryRow && scheduledRetryContent ? (
           <PropertyPicker
             inline={inline}

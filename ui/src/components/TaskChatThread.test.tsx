@@ -4580,3 +4580,21 @@ describe("TaskChatThread composer execution controls", () => {
     expect(container.querySelector('[data-testid="task-chat-composer-stop"]')).toBeNull();
   });
 });
+
+describe("TaskChatThread resource waits (fork)", () => {
+  it.each([
+    ["legacy", "claude_local", "environment_unavailable"],
+    ["legacy", "claude_local", "ai_account_unavailable"],
+    ["legacy", "claude_local", "device_slots_full"],
+    ["native", "paperclip_runner", "environment_unavailable"],
+  ] as const)("keeps a %s %s %s deferral out of the conversation's stop markers", (runtimeMode, adapterType, errorCode) => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
+      runId: `wait-${errorCode}`, runtimeMode, status: "cancelled", errorCode,
+      agentId: "agent-1", agentName: "Runner", adapterType,
+      // A deferral is claimed, so it has started; it never starts provider work.
+      startedAt: "2026-09-12T18:00:00.000Z", createdAt: "2026-09-12T18:00:00.000Z", finishedAt: "2026-09-12T18:00:01.000Z",
+      resultJson: { executionRecovery: { kind: "resource_wait", providerWorkStarted: false } },
+    }]} />);
+    expect(container.textContent).not.toMatch(/Run cancelled|Run failed|Stopped|Execution was stopped|Couldn't start/);
+  });
+});

@@ -3613,4 +3613,51 @@ describe("IssueProperties", () => {
 
     act(() => root.unmount());
   });
+
+  it("shows a Waiting row instead of the retry picker while the task waits for its device (fork)", () => {
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "in_progress",
+        scheduledRetry: {
+          runId: "run-successor",
+          status: "scheduled_retry",
+          agentId: "agent-1",
+          agentName: "Coder",
+          retryOfRunId: "run-deferral",
+          scheduledRetryAt: "2026-04-18T20:15:00.000Z",
+          scheduledRetryAttempt: 2,
+          scheduledRetryReason: "environment_wait",
+          errorCode: "environment_unavailable",
+          resourceWait: {
+            version: 1,
+            episodeId: "episode-1",
+            kind: "environment",
+            reason: "offline",
+            scope: "target",
+            environmentId: "environment-1",
+            environmentName: "SSH · Build box",
+            deviceId: "device-1",
+            deviceName: "Build box",
+            accountId: null,
+            accountLabel: null,
+            resumeAt: null,
+            resumeAtSource: null,
+            message: null,
+            since: null,
+            notifiedAt: null,
+          },
+        },
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+      inline: true,
+    });
+
+    expect(container.querySelector('[data-property-label="Waiting"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="issue-properties-resource-wait"]')?.textContent)
+      .toBe("device Build box (offline)");
+    expect(container.querySelector('[data-property-label="Scheduled retry"]')).toBeNull();
+
+    act(() => root.unmount());
+  });
 });

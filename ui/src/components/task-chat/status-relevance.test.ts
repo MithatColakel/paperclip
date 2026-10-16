@@ -130,3 +130,34 @@ it("removes run lifecycle diagnostics while retaining tool failures and pending 
   expect(withoutHistoricalRunStatus(items)).toEqual(retained);
   expect(items).toHaveLength(7);
 });
+
+describe("task chat status relevance for resource waits (fork)", () => {
+  const failed = {
+    id: "failed", agentId: "agent", status: "failed",
+    createdAt: "2025-01-01T10:00:00Z", startedAt: "2025-01-01T10:00:01Z",
+  };
+  // A deferral is claimed, so it has startedAt, but it never starts provider work.
+  const deferral = (id: string, at: string, errorCode: string) => ({
+    id, agentId: "agent", status: "cancelled", errorCode, createdAt: at, startedAt: at,
+    resultJson: { executionRecovery: { kind: "resource_wait", providerWorkStarted: false } },
+  });
+
+  it.each(["environment_unavailable", "ai_account_unavailable", "device_slots_full"])(
+    "treats a %s deferral as a wait, not as a new attempt",
+    (errorCode) => {
+      const wait = deferral("wait", "2025-01-01T10:01:00Z", errorCode);
+      const policy = taskChatStatusRelevance("in_progress", [failed, wait]);
+      // The wait does not resolve the earlier failure.
+      expect(policy.isHistoricalRun("failed")).toBe(false);
+      expect(policy.isHistoricalRun("wait")).toBe(false);
+    },
+  );
+
+  it("keeps only the latest observation of a wait", () => {
+    const older = deferral("older", "2025-01-01T10:01:00Z", "environment_unavailable");
+    const newer = deferral("newer", "2025-01-01T10:02:00Z", "environment_unavailable");
+    const policy = taskChatStatusRelevance("in_progress", [older, newer]);
+    expect(policy.isHistoricalRun("older")).toBe(true);
+    expect(policy.isHistoricalRun("newer")).toBe(false);
+  });
+});

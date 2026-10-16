@@ -24,6 +24,13 @@ import { cn, relativeTime } from "../lib/utils";
 import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameQueryTail } from "../lib/query-placeholder-data";
 import { describeRunRetryState } from "../lib/runRetryState";
+import {
+  collapseResourceWaitRuns,
+  isResourceWaitLedgerRun,
+  resourceWaitRunSummary,
+  type ResourceWaitRunGroup,
+} from "../lib/resource-wait";
+import { ResourceWaitLedgerEntry } from "./ResourceWaitBanner";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { SourceResolvedFoldBadge } from "./SourceResolvedFoldBadge";
 import { ResponsibleUserDenialNotice } from "./ResponsibleUserDenialNotice";
@@ -82,7 +89,9 @@ type LedgerFeedItem =
       id: string;
       timestamp: string;
       event: ActivityEvent;
-    };
+    }
+  // Fork: consecutive resource-wait runs, shown as one "Waited: <reason>" entry.
+  | ResourceWaitRunGroup<LedgerRun>;
 
 type LivenessCopy = {
   label: string;
@@ -292,6 +301,7 @@ function runSummary(
   agentMap: ReadonlyMap<string, Pick<Agent, "name">>,
 ) {
   const agentName = compactAgentName(run, agentMap);
+  if (isResourceWaitLedgerRun(run)) return resourceWaitRunSummary(run, agentName);
   if (run.status === "running") return `Running now by ${agentName}`;
   if (run.status === "queued") return `Queued for ${agentName}`;
   if (run.status === "scheduled_retry")
@@ -654,13 +664,14 @@ export function IssueRunLedgerContent({
         });
       }
     }
-    return items.sort((a, b) => {
+    items.sort((a, b) => {
       const aTime = new Date(a.timestamp).getTime();
       const bTime = new Date(b.timestamp).getTime();
       if (aTime !== bTime) return bTime - aTime;
       if (a.kind !== b.kind) return a.kind === "run" ? -1 : 1;
       return b.id.localeCompare(a.id);
     });
+    return collapseResourceWaitRuns(items, (item) => (item.kind === "run" ? item.run : null));
   }, [activityEvents, canRenderActivityEvents, ledgerRuns]);
 
   return (
@@ -841,6 +852,7 @@ export function IssueRunLedgerContent({
                 </div>
               );
             }
+            if (item.kind === "resource_wait") return <ResourceWaitLedgerEntry key={item.id} runs={item.runs} agentName={compactAgentName(item.runs[0], agentMap)} timestamp={item.timestamp} />;
             const run = item.run;
             const liveness = livenessCopyForRun(run);
             const stopReason = stopReasonLabel(run);

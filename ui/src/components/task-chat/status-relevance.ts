@@ -1,5 +1,6 @@
 import type { ExecutionProjection, IssueRecoveryAction } from "@paperclipai/shared";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
+import { isResourceWaitDeferralRun } from "@/lib/resource-wait";
 import { isTerminalIssueStatus } from "@/lib/liveIssueIds";
 import type { TaskChatItem } from "./task-chat-model";
 
@@ -19,8 +20,10 @@ function timestamp(value: Date | string | null | undefined): number {
 }
 
 function isAdmissionWait(run: StatusRun): boolean {
-  return run.status === "cancelled" && !run.startedAt
-    && ["execution_reconciliation_required", "workspace_busy", "issue_not_in_progress", "issue_terminal_status"].includes(run.errorCode ?? "");
+  return (run.status === "cancelled" && !run.startedAt
+    && ["execution_reconciliation_required", "workspace_busy", "issue_not_in_progress", "issue_terminal_status"].includes(run.errorCode ?? ""))
+    // Fork: a resource wait is claimed (so it has startedAt) but never starts provider work.
+    || isResourceWaitDeferralRun(run);
 }
 
 /** Presentation only: retain every run and comment in the underlying history. */

@@ -455,3 +455,66 @@ describe("CompanySettingsSidebar operator-hidden entries", () => {
     expect(container.textContent).not.toContain("Import");
   });
 });
+
+describe("CompanySettingsSidebar Claude accounts and devices (fork)", () => {
+  let container: HTMLDivElement;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    mockSidebarBadgesApi.get.mockResolvedValue({ inbox: 0, approvals: 0, failedRuns: 0, joinRequests: 0 });
+    mockPluginsApi.list.mockResolvedValue([]);
+    mockUsePluginSlots.mockReturnValue({ slots: [], isLoading: false, errorMessage: null });
+  });
+
+  afterEach(() => {
+    container.remove();
+    document.body.innerHTML = "";
+    vi.clearAllMocks();
+  });
+
+  async function renderSidebar(isInstanceAdmin: boolean) {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.access.currentBoardAccess, { isInstanceAdmin, source: "session" });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanySettingsSidebar />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    return root;
+  }
+
+  it("shows Claude accounts and Devices to every member", async () => {
+    const root = await renderSidebar(false);
+
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/company/settings/claude-accounts", label: "Claude accounts", end: true }),
+    );
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/company/settings/devices", label: "Devices", end: true }),
+    );
+    expect(container.textContent).not.toContain("Devices & Claude accounts");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("adds the instance-wide Devices & Claude accounts page for instance admins", async () => {
+    const root = await renderSidebar(true);
+
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/company/settings/instance/ai-accounts", label: "Devices & Claude accounts" }),
+    );
+    expect(container.textContent).toContain("Claude accounts");
+    expect(container.textContent).toContain("Devices");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+});

@@ -128,6 +128,8 @@ export function attentionKind(item: AttentionItem): AttentionKind {
     case "blocker_attention":
     case "recovery_action":
     case "budget_alert":
+    // Fork: tasks waiting for a device, Claude account or account slot.
+    case "resource_wait_alert":
       return "blocking";
     case "approval":
     case "issue_thread_interaction":

@@ -8,6 +8,8 @@ import type { IssueScheduledRetry } from "@paperclipai/shared";
 import { useRetryNowMutation, type RetryNowError } from "../hooks/useRetryNowMutation";
 import { Badge } from "@/components/ui/badge";
 import { InlineBanner } from "@/components/InlineBanner";
+import { isResourceWaitRetryReason } from "@/lib/resource-wait";
+import { ResourceWaitBanner } from "./ResourceWaitBanner";
 
 const MAX_TURN_CONTINUATION = "max_turns_continuation";
 
@@ -40,6 +42,8 @@ export function IssueScheduledRetryCard({
       </InlineBanner>
     );
   }
+  // Fork: a device, Claude account or slot wait starts on its own; its "Check now" re-checks the resource.
+  if (isResourceWaitRetryReason(scheduledRetry.scheduledRetryReason)) return <ResourceWaitBanner issueId={issueId} scheduledRetry={scheduledRetry} className="mb-3" />;
 
   const continuation = isContinuationReason(scheduledRetry.scheduledRetryReason);
   const dueAtIso = scheduledRetry.scheduledRetryAt

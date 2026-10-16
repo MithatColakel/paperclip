@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueRetryNowOutcome, IssueScheduledRetry } from "@paperclipai/shared";
 import { IssueScheduledRetryCard } from "./IssueScheduledRetryCard";
 import { ToastProvider } from "../context/ToastContext";
+import { ApiError } from "../api/client";
 
 const retryNowMock = vi.hoisted(() => vi.fn());
 
@@ -251,5 +252,63 @@ describe("IssueScheduledRetryCard", () => {
       expect((band?.textContent ?? "")).toContain("Promotion suppressed");
       expect(getRetryNowButton()!.disabled).toBe(false);
     });
+  });
+});
+
+describe("IssueScheduledRetryCard resource waits (fork)", () => {
+  const waitingRetry: IssueScheduledRetry = {
+    ...baseRetry,
+    scheduledRetryReason: "environment_wait",
+    errorCode: "environment_unavailable",
+    error: "Waiting for device Build box",
+    resourceWait: {
+      version: 1,
+      episodeId: "episode-1",
+      kind: "environment",
+      reason: "offline",
+      scope: "target",
+      environmentId: "environment-1",
+      environmentName: "SSH · Build box",
+      deviceId: "device-1",
+      deviceName: "Build box",
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+      since: null,
+      notifiedAt: null,
+    },
+  };
+
+  function getCheckNowButton() {
+    return container.querySelector<HTMLButtonElement>('[data-testid="resource-wait-check-now"]');
+  }
+
+  it("shows the wait and Check now instead of retry controls", () => {
+    renderWithProviders(<IssueScheduledRetryCard issueId="issue-1" scheduledRetry={waitingRetry} />);
+    expect(container.textContent).toContain("Waiting for device Build box (offline)");
+    expect(container.textContent).toContain("Starts automatically when Build box is back online.");
+    expect(getCheckNowButton()?.textContent).toContain("Check now");
+    expect(getRetryNowButton()).toBeNull();
+    expect(container.textContent).not.toMatch(/Retry scheduled|Attempt|Last attempt failed/);
+  });
+
+  it("renders a 409 from Check now as still unavailable, without an error band or toast", async () => {
+    retryNowMock.mockRejectedValue(new ApiError("Still unavailable", 409, {
+      error: "Still unavailable",
+      code: "resource_still_unavailable",
+      details: { code: "resource_still_unavailable", resourceWait: waitingRetry.resourceWait, checkedAt: new Date(SYSTEM_NOW).toISOString() },
+    }));
+    renderWithProviders(<IssueScheduledRetryCard issueId="issue-1" scheduledRetry={waitingRetry} />);
+    act(() => {
+      getCheckNowButton()!.click();
+    });
+    await waitForUi(() => {
+      expect(container.textContent).toContain("Still unavailable (checked just now)");
+    });
+    expect(retryNowMock).toHaveBeenCalledWith("issue-1");
+    expect(container.querySelector('[data-testid="issue-scheduled-retry-error-band"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Couldn't retry now");
   });
 });

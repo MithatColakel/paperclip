@@ -659,3 +659,12 @@ describe("planAttentionRenderRows (PAP-13784 incremental rendering)", () => {
     expect(plan.hasMoreRows).toBe(true);
   });
 });
+
+describe("resource wait alerts (fork)", () => {
+  it("labels them as waiting and files them with the blocking kind", () => {
+    const item = buildItem({ sourceKind: "resource_wait_alert" });
+    expect(sourceMeta("resource_wait_alert").label).toBe("Waiting");
+    expect(attentionKind(item)).toBe("blocking");
+    expect(attentionStatus(item)).toBe("blocked");
+  });
+});

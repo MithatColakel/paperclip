@@ -1,6 +1,7 @@
 import type { Agent } from "@paperclipai/shared";
 import type { CompanyUserProfile } from "./company-members";
 import { formatReviewPolicyValue } from "./review-policy";
+import { accountPoolActivityVerb, accountPoolIssueActivityLabel } from "./resource-wait";
 
 type ActivityDetails = Record<string, unknown> | null | undefined;
 
@@ -480,7 +481,7 @@ export function formatActivityVerb(
   });
   if (structuredChange) return structuredChange;
 
-  return ACTIVITY_ROW_VERBS[action] ?? action.replace(/[._]/g, " ");
+  return ACTIVITY_ROW_VERBS[action] ?? accountPoolActivityVerb(action, details) ?? action.replace(/[._]/g, " ");
 }
 
 export function formatIssueActivityAction(
@@ -538,5 +539,5 @@ export function formatIssueActivityAction(
     return `${ISSUE_ACTIVITY_LABELS[action] ?? action} ${key}${title}`;
   }
 
-  return ISSUE_ACTIVITY_LABELS[action] ?? action.replace(/[._]/g, " ");
+  return ISSUE_ACTIVITY_LABELS[action] ?? accountPoolIssueActivityLabel(action, details) ?? action.replace(/[._]/g, " ");
 }

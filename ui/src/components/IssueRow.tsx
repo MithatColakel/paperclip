@@ -22,6 +22,7 @@ import {
 import { StatusIcon } from "./StatusIcon";
 import { hasAssignedBacklogBlocker } from "../lib/issue-blockers";
 import { ExternalObjectStatusSummary } from "./ExternalObjectStatusSummary";
+import { ResourceWaitChip } from "./ResourceWaitBanner";
 import { Badge } from "@/components/ui/badge";
 
 export type IssueRowUnreadState = "hidden" | "visible" | "fading";
@@ -202,7 +203,7 @@ export function IssueRow({
   // scheduler is actually running from one whose due time simply passed.
   const recoveryIndicator = recoveryAction && !requiresExecutionReconciliation(recoveryAction.cause)
     ? renderRecoveryChip(recoveryAction, selected, { scheduledRetry: issue.scheduledRetry ?? null })
-    : null;
+    : <ResourceWaitChip scheduledRetry={issue.scheduledRetry} selected={selected} />;
   const parkedBlockerIndicator = hasAssignedBacklogBlocker(issue.blockedBy) ? (
     <Badge variant="outline"
       data-testid="issue-row-parked-blocker"

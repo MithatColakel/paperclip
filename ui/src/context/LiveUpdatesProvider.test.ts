@@ -1628,3 +1628,21 @@ describe("task subtree notification context", () => {
     expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/agents/alex/runs/child-run", { runId: "child-run" }, { isForegrounded: true })).toBe(true);
   });
 });
+
+describe("LiveUpdatesProvider resource waits (fork)", () => {
+  it.each(["environment_unavailable", "ai_account_unavailable", "device_slots_full"])(
+    "does not toast a %s deferral: the task shows the wait",
+    (errorCode) => {
+      expect(__liveUpdatesTestUtils.buildRunStatusToast({
+        runId: "deferral-run", agentId: "agent-1", status: "cancelled", errorCode,
+        error: "Waiting for device Build box (offline)",
+      }, () => "Coder")).toBeNull();
+    },
+  );
+
+  it("still toasts other cancellations", () => {
+    expect(__liveUpdatesTestUtils.buildRunStatusToast({
+      runId: "other-run", agentId: "agent-1", status: "cancelled", errorCode: "cancelled_by_user",
+    }, () => "Coder")).not.toBeNull();
+  });
+});

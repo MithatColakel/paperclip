@@ -6,9 +6,11 @@ import {
   Download,
   FlaskConical,
   KeyRound,
+  Laptop,
   MailPlus,
   MonitorCog,
   Puzzle,
+  ServerCog,
   Shield,
   SlidersHorizontal,
   Upload,
@@ -50,7 +52,7 @@ export function CompanySettingsSidebar() {
   const { hidden: hiddenSettings } = useHiddenSettings();
   const showPage = (pageKey: string) => !hiddenSettings.has(pageKey);
   const showPlugins = showPage("instance.plugins");
-  // Claude accounts serve every company's runs, so only instance admins see the page.
+  // Every device and account across companies: only instance admins see that page.
   const showAiAccounts = useIsInstanceAdmin();
   // Import is floored server-side on cloud-managed instances (403 cloud_managed), so the
   // nav entry is hidden rather than dead-ending. Export stays available.
@@ -147,11 +149,14 @@ export function CompanySettingsSidebar() {
               end
             />
           )}
+          {/* Fork: every member's Claude accounts and the devices that run this company's agents. */}
+          <SidebarNavItem to="/company/settings/claude-accounts" label="Claude accounts" icon={UserRoundCog} end />
+          <SidebarNavItem to="/company/settings/devices" label="Devices" icon={Laptop} end />
           {showAiAccounts && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts`}
-              label="Claude accounts"
-              icon={UserRoundCog}
+              label="Devices & Claude accounts"
+              icon={ServerCog}
               end
             />
           )}

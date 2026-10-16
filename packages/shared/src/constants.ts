@@ -1538,6 +1538,9 @@ export const PLUGIN_RESERVED_COMPANY_SETTINGS_ROUTE_SEGMENTS = [
   "invites",
   "secrets",
   "instance",
+  // Fork: the host's Claude accounts and execution devices pages.
+  "claude-accounts",
+  "devices",
 ] as const;
 export type PluginReservedCompanySettingsRouteSegment =
   (typeof PLUGIN_RESERVED_COMPANY_SETTINGS_ROUTE_SEGMENTS)[number];

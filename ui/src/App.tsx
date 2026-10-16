@@ -91,6 +91,8 @@ import { DesignGuide } from "./pages/DesignGuide";
 import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
 import { InstanceAccess } from "./pages/InstanceAccess";
 import { InstanceAiAccounts } from "./pages/InstanceAiAccounts";
+import { ClaudeAccounts } from "./pages/ClaudeAccounts";
+import { ExecutionDevices } from "./pages/ExecutionDevices";
 import { ProfileSettings } from "./pages/ProfileSettings";
 import { PluginManager } from "./pages/PluginManager";
 import { PluginSettings } from "./pages/PluginSettings";
@@ -266,6 +268,9 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       </Route>
       {/* Instance-wide Claude accounts per execution host; run failures link here via /instance/settings/ai-accounts. */}
       <Route path="company/settings/instance/ai-accounts" element={<InstanceAiAccounts />} />
+      {/* Fork: every member's Claude accounts and devices pages; declared before the plugin settings catch-all. */}
+      <Route path="company/settings/claude-accounts" element={<ClaudeAccounts />} />
+      <Route path="company/settings/devices" element={<ExecutionDevices />} />
       <Route path="company/settings/:settingsRoutePath/*" element={<CompanySettingsPluginPage />} />
       <Route path="skills/sources" element={<SkillSources />} />
       <Route path="skills/sources/:sourceId" element={<SkillSources />} />

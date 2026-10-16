@@ -9,6 +9,7 @@ import type { ActivityEvent, IssueQueuedCommentQueue, TaskBrowser } from "@paper
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { skillCreatedItems } from "@/components/task-chat/skill-created-items";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
+import { isResourceWaitErrorCode } from "@paperclipai/shared";
 import { TaskChatExpansionState } from "@/components/task-chat/expansion-state";
 import { TaskChatScrollReady } from "@/components/task-chat/scroll-navigation";
 import {
@@ -1509,7 +1510,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const historical = statusRelevance.isHistoricalRun(source.id);
       // A workspace admission attempt never started provider work. Its live
       // successor owns the waiting indicator; retain this attempt in the run log.
-      if (source.status === "cancelled" && meta?.errorCode === "workspace_busy") {
+      // Fork: the same holds for a device, Claude account or account-slot wait.
+      if (source.status === "cancelled" && (meta?.errorCode === "workspace_busy" || isResourceWaitErrorCode(meta?.errorCode))) {
         settledRunIds.add(source.id);
         continue;
       }

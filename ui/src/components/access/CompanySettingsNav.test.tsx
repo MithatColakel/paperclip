@@ -88,6 +88,8 @@ describe("CompanySettingsNav", () => {
     expect(getCompanySettingsTab("/PAP/company/settings/instance/plugins/example")).toBe("instance-plugins");
     expect(getCompanySettingsTab("/company/settings/instance/adapters")).toBe("instance-adapters");
     expect(getCompanySettingsTab("/PAP/company/settings/instance/ai-accounts")).toBe("instance-ai-accounts");
+    expect(getCompanySettingsTab("/PAP/company/settings/claude-accounts")).toBe("claude-accounts");
+    expect(getCompanySettingsTab("/company/settings/devices")).toBe("devices");
   });
 
   function renderNav(
@@ -130,6 +132,8 @@ describe("CompanySettingsNav", () => {
           { value: "secrets", label: "Secrets" },
           { value: "instance-profile", label: "Profile" },
           { value: "instance-environments", label: "Environments" },
+          { value: "claude-accounts", label: "Claude accounts" },
+          { value: "devices", label: "Devices" },
           { value: "instance-access", label: "Access" },
           { value: "instance-experimental", label: "Experimental" },
           { value: "instance-plugins", label: "Plugins" },
@@ -152,7 +156,7 @@ describe("CompanySettingsNav", () => {
     });
   });
 
-  it("offers the Claude accounts tab to instance admins only", async () => {
+  it("offers the Devices & Claude accounts tab to instance admins only", async () => {
     currentPathname = "/PAP/company/settings/instance/ai-accounts";
     const root = createRoot(container);
 
@@ -162,7 +166,7 @@ describe("CompanySettingsNav", () => {
 
     const adminTabs = pageTabBarMock.mock.calls.at(-1)?.[0];
     expect(adminTabs?.value).toBe("instance-ai-accounts");
-    expect(adminTabs?.items).toContainEqual({ value: "instance-ai-accounts", label: "Claude accounts" });
+    expect(adminTabs?.items).toContainEqual({ value: "instance-ai-accounts", label: "Devices & Claude accounts" });
 
     await act(async () => {
       root.unmount();
@@ -178,6 +182,24 @@ describe("CompanySettingsNav", () => {
 
     await act(async () => {
       memberRoot.unmount();
+    });
+  });
+
+  it("offers the Claude accounts and Devices tabs to every member", async () => {
+    currentPathname = "/PAP/company/settings/devices";
+    const root = createRoot(container);
+
+    await act(async () => {
+      renderNav(root, undefined, undefined, { isInstanceAdmin: false, source: "session" });
+    });
+
+    const memberTabs = pageTabBarMock.mock.calls.at(-1)?.[0];
+    expect(memberTabs?.value).toBe("devices");
+    expect(memberTabs?.items).toContainEqual({ value: "claude-accounts", label: "Claude accounts" });
+    expect(memberTabs?.items).toContainEqual({ value: "devices", label: "Devices" });
+
+    await act(async () => {
+      root.unmount();
     });
   });
 
@@ -200,6 +222,8 @@ describe("CompanySettingsNav", () => {
       "secrets",
       "instance-profile",
       "instance-environments",
+      "claude-accounts",
+      "devices",
       "instance-access",
       "instance-experimental",
       "instance-adapters",

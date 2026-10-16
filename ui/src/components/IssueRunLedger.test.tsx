@@ -629,3 +629,110 @@ describe("IssueRunLedger", () => {
     expect(container.querySelector('[data-testid="responsible-user-denial-notice"]')).toBeNull();
   });
 });
+
+describe("IssueRunLedger resource waits (fork)", () => {
+  const offline = {
+    version: 1,
+    episodeId: "episode-1",
+    kind: "environment",
+    reason: "offline",
+    scope: "target",
+    environmentId: "environment-1",
+    environmentName: "SSH · Build box",
+    deviceId: "device-1",
+    deviceName: "Build box",
+    accountId: null,
+    accountLabel: null,
+    resumeAt: null,
+    resumeAtSource: null,
+    message: null,
+  };
+
+  function deferral(runId: string, at: string) {
+    return createRun({
+      runId,
+      status: "cancelled",
+      errorCode: "environment_unavailable",
+      startedAt: at,
+      finishedAt: at,
+      createdAt: at,
+      livenessState: null,
+      livenessReason: null,
+      lastUsefulActionAt: null,
+      resultJson: {
+        executionRecovery: { kind: "resource_wait", providerWorkStarted: false },
+        resourceWait: offline,
+      },
+    });
+  }
+
+  const earlier = createRun({
+    runId: "run-earlier",
+    startedAt: "2026-04-18T19:00:00.000Z",
+    finishedAt: "2026-04-18T19:05:00.000Z",
+    createdAt: "2026-04-18T19:00:00.000Z",
+  });
+
+  it("collapses a chain of waits into one entry while the task still waits", () => {
+    renderLedger({
+      runs: [
+        createRun({
+          runId: "run-waiting",
+          status: "scheduled_retry",
+          startedAt: null,
+          finishedAt: null,
+          createdAt: "2026-04-18T19:50:00.000Z",
+          livenessState: null,
+          livenessReason: null,
+          lastUsefulActionAt: null,
+          retryOfRunId: "run-deferral-2",
+          scheduledRetryAt: "2026-04-18T20:01:00.000Z",
+          scheduledRetryAttempt: 3,
+          scheduledRetryReason: "environment_wait",
+          contextSnapshot: { resourceWait: offline },
+        }),
+        deferral("run-deferral-2", "2026-04-18T19:40:00.000Z"),
+        deferral("run-deferral-1", "2026-04-18T19:30:00.000Z"),
+        earlier,
+      ],
+    });
+
+    const entries = container.querySelectorAll('[data-testid="run-ledger-resource-wait"]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].textContent).toContain("Waiting: device offline");
+    expect(entries[0].textContent).toContain("2 attempts");
+    expect(entries[0].textContent).toContain("30m so far");
+    expect(entries[0].textContent).toContain("Waiting for device Build box (offline)");
+    expect(container.querySelectorAll("article")).toHaveLength(2);
+    expect(container.textContent).toContain("Waiting: device offline · CodexCoder");
+    expect(container.textContent).not.toContain("Retry pending");
+    expect(container.textContent).not.toContain("Automatic retry scheduled");
+  });
+
+  it("shows a finished wait as waited, next to the run that resumed", () => {
+    renderLedger({
+      runs: [
+        createRun({
+          runId: "run-resumed",
+          startedAt: "2026-04-18T19:50:00.000Z",
+          finishedAt: "2026-04-18T19:55:00.000Z",
+          createdAt: "2026-04-18T19:45:00.000Z",
+          retryOfRunId: "run-deferral-2",
+          scheduledRetryAttempt: 3,
+          scheduledRetryReason: "environment_wait",
+        }),
+        deferral("run-deferral-2", "2026-04-18T19:40:00.000Z"),
+        deferral("run-deferral-1", "2026-04-18T19:30:00.000Z"),
+      ],
+    });
+
+    const entries = container.querySelectorAll('[data-testid="run-ledger-resource-wait"]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].textContent).toContain("Waited: device offline");
+    expect(entries[0].textContent).toContain("for 10m");
+    expect(container.querySelectorAll("article")).toHaveLength(2);
+    expect(container.textContent).toContain("Resumed");
+    expect(container.textContent).toContain("Started after waiting for its device");
+    expect(container.textContent).not.toMatch(/cancelled by|Retried run/);
+  });
+});

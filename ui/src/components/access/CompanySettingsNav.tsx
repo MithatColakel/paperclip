@@ -14,7 +14,10 @@ const items = [
   { value: "secrets", label: "Secrets", href: "/company/settings/secrets" },
   { value: "instance-profile", label: "Profile", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/profile` },
   { value: "instance-environments", label: "Environments", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/environments` },
-  { value: "instance-ai-accounts", label: "Claude accounts", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts` },
+  // Fork: every member's Claude accounts and devices; the instance page is for instance admins.
+  { value: "claude-accounts", label: "Claude accounts", href: "/company/settings/claude-accounts" },
+  { value: "devices", label: "Devices", href: "/company/settings/devices" },
+  { value: "instance-ai-accounts", label: "Devices & Claude accounts", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts` },
   { value: "instance-access", label: "Access", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/access` },
   { value: "instance-experimental", label: "Experimental", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/experimental` },
   { value: "instance-plugins", label: "Plugins", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/plugins` },
@@ -48,6 +51,14 @@ export function getCompanySettingsTab(pathname: string): CompanySettingsTab {
 
   if (pathname.includes(`${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts`)) {
     return "instance-ai-accounts";
+  }
+
+  if (pathname.includes("/company/settings/claude-accounts")) {
+    return "claude-accounts";
+  }
+
+  if (pathname.includes("/company/settings/devices")) {
+    return "devices";
   }
 
   if (pathname.includes(`${INSTANCE_SETTINGS_PATH_PREFIX}/access`)) {
@@ -105,7 +116,7 @@ export function CompanySettingsNav() {
   // Import is floored server-side on cloud-managed instances (403 cloud_managed), so the
   // tab is suppressed there rather than dead-ending.
   const isCloud = Boolean(useCloudInstance());
-  // Claude accounts serve every company's runs, so only instance admins get the tab.
+  // Every device and account across companies: only instance admins get that tab.
   const isInstanceAdmin = useIsInstanceAdmin();
   const activeTab = getCompanySettingsTab(location.pathname);
   const visibleItems = items.filter((item) => {

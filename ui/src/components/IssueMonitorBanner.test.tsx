@@ -2,7 +2,8 @@
 
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import type { Issue } from "@paperclipai/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Issue, ScheduledRetryResourceWait } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -268,5 +269,111 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     expect(container.textContent).toBe("");
     expect(vi.getTimerCount()).toBe(0);
     flushSync(() => root.unmount());
+  });
+});
+
+describe("resource waits on the waiting surfaces (fork)", () => {
+  function resourceWait(overrides: Partial<ScheduledRetryResourceWait> = {}): ScheduledRetryResourceWait {
+    return {
+      version: 1,
+      episodeId: "episode-1",
+      kind: "environment",
+      reason: "unreachable",
+      scope: "target",
+      environmentId: "environment-1",
+      environmentName: "SSH · Build box",
+      deviceId: "device-1",
+      deviceName: "Build box",
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+      since: null,
+      notifiedAt: null,
+      ...overrides,
+    };
+  }
+
+  it("names the resource and drops retry wording", () => {
+    const copy = buildMonitorSurfaceCopy(
+      derived({ state: "overdue", source: "scheduled-retry", nextCheckAt: NOW.toISOString(), attemptCount: 3 }),
+      NOW,
+      "environment_wait",
+      { lane: "environment_wait", agentName: "Coder", wait: resourceWait() },
+    );
+    expect(copy).toMatchObject({
+      resourceWait: true,
+      bannerTitle: "Waiting for device Build box (unreachable)",
+      stripTitle: "Waiting for device: Build box",
+      tone: "info",
+    });
+    expect([...copy!.bannerMeta, ...copy!.stripMeta].join(" ")).not.toMatch(/Attempt|overdue|retry/i);
+  });
+
+  it("uses the warning tone when a person has to act, even while a monitor is scheduled", () => {
+    const copy = buildMonitorSurfaceCopy(
+      derived({ state: "scheduled", source: "monitor", nextCheckAt: new Date(NOW.getTime() + 15 * 60_000).toISOString(), attemptCount: 1 }),
+      NOW,
+      "ai_account_wait",
+      {
+        lane: "ai_account_wait",
+        agentName: "Coder",
+        wait: resourceWait({ kind: "ai_account", scope: "account", reason: "signed_out", accountId: "account-1", accountLabel: "Team Max" }),
+      },
+    );
+    expect(copy).toMatchObject({ resourceWait: true, tone: "warning", bannerTitle: "Waiting for a Claude account: Team Max is signed out" });
+    expect(copy!.bannerMeta[0]).toContain("must replace its token");
+  });
+
+  it("shows the wait and its own Check now on the banner and the strip", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const issue = {
+      id: "issue-1",
+      status: "in_progress",
+      scheduledRetry: {
+        runId: "run-successor",
+        status: "scheduled_retry",
+        agentId: "agent-1",
+        agentName: "Coder",
+        retryOfRunId: "run-deferral",
+        scheduledRetryReason: "ai_account_wait",
+        scheduledRetryAt: new Date(NOW.getTime() + 60_000).toISOString(),
+        scheduledRetryAttempt: 2,
+        resourceWait: resourceWait({
+          kind: "ai_account",
+          scope: "account",
+          reason: "usage_limit",
+          accountId: "account-1",
+          accountLabel: "Team Max",
+          resumeAt: new Date(NOW.getTime() + 2 * 60 * 60_000).toISOString(),
+          resumeAtSource: "estimated",
+        }),
+      },
+    } as unknown as Issue;
+    const onCheckNow = vi.fn();
+    const root = createRoot(container);
+    flushSync(() => root.render(
+      <QueryClientProvider client={new QueryClient()}>
+        <IssueMonitorBanner issue={issue} onCheckNow={onCheckNow} />
+        <IssueMonitorComposerStrip issue={issue} onCheckNow={onCheckNow} />
+      </QueryClientProvider>,
+    ));
+
+    expect(container.textContent).toContain("Waiting for Claude account Team Max: the usage limit resets at ");
+    expect(container.textContent).toContain("(estimated)");
+    expect(container.textContent).toContain("Waiting for limit reset: ");
+    expect(container.textContent).toContain("You can keep sending instructions while the agent waits.");
+    expect(container.textContent).not.toContain("Agent retry");
+    const checkNow = container.querySelectorAll('[data-testid="resource-wait-check-now"]');
+    expect(checkNow).toHaveLength(2);
+    expect(Array.from(container.querySelectorAll("button")).filter((button) => button.textContent?.includes("Check now"))).toHaveLength(2);
+
+    flushSync(() => root.unmount());
+    container.remove();
+    vi.useRealTimers();
   });
 });

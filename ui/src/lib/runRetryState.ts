@@ -1,4 +1,5 @@
 import { formatDateTime } from "./utils";
+import { describeResourceWaitRunState, resourceWaitLaneLabel } from "./resource-wait";
 
 type RetryAwareRun = {
   status: string;
@@ -43,10 +44,13 @@ function joinFragments(parts: Array<string | null>) {
 export function formatRetryReason(reason: string | null | undefined) {
   const normalized = readNonEmptyString(reason);
   if (!normalized) return null;
-  return RETRY_REASON_LABELS[normalized] ?? normalized.replace(/_/g, " ");
+  return RETRY_REASON_LABELS[normalized] ?? resourceWaitLaneLabel(normalized) ?? normalized.replace(/_/g, " ");
 }
 
 export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary | null {
+  // Fork: a resource wait reads "Waiting" / "Waited", never as a retry.
+  const resourceWait = describeResourceWaitRunState(run);
+  if (resourceWait) return resourceWait;
   const attempt =
     typeof run.scheduledRetryAttempt === "number" && Number.isFinite(run.scheduledRetryAttempt) && run.scheduledRetryAttempt > 0
       ? run.scheduledRetryAttempt

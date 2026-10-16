@@ -59,3 +59,70 @@ describe("runRetryState", () => {
     });
   });
 });
+
+describe("runRetryState resource waits (fork)", () => {
+  const deviceWait = {
+    version: 1,
+    episodeId: "episode-1",
+    kind: "environment",
+    reason: "offline",
+    scope: "target",
+    environmentId: "environment-1",
+    environmentName: "SSH · Build box",
+    deviceId: "device-1",
+    deviceName: "Build box",
+    accountId: null,
+    accountLabel: null,
+    resumeAt: null,
+    resumeAtSource: null,
+    message: null,
+  };
+
+  it("labels the three wait lanes", () => {
+    expect(formatRetryReason("environment_wait")).toBe("Waiting for device");
+    expect(formatRetryReason("ai_account_wait")).toBe("Waiting for Claude account");
+    expect(formatRetryReason("device_slot_wait")).toBe("Waiting for account slot");
+  });
+
+  it("describes a waiting successor as waiting, not as a scheduled retry", () => {
+    expect(
+      describeRunRetryState({
+        status: "scheduled_retry",
+        retryOfRunId: "run-deferral",
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "environment_wait",
+        scheduledRetryAt: "2026-04-18T20:15:00.000Z",
+        contextSnapshot: { resourceWait: deviceWait },
+      } as Parameters<typeof describeRunRetryState>[0]),
+    ).toMatchObject({
+      kind: "scheduled",
+      badgeLabel: "Waiting",
+      detail: "Waiting for device Build box (offline)",
+      retryOfRunId: "run-deferral",
+    });
+  });
+
+  it("describes a deferral as waited, with no retry wording", () => {
+    const state = describeRunRetryState({
+      status: "cancelled",
+      errorCode: "ai_account_unavailable",
+      resultJson: {
+        executionRecovery: { kind: "resource_wait", providerWorkStarted: false },
+        resourceWait: { kind: "ai_account", reason: "usage_limit" },
+      },
+    } as Parameters<typeof describeRunRetryState>[0]);
+    expect(state).toMatchObject({ kind: "attempted", badgeLabel: "Waited", detail: "Waited: usage limit" });
+    expect(`${state?.detail} ${state?.secondary}`).not.toMatch(/retr/i);
+  });
+
+  it("describes a successor that ran as resumed", () => {
+    expect(
+      describeRunRetryState({
+        status: "succeeded",
+        retryOfRunId: "run-deferral",
+        scheduledRetryAttempt: 3,
+        scheduledRetryReason: "device_slot_wait",
+      }),
+    ).toMatchObject({ kind: "attempted", badgeLabel: "Resumed", detail: "Started after waiting for an account slot" });
+  });
+});

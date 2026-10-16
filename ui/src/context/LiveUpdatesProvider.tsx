@@ -29,6 +29,7 @@ import type {
   IssueComment,
   LiveEvent,
 } from "@paperclipai/shared";
+import { isResourceWaitErrorCode } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
@@ -1083,6 +1084,8 @@ function buildRunStatusToast(
   if (errorCode === "operator_interrupted") return null;
   // Workspace contention is ordinary scheduling, not a failed user action.
   if (errorCode === "workspace_busy") return null;
+  // Fork: so is a wait for a device, Claude account or account slot; the task shows the wait.
+  if (isResourceWaitErrorCode(errorCode)) return null;
   const contextSource = readString(payload.contextSource);
   const triggerDetail = readString(payload.triggerDetail);
   const name = nameOf(agentId) ?? "Agent";

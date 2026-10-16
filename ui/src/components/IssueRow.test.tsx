@@ -846,3 +846,86 @@ describe("IssueRow", () => {
     });
   });
 });
+
+describe("IssueRow resource waits (fork)", () => {
+  let container: HTMLDivElement;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+  });
+
+  afterEach(() => {
+    container.remove();
+  });
+
+  it.each(["task", "legacy"] as const)("shows a waiting chip in the %s layout", (presentation) => {
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <IssueRow
+          presentation={presentation}
+          issue={createIssue({
+            status: "in_progress",
+            scheduledRetry: {
+              runId: "run-successor",
+              status: "scheduled_retry",
+              agentId: "agent-1",
+              agentName: "Coder",
+              retryOfRunId: "run-deferral",
+              scheduledRetryAt: "2026-03-11T00:05:00.000Z",
+              scheduledRetryAttempt: 2,
+              scheduledRetryReason: "device_slot_wait",
+              resourceWait: {
+                version: 1,
+                episodeId: "episode-1",
+                kind: "device_slots",
+                reason: "slots_full",
+                scope: "device",
+                environmentId: "environment-1",
+                environmentName: "SSH · Build box",
+                deviceId: "device-1",
+                deviceName: "Build box",
+                accountId: "account-1",
+                accountLabel: "Team Max",
+                resumeAt: null,
+                resumeAtSource: null,
+                message: null,
+                since: null,
+                notifiedAt: null,
+              },
+            },
+          })}
+        />,
+      );
+    });
+    const chip = container.querySelector('[data-testid="issue-row-resource-wait"]');
+    expect(chip?.textContent).toBe("Waiting for an account slot: Build box");
+    expect(chip?.getAttribute("aria-label")).toBe("Waiting for an account slot on Build box");
+    act(() => root.unmount());
+  });
+
+  it("shows no chip for an ordinary scheduled retry", () => {
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <IssueRow
+          issue={createIssue({
+            scheduledRetry: {
+              runId: "run-retry",
+              status: "scheduled_retry",
+              agentId: "agent-1",
+              agentName: "Coder",
+              retryOfRunId: "run-failed",
+              scheduledRetryAt: "2026-03-11T00:05:00.000Z",
+              scheduledRetryAttempt: 1,
+              scheduledRetryReason: "transient_failure",
+            },
+          })}
+        />,
+      );
+    });
+    expect(container.querySelector('[data-testid="issue-row-resource-wait"]')).toBeNull();
+    act(() => root.unmount());
+  });
+});

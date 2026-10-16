@@ -4,6 +4,8 @@ import type { Issue } from "@paperclipai/shared";
 
 import { Button } from "@/components/ui/button";
 import { InlineBanner } from "@/components/InlineBanner";
+import { ResourceWaitCheckNowButton } from "@/components/ResourceWaitBanner";
+import { resourceWaitSurfaceCopy, scheduledResourceWait, type ScheduledResourceWait } from "@/lib/resource-wait";
 import { cn } from "@/lib/utils";
 import {
   deriveMonitorState,
@@ -50,6 +52,8 @@ export interface MonitorSurfaceCopy {
   /** `warning` (amber) once overdue, `info` (blue) while still on schedule. */
   tone: "info" | "warning";
   workspaceWait?: boolean;
+  /** Fork: waiting for a device, Claude account or account slot; "Check now" re-checks it. */
+  resourceWait?: boolean;
 }
 
 function capitalize(value: string): string {
@@ -65,8 +69,10 @@ export function buildMonitorSurfaceCopy(
   derived: DerivedMonitorState,
   now: MonitorDate,
   scheduledRetryReason?: string | null,
+  resourceWait?: ScheduledResourceWait | null,
 ): MonitorSurfaceCopy | null {
   if (!isWaitingMonitorState(derived.state) || !derived.nextCheckAt) return null;
+  if (resourceWait) return resourceWaitSurfaceCopy(resourceWait, { now: new Date(now) });
 
   if (derived.source === "scheduled-retry" && scheduledRetryReason === "workspace_busy") {
     return {
@@ -140,7 +146,7 @@ function useMonitorSurfaceCopy(issue: Issue): MonitorSurfaceCopy | null {
   // roll scheduled → due → overdue on their own.
   const nextCheckAt = useMemo(() => deriveMonitorState(issue).nextCheckAt, [issue]);
   const now = useMonitorCountdown(nextCheckAt);
-  return useMemo(() => buildMonitorSurfaceCopy(deriveMonitorState(issue, now), now, issue.scheduledRetry?.scheduledRetryReason), [issue, now]);
+  return useMemo(() => buildMonitorSurfaceCopy(deriveMonitorState(issue, now), now, issue.scheduledRetry?.scheduledRetryReason, scheduledResourceWait(issue.scheduledRetry)), [issue, now]);
 }
 
 function CheckNowButton({
@@ -189,7 +195,7 @@ export function IssueMonitorBanner({
       icon={Clock}
       title={copy.bannerTitle}
       className="my-3"
-      actions={onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
+      actions={copy.resourceWait ? <ResourceWaitCheckNowButton issueId={issue.id} /> : onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
     >
       <span>{copy.bannerMeta.join("  ·  ")}</span>
     </InlineBanner>
@@ -224,10 +230,10 @@ export function IssueMonitorComposerStrip({
             <div className="text-xs text-muted-foreground">{copy.stripMeta.join(" · ")}</div>
           </div>
         </div>
-        {onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
+        {copy.resourceWait ? <ResourceWaitCheckNowButton issueId={issue.id} /> : onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} /> : null}
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
-        {copy.workspaceWait
+        {copy.workspaceWait || copy.resourceWait
           ? "You can keep sending instructions while the agent waits."
           : "Sending a reply wakes the agent now — before the scheduled check."}
       </p>

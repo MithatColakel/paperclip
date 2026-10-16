@@ -162,3 +162,32 @@ describe("activity formatting", () => {
     );
   });
 });
+
+describe("account pool and wait activity (fork)", () => {
+  it("reads account, binding and device verbs", () => {
+    expect(formatActivityVerb("ai_account.created", { accountLabel: "Team Max" })).toBe("added Claude account Team Max");
+    expect(formatActivityVerb("ai_account.created", null)).toBe("added a Claude account");
+    expect(formatActivityVerb("ai_account.owner_changed", null)).toBe("transferred a Claude account");
+    expect(formatActivityVerb("ai_account.binding_updated", null)).toBe("changed the Claude account of");
+    expect(formatActivityVerb("ai_account.binding_cleared", null)).toBe("cleared the Claude account of");
+    expect(formatActivityVerb("ai_account.admin_disabled", { label: "Team Max" })).toBe("disabled Claude account Team Max");
+    expect(formatActivityVerb("execution_device.linked", null)).toBe("linked an execution device");
+    expect(formatActivityVerb("company.execution_wait_settings_updated", null)).toBe("updated wait notices for");
+  });
+
+  it("names the reason a task waited", () => {
+    expect(formatActivityVerb("resource_wait.started", { kind: "environment", reason: "offline" }))
+      .toBe("started waiting (device offline) on");
+    expect(formatIssueActivityAction("resource_wait.started", { kind: "ai_account", reason: "usage_limit" }))
+      .toBe("started waiting: usage limit");
+    expect(formatIssueActivityAction("resource_wait.long_wait_notified", { reason: "unreachable" }))
+      .toBe("reported a long wait: device unreachable");
+    expect(formatIssueActivityAction("resource_wait.resolved", null)).toBe("resumed after waiting");
+    expect(formatIssueActivityAction("resource_wait.started", { kind: "device_slots" }))
+      .toBe("started waiting: account slots full");
+  });
+
+  it("keeps the generic fallback for unknown actions", () => {
+    expect(formatActivityVerb("ai_account.something_new", null)).toBe("ai account something new");
+  });
+});
