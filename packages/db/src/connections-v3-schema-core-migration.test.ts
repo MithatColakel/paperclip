@@ -42,6 +42,10 @@ describeEmbeddedPostgres("connections v3 schema core migration", () => {
     // arrives after 0182. Rewind these empty fixture tables in dependency order.
     await sql`DROP TABLE IF EXISTS "ai_connection_task_pins"`;
     await sql`DROP TABLE IF EXISTS "ai_connection_router_cursors"`;
+    // Fork: the company Claude account pool tables also reference grants and
+    // connections.
+    await sql`DROP TABLE IF EXISTS "ai_connection_pool_members"`;
+    await sql`DROP TABLE IF EXISTS "ai_connection_quota_states"`;
     await sql`DROP TABLE IF EXISTS "ai_connection_pools"`;
     await sql`DROP TABLE IF EXISTS "ai_provider_defaults"`;
     await sql`DROP TABLE IF EXISTS "ai_connection_defaults"`;
