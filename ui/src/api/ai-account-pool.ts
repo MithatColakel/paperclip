@@ -110,8 +110,8 @@ export const aiAccountPoolApi = {
 
 /**
  * Refresh everything an account, binding or device change can touch: my
- * accounts, company accounts, bindings, agent cards, devices and the legacy
- * host list.
+ * accounts, company accounts, bindings, agents' Claude account fields,
+ * devices and the legacy host list.
  */
 export function invalidateAiAccountPoolQueries(queryClient: QueryClient): Promise<unknown> {
   return Promise.all([

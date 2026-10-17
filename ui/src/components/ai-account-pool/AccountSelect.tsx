@@ -4,6 +4,7 @@ import { SearchableSelect } from "@/components/SearchableSelect";
 import { Badge } from "@/components/ui/badge";
 import {
   AI_ACCOUNT_BINDING_STATE_TEXT,
+  DEVICE_LOGIN_SELECT_VALUE,
   POOL_BADGE_TONE_CLASS,
   POOL_CREDENTIAL_TYPE_LABELS,
   accountSelectKey,
@@ -30,20 +31,24 @@ export function AiAccountStateBadge({ display, className }: { display: AiAccount
 
 function AccountOptionRow({ option }: { option: AccountSelectOption }) {
   const account = option.account;
-  const meta = account
-    ? [option.ownerText, account.plan, POOL_CREDENTIAL_TYPE_LABELS[account.credentialType]].filter(Boolean).join(" · ")
-    : "Whatever login the device already has. It does not count toward the device's Claude accounts.";
   return (
     <span
       className="flex min-w-0 flex-1 flex-col gap-0.5"
-      data-account-option={account?.id ?? "device-login"}
+      data-account-option={account?.id ?? (option.value === DEVICE_LOGIN_SELECT_VALUE ? "device-login" : "ai-connection")}
       data-disabled-reason={option.disabledReason ?? undefined}
     >
       <span className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 truncate">{option.label}</span>
         {option.stateDisplay ? <AiAccountStateBadge display={option.stateDisplay} /> : null}
       </span>
-      <span className="truncate text-xs text-muted-foreground">{meta}</span>
+      {account ? (
+        <span className="truncate text-xs text-muted-foreground" data-account-option-meta="">
+          {[option.ownerText, account.plan, POOL_CREDENTIAL_TYPE_LABELS[account.credentialType]].filter(Boolean).join(" · ")}
+        </span>
+      ) : option.description ? (
+        // What a choice that is not an account means: it wraps, so it is read in full.
+        <span className="text-xs text-muted-foreground" data-account-option-description="">{option.description}</span>
+      ) : null}
       {option.disabledReason ? (
         <span className="text-xs text-muted-foreground">{option.disabledReason}</span>
       ) : option.warning ? (
@@ -70,6 +75,14 @@ export interface AccountSelectProps {
    * while the agent is bound to one of their own accounts.
    */
   canSetDeviceLogin?: boolean;
+  /**
+   * The agent's AI connection while the agent has no selection, e.g.
+   * "Responsible user's connection". It is listed only then, and selected
+   * with `value: { mode: "ai_connection" }`; picking it saves nothing.
+   */
+  currentAiConnection?: { label: string } | null;
+  /** Also show the chosen account's state while it is active; any other state always shows. */
+  showActiveState?: boolean;
   disabled?: boolean;
   loading?: boolean;
   placeholder?: string;
@@ -93,6 +106,8 @@ export function AccountSelect({
   onChange,
   includeDeviceLogin = false,
   canSetDeviceLogin,
+  currentAiConnection = null,
+  showActiveState = false,
   disabled = false,
   loading = false,
   placeholder = "Choose a Claude account",
@@ -102,8 +117,8 @@ export function AccountSelect({
   now,
 }: AccountSelectProps) {
   const groups = useMemo(
-    () => buildAccountSelectGroups({ options, canBindAny, includeDeviceLogin, canSetDeviceLogin, now }),
-    [canBindAny, canSetDeviceLogin, includeDeviceLogin, now, options],
+    () => buildAccountSelectGroups({ options, canBindAny, includeDeviceLogin, canSetDeviceLogin, currentAiConnection, now }),
+    [canBindAny, canSetDeviceLogin, currentAiConnection, includeDeviceLogin, now, options],
   );
   const selectedKey = accountSelectKey(value);
   const knownSelection = selectedKey !== "" && groups.some((group) => group.options.some((option) => option.value === selectedKey));
@@ -135,7 +150,7 @@ export function AccountSelect({
         option ? (
           <span className="inline-flex min-w-0 items-center gap-2">
             <span className="min-w-0 truncate">{option.label}</span>
-            {option.stateDisplay && option.stateDisplay.state !== "active" ? (
+            {option.stateDisplay && (showActiveState || option.stateDisplay.state !== "active") ? (
               <AiAccountStateBadge display={option.stateDisplay} />
             ) : null}
           </span>

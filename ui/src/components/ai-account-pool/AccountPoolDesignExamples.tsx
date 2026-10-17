@@ -4,6 +4,8 @@ import type {
   AgentAiAccountBindingDetail,
   AiAccountLimitSource,
   AiAccountState,
+  AiConnectionList,
+  AiRuntimeConnectionBinding,
   CompanyAiAccountOption,
   CompanyExecutionDevicesResponse,
   EnvironmentAvailabilitySummary,
@@ -35,17 +37,17 @@ import {
 import { queryKeys } from "@/lib/queryKeys";
 import type { ResourceWaitLedgerRunLike, ResourceWaitRunLike } from "@/lib/resource-wait";
 import { AccountSelect, AiAccountStateBadge } from "./AccountSelect";
-import { AgentClaudeAccountCard } from "./AgentClaudeAccountCard";
+import { AgentClaudeAccountField, AgentClaudeAccountLeftOver } from "./AgentClaudeAccountField";
 import { RunResourceWaitBadge } from "./RunResourceWaitBadge";
 
 /**
  * Fork: the /design-guide examples of the Claude account pool and the
- * waiting UI: the agent page's account card, the account picker and state
- * badge, a waiting task's banner, chip, property value and run-ledger entry
- * (with "Check now"), the run badge of a resource wait, and the dialog that
- * links one machine reached two ways. Each reads sample data from its own
- * query cache, which never refetches and stops every save and check before it
- * reaches the server.
+ * waiting UI: the Claude account field of an agent's configuration and its
+ * left-over notice, the account picker and state badge, a waiting task's
+ * banner, chip, property value and run-ledger entry (with "Check now"), the
+ * run badge of a resource wait, and the dialog that links one machine reached
+ * two ways. Each reads sample data from its own query cache, which never
+ * refetches and stops every save and check before it reaches the server.
  */
 
 const COMPANY_ID = "design-company";
@@ -185,6 +187,13 @@ const LIMITED_AGENT = { id: "design-agent-limited", name: "Coder", companyId: CO
 const MIGRATED_AGENT = { id: "design-agent-migrated", name: "Reviewer", companyId: COMPANY_ID, adapterType: "claude_local" };
 const DEVICE_LOGIN_AGENT = { id: "design-agent-device-login", name: "Designer", companyId: COMPANY_ID, adapterType: "claude_local" };
 const READ_ONLY_AGENT = { id: "design-agent-read-only", name: "Writer", companyId: COMPANY_ID, adapterType: "claude_local" };
+const CONNECTION_AGENT = { id: "design-agent-connection", name: "Planner", companyId: COMPANY_ID, adapterType: "claude_local" };
+const UNSET_AGENT = { id: "design-agent-unset", name: "Tester", companyId: COMPANY_ID, adapterType: "claude_local" };
+const LEFT_OVER_AGENT = { id: "design-agent-left-over", name: "Porter", companyId: COMPANY_ID, adapterType: "codex_local" };
+const FIELD_AGENTS = [LIMITED_AGENT, MIGRATED_AGENT, DEVICE_LOGIN_AGENT, READ_ONLY_AGENT, CONNECTION_AGENT, UNSET_AGENT];
+
+/** The Planner's AI connection: it applies while the agent has no Claude account selection. */
+const RESPONSIBLE_USER_CONNECTION: AiRuntimeConnectionBinding = { provider: "anthropic", method: "subscription", mode: "responsible_user" };
 
 const SSH_DEVICE = instanceDevice("design-link-ssh", "SSH · Build box", "ssh_host", null);
 const PLUGIN_DEVICE = instanceDevice(
@@ -497,7 +506,56 @@ function createExampleClient(now: Date): QueryClient {
     canBindAny: false,
     options: [{ ...ada, canBind: false, selectable: false, reason: "not_permitted" }, mine],
   }));
-  for (const agent of [LIMITED_AGENT, MIGRATED_AGENT, DEVICE_LOGIN_AGENT, READ_ONLY_AGENT]) {
+  // No selection: the Planner's AI connection applies, the Tester's device login.
+  seed(aiAccountPoolKeys.agent(CONNECTION_AGENT.id), binding({
+    agentId: CONNECTION_AGENT.id,
+    agentName: CONNECTION_AGENT.name,
+    options: [{ ...team, onAgentDevice: false }, mine],
+  }));
+  seed(["ai-connections", COMPANY_ID, CONNECTION_AGENT.id], {
+    currentUserId: ME.userId,
+    canManageConnections: false,
+    pools: [],
+    connections: [{
+      id: "00000000-0000-4000-8000-0000000000c1",
+      grantId: "00000000-0000-4000-8000-0000000000c2",
+      companyId: COMPANY_ID,
+      provider: "anthropic",
+      method: "subscription",
+      name: "My Claude subscription",
+      ownership: "personal",
+      ownerUserId: ME.userId,
+      ownerName: "You",
+      isDefault: true,
+      status: "connected",
+    }],
+  } satisfies AiConnectionList);
+  seed(aiAccountPoolKeys.agent(UNSET_AGENT.id), binding({
+    agentId: UNSET_AGENT.id,
+    agentName: UNSET_AGENT.name,
+    options: [{ ...team, onAgentDevice: false }, mine],
+  }));
+  // An agent moved to another adapter that still holds its Claude account.
+  seed(aiAccountPoolKeys.agent(LEFT_OVER_AGENT.id), binding({
+    agentId: LEFT_OVER_AGENT.id,
+    agentName: LEFT_OVER_AGENT.name,
+    adapterType: LEFT_OVER_AGENT.adapterType,
+    supported: false,
+    state: "pool_account",
+    mode: "pool_account",
+    source: "manual",
+    account: {
+      id: mine.id,
+      label: mine.label,
+      credentialType: "subscription",
+      state: "active",
+      ownedByMe: true,
+      ownerName: ME.name,
+      exhaustedUntil: null,
+      limitSource: null,
+    },
+  }));
+  for (const agent of FIELD_AGENTS) {
     seed([...queryKeys.heartbeats(COMPANY_ID, agent.id), "resource-wait"], []);
   }
   const offline: EnvironmentAvailabilitySummary = {
@@ -542,6 +600,7 @@ function AccountSelectExample({
 }) {
   const [value, setValue] = useState<AccountSelectValue>(initial);
   const current = value?.mode === "pool_account" ? options.find((entry) => entry.id === value.accountId) ?? null : null;
+  const mode = value?.mode === "pool_account" || value?.mode === "device_login" ? value.mode : null;
   return (
     <div className="max-w-md">
       <AccountSelect
@@ -550,7 +609,7 @@ function AccountSelectExample({
         value={value}
         onChange={setValue}
         includeDeviceLogin
-        canSetDeviceLogin={canChooseDeviceLogin({ canBindAny, binding: { mode: value?.mode ?? null, account: current } })}
+        canSetDeviceLogin={canChooseDeviceLogin({ canBindAny, binding: { mode, account: current } })}
         aria-label={label}
         now={now}
       />
@@ -577,17 +636,31 @@ export function AccountPoolDesignExamples() {
           task to another account. A task whose device or account is unavailable waits and starts on its own. Saves
           and checks in these examples stop before they reach the server.
         </p>
-        <Example title="AgentClaudeAccountCard: an account at its usage limit">
-          <AgentClaudeAccountCard agent={LIMITED_AGENT} now={now} />
+        <Example title="AgentClaudeAccountField: an account at its usage limit">
+          <AgentClaudeAccountField agent={LIMITED_AGENT} id={`${LIMITED_AGENT.id}-field`} now={now} />
         </Example>
-        <Example title="AgentClaudeAccountCard: a migrated agent without an account">
-          <AgentClaudeAccountCard agent={MIGRATED_AGENT} now={now} />
+        <Example title="AgentClaudeAccountField: a migrated agent without an account">
+          <AgentClaudeAccountField agent={MIGRATED_AGENT} id={`${MIGRATED_AGENT.id}-field`} now={now} />
         </Example>
-        <Example title="AgentClaudeAccountCard: on its device's own login">
-          <AgentClaudeAccountCard agent={DEVICE_LOGIN_AGENT} now={now} />
+        <Example title="AgentClaudeAccountField: on its device's own login">
+          <AgentClaudeAccountField agent={DEVICE_LOGIN_AGENT} id={`${DEVICE_LOGIN_AGENT.id}-field`} now={now} />
         </Example>
-        <Example title="AgentClaudeAccountCard: read-only for a member who cannot change it">
-          <AgentClaudeAccountCard agent={READ_ONLY_AGENT} now={now} />
+        <Example title="AgentClaudeAccountField: read-only for a member who cannot change it">
+          <AgentClaudeAccountField agent={READ_ONLY_AGENT} id={`${READ_ONLY_AGENT.id}-field`} now={now} />
+        </Example>
+        <Example title="AgentClaudeAccountField: its AI connection, offered only while it is current">
+          <AgentClaudeAccountField
+            agent={CONNECTION_AGENT}
+            aiConnection={RESPONSIBLE_USER_CONNECTION}
+            id={`${CONNECTION_AGENT.id}-field`}
+            now={now}
+          />
+        </Example>
+        <Example title="AgentClaudeAccountField: no selection, so the device's own login applies">
+          <AgentClaudeAccountField agent={UNSET_AGENT} id={`${UNSET_AGENT.id}-field`} now={now} />
+        </Example>
+        <Example title="AgentClaudeAccountLeftOver: a selection left from when the agent ran Claude">
+          <AgentClaudeAccountLeftOver agentId={LEFT_OVER_AGENT.id} />
         </Example>
         <Example title="AccountSelect: a company admin may choose any eligible account">
           <AccountSelectExample

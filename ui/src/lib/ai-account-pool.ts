@@ -1,7 +1,8 @@
 /**
  * Fork: display helpers for the user-owned Claude account pool and execution
- * devices. Pages and cards (Claude accounts, Devices, the agent card) share
- * these so every surface names a state, a reason and its fix the same way.
+ * devices. Pages and fields (Claude accounts, Devices, the agent's Claude
+ * account field) share these so every surface names a state, a reason and
+ * its fix the same way.
  *
  * Product rule: Paperclip never moves a task to another account. When an
  * account hits its limit, its tasks wait for the reset.
@@ -334,18 +335,26 @@ export function aiAccountPoolErrorMessage(error: unknown): string {
 // AccountSelect options
 // ---------------------------------------------------------------------------
 
-/** The picker's value: the device's own login, a pool account, pool mode without an account, or nothing yet. */
+/**
+ * The picker's value: the device's own login, a pool account, pool mode
+ * without an account, the agent's AI connection while it is what the agent
+ * uses, or nothing yet.
+ */
 export type AccountSelectValue =
   | { mode: "device_login" }
   | { mode: "pool_account"; accountId: string | null }
+  | { mode: "ai_connection" }
   | null;
 
 export const DEVICE_LOGIN_SELECT_VALUE = "device_login";
+/** The agent's current AI connection. It is no PUT body, so picking it saves nothing. */
+export const AI_CONNECTION_SELECT_VALUE = "ai_connection";
 const ACCOUNT_VALUE_PREFIX = "account:";
 
 export function accountSelectKey(value: AccountSelectValue): string {
   if (!value) return "";
   if (value.mode === "device_login") return DEVICE_LOGIN_SELECT_VALUE;
+  if (value.mode === "ai_connection") return AI_CONNECTION_SELECT_VALUE;
   return value.accountId ? `${ACCOUNT_VALUE_PREFIX}${value.accountId}` : "";
 }
 
@@ -369,7 +378,7 @@ export function accountSelectValueFromBinding(binding: {
 }
 
 export interface AccountSelectOption extends SearchableSelectOption<string> {
-  /** Null for the device-login choice. */
+  /** Null for the device-login and AI connection choices. */
   account: CompanyAiAccountOption | null;
   stateDisplay: AiAccountStateDisplay | null;
   /** "yours", or the owner's name. */
@@ -378,6 +387,8 @@ export interface AccountSelectOption extends SearchableSelectOption<string> {
   disabledReason: string | null;
   /** A limited account stays selectable, with this note. */
   warning: string | null;
+  /** What a choice that is not an account means; null for an account. */
+  description: string | null;
 }
 
 export type AccountSelectGroup = SearchableSelectGroup<string, AccountSelectOption>;
@@ -413,6 +424,14 @@ function accountWarning(option: CompanyAiAccountOption, now: Date): string | nul
 export const DEVICE_LOGIN_NOT_PERMITTED_TEXT =
   "Only a company admin, or the owner of the agent's current Claude account, can switch it to the device's own login.";
 
+/** The device-login choice, under its name in the picker. */
+export const DEVICE_LOGIN_OPTION_TEXT =
+  "Whatever login the device already has. It does not count toward the device's Claude accounts.";
+
+/** The current AI connection choice, under its name in the picker. */
+export const CURRENT_AI_CONNECTION_OPTION_TEXT =
+  "What this agent uses now. Once you choose another option, it is no longer offered here.";
+
 /**
  * Whether the caller may switch an agent to the device's own login (spec 5.1,
  * decision D4): a company admin always; an account owner only while the agent
@@ -428,7 +447,8 @@ export function canChooseDeviceLogin(input: {
 }
 
 /**
- * Groups for `AccountSelect`: the device's own login (when offered), accounts
+ * Groups for `AccountSelect`: the agent's current AI connection (when it is
+ * what the agent uses), the device's own login (when offered), accounts
  * already on the agent's device (they take no new slot), then the others.
  * Within a group, choosable accounts come first, then by label.
  */
@@ -442,6 +462,13 @@ export function buildAccountSelectGroups(input: {
    * reason (see `canChooseDeviceLogin`).
    */
   canSetDeviceLogin?: boolean;
+  /**
+   * The agent's AI connection while the agent has no Claude account
+   * selection, named as the AI connection picker names it. It is offered
+   * only then: once the agent has an account or the device's own login, it
+   * cannot be chosen again here.
+   */
+  currentAiConnection?: { label: string } | null;
   now?: Date;
 }): AccountSelectGroup[] {
   const now = input.now ?? new Date();
@@ -459,6 +486,7 @@ export function buildAccountSelectGroups(input: {
       ownerText: owner,
       disabledReason,
       warning: disabledReason === null ? accountWarning(option, now) : null,
+      description: null,
     };
   };
   const order = (a: AccountSelectOption, b: AccountSelectOption) =>
@@ -467,6 +495,25 @@ export function buildAccountSelectGroups(input: {
   const others = input.options.filter((option) => option.onAgentDevice !== true).map(build).sort(order);
 
   const groups: AccountSelectGroup[] = [];
+  if (input.currentAiConnection) {
+    groups.push({
+      id: "ai-connection",
+      label: "AI connection",
+      options: [{
+        key: AI_CONNECTION_SELECT_VALUE,
+        value: AI_CONNECTION_SELECT_VALUE,
+        label: input.currentAiConnection.label,
+        searchText: "ai connection",
+        disabled: false,
+        account: null,
+        stateDisplay: null,
+        ownerText: null,
+        disabledReason: null,
+        warning: null,
+        description: CURRENT_AI_CONNECTION_OPTION_TEXT,
+      }],
+    });
+  }
   if (input.includeDeviceLogin) {
     const deviceLoginReason = (input.canSetDeviceLogin ?? input.canBindAny) ? null : DEVICE_LOGIN_NOT_PERMITTED_TEXT;
     groups.push({
@@ -483,6 +530,7 @@ export function buildAccountSelectGroups(input: {
         ownerText: null,
         disabledReason: deviceLoginReason,
         warning: null,
+        description: DEVICE_LOGIN_OPTION_TEXT,
       }],
     });
   }

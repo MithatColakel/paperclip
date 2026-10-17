@@ -1,5 +1,6 @@
 import { AiConnectionField } from "./ai-connections/AiConnectionField";
-import { AiConnectionOverrideNote } from "./ai-account-pool/AgentClaudeAccountCard";
+import { AgentClaudeAccountField, AgentClaudeAccountLeftOver, useHasClaudeAccountSelection } from "./ai-account-pool/AgentClaudeAccountField";
+import { agentAiConnection, claudeEnvironmentCredentials, showsClaudeAccountField } from "@/lib/agent-claude-account";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema } from "@paperclipai/shared";
 import { testAgentSetup } from "@/lib/test-agent-setup";
 import { setupEfforts } from "../lib/agent-setup-fields";
@@ -1153,8 +1154,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     effectiveLoginProvider != null &&
     environmentCapabilities?.sandboxProviders?.[effectiveLoginProvider]?.supportsLoginPty === true;
   const loginNeedsPty = adapterCaps.login != null;
+  // Fork: an existing Claude agent's credential is chosen in its Claude account
+  // field, in place of the AI connection. The sandbox sign-in binds the agent's
+  // own credential variable, which a pool account blanks and which would
+  // override the device's own login, so like an AI connection a selection hides it.
+  const claudeAccountField = !isCreate && showsClaudeAccountField(props.agent.adapterType, adapterType);
+  const claudeAccountSelected = useHasClaudeAccountSelection(claudeAccountField ? props.agent.id : null);
   const showAdapterLogin =
     (isCreate || !((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection)) &&
+    !claudeAccountSelected &&
     adapterSupportsSandboxLogin &&
     effectiveLoginEnvironment?.driver === "sandbox" &&
     Boolean(effectiveLoginEnvironmentId) &&
@@ -1170,6 +1178,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     : eff("adapterConfig", "env", (config.env ?? EMPTY_ENV) as Record<string, EnvBinding>)) as Record<string, EnvBinding>;
   const showSavedClaudeLoginBind =
     adapterType === "claude_local" &&
+    // Fork: no saved-login bind sits beside an existing Claude agent's Claude account field.
+    !claudeAccountField &&
     !showAdapterLogin &&
     effectiveLoginEnvironment?.driver !== "sandbox" &&
     (isCreate || !((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection)) &&
@@ -1677,9 +1687,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           )}
 
-          {/* Fork: a Claude account selection overrides the AI connection below. */}
-          {!isCreate && <AiConnectionOverrideNote agentId={props.agent.id} adapterType={adapterType} />}
-          {!isCreate && selectedCompanyId && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={adapterType === "paperclip_runner" ? eff("adapterConfig", "provider", config.provider) === "codex" ? "codex_local" : eff("adapterConfig", "provider", config.provider) === "opencode" ? "opencode_local" : eff("adapterConfig", "provider", config.provider) === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "grok" ? "grok_local" : eff("adapterConfig", "provider", config.provider) === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "claude" ? "claude_local" : adapterType : adapterType}
+          {/* Fork: a Claude agent chooses its Claude account here, in place of the AI connection; another adapter can remove a selection left from Claude. */}
+          {!isCreate && (claudeAccountField
+            ? <AgentClaudeAccountField agent={props.agent} aiConnection={agentAiConnection(runtimeConfig)}
+                environmentCredentials={claudeEnvironmentCredentials(config.env)} />
+            : <AgentClaudeAccountLeftOver agentId={props.agent.id} />)}
+          {!isCreate && selectedCompanyId && !claudeAccountField && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={adapterType === "paperclip_runner" ? eff("adapterConfig", "provider", config.provider) === "codex" ? "codex_local" : eff("adapterConfig", "provider", config.provider) === "opencode" ? "opencode_local" : eff("adapterConfig", "provider", config.provider) === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "grok" ? "grok_local" : eff("adapterConfig", "provider", config.provider) === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "claude" ? "claude_local" : adapterType : adapterType}
             routerAdapterType={adapterType} value={aiRuntimeConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data}
             model={String(eff("adapterConfig", "model", config.model) ?? "")} environmentId={currentDefaultEnvironmentId || undefined} legacy
             onChange={binding => mark("runtime", "runtimeConfig", { ...runtimeConfig, aiConnection: binding })} />}

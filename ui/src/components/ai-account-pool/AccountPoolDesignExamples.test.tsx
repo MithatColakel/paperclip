@@ -3,7 +3,8 @@
 import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT } from "@/lib/agent-claude-account";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT, RESPONSIBLE_USER_CONNECTION_LABEL } from "@/lib/agent-claude-account";
 import { AI_ACCOUNT_UNSELECTABLE_REASON_TEXT, DEVICE_LOGIN_NOT_PERMITTED_TEXT } from "@/lib/ai-account-pool";
 import { AccountPoolDesignExamples } from "./AccountPoolDesignExamples";
 
@@ -75,6 +76,12 @@ async function settle() {
   }
 }
 
+/** As on /design-guide, inside the app's tooltip provider (the field's label has a hint). */
+async function renderExamples() {
+  await act(async () => root.render(<TooltipProvider><AccountPoolDesignExamples /></TooltipProvider>));
+  await settle();
+}
+
 async function click(element: Element | null | undefined) {
   expect(element).toBeTruthy();
   await act(async () => {
@@ -107,29 +114,42 @@ async function openPicker(label: string) {
 
 describe("AccountPoolDesignExamples", () => {
   it("shows every example from sample data, without one request", async () => {
-    await act(async () => root.render(<AccountPoolDesignExamples />));
-    await settle();
+    await renderExamples();
 
-    const cards = [...container.querySelectorAll("[data-agent-claude-account]")];
-    expect(cards).toHaveLength(4);
-    expect(cards[0]!.textContent).toContain("Team Max");
-    expect(cards[0]!.querySelector("[data-account-state='limited']")?.textContent).toMatch(/^Limited until .+\(estimated\)$/);
-    expect(cards[0]!.textContent).toContain("Tasks wait: usage limit");
-    expect(cards[0]!.textContent).toContain("Build box — owner ada@example.com");
-    expect(cards[1]!.textContent).toContain("Tasks wait: no account chosen");
-    expect(cards[1]!.textContent).toContain("Review this migrated assignment");
-    expect(cards[1]!.querySelector("[data-device='design-device-server'] [data-device-availability]")?.textContent)
+    const fields = [...container.querySelectorAll("[data-agent-claude-account]")];
+    const usage = (field: Element) => field.querySelector("[data-claude-account-usage]")?.textContent;
+    const picker = (field: Element) => field.querySelector("button[role='combobox']");
+    expect(fields).toHaveLength(6);
+    expect(fields.every((field) => field.querySelector("label")?.textContent === "Claude account")).toBe(true);
+    expect(picker(fields[0]!)?.textContent).toContain("Team Max");
+    expect(picker(fields[0]!)?.querySelector("[data-account-state='limited']")?.textContent).toMatch(/^Limited until .+\(estimated\)$/);
+    expect(usage(fields[0]!)).toBe("Runs use Ada's Claude account Team Max on Build box.");
+    expect(fields[0]!.textContent).toContain("Tasks wait: usage limit");
+    expect(fields[0]!.textContent).toContain("Build box — owner ada@example.com");
+    expect(fields[1]!.textContent).toContain("Tasks wait: no account chosen");
+    expect(fields[1]!.textContent).toContain("Review this migrated assignment");
+    expect(fields[1]!.querySelector("[data-device='design-device-server'] [data-device-availability]")?.textContent)
       .toMatch(/^Offline since /);
-    // On the device's own login: nothing waits, and an admin can clear it.
-    expect(cards[2]!.querySelector("[data-binding-state='device_login']")?.textContent).toBe("Device's own login");
-    expect(cards[2]!.querySelector("button[role='combobox']")?.textContent).toContain("Device's own login");
-    expect(cards[2]!.textContent).not.toContain("Tasks wait");
-    expect(buttonIn(cards[2]!, "Clear")).toBeTruthy();
+    // On the device's own login: nothing waits.
+    expect(picker(fields[2]!)?.textContent).toContain("Device's own login");
+    expect(usage(fields[2]!)).toBe("Runs use the device's own Claude login on Build box.");
+    expect(fields[2]!.textContent).not.toContain("Tasks wait");
     // Read-only: the picker is disabled and says who can change it.
-    expect(cards[3]!.querySelector("button[role='combobox']")?.hasAttribute("disabled")).toBe(true);
-    expect(cards[3]!.querySelector("button[role='combobox']")?.textContent).toContain("Ada's Max");
-    expect(cards[3]!.textContent).toContain(AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT);
-    expect(buttonIn(cards[3]!, "Clear")).toBeUndefined();
+    expect(picker(fields[3]!)?.hasAttribute("disabled")).toBe(true);
+    expect(picker(fields[3]!)?.textContent).toContain("Ada's Max");
+    expect(fields[3]!.textContent).toContain(AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT);
+    // The AI connection applies while the agent has no selection, and names the viewer's own connection.
+    expect(picker(fields[4]!)?.textContent).toBe(RESPONSIBLE_USER_CONNECTION_LABEL);
+    expect(usage(fields[4]!)).toBe(
+      "Each task uses the Claude connection of the person responsible for it: for your tasks, that is My Claude subscription.",
+    );
+    expect(picker(fields[5]!)?.textContent).toBe("Choose a Claude account");
+    expect(usage(fields[5]!)).toBe("No account is chosen, so runs use the device's own Claude login on Build box.");
+    expect(fields.every((field) => buttonIn(field, "Clear") === undefined)).toBe(true);
+
+    const leftOver = container.querySelector("[data-agent-claude-account-left-over]");
+    expect(leftOver?.textContent).toContain("A Claude account selection is left over");
+    expect(buttonIn(leftOver!, "Remove")).toBeTruthy();
 
     // The pickers: the admin's shows the chosen limited account with its state, the owner's has no choice yet.
     expect(container.querySelector("button[aria-label='Claude account, as a company admin']")?.textContent)
@@ -195,8 +215,7 @@ describe("AccountPoolDesignExamples", () => {
   });
 
   it("shows each picker option's state and reason, for a company admin and for an account owner", async () => {
-    await act(async () => root.render(<AccountPoolDesignExamples />));
-    await settle();
+    await renderExamples();
 
     const admin = await openPicker("Claude account, as a company admin");
     expect(admin.item("Device's own login")?.getAttribute("aria-disabled")).not.toBe("true");
@@ -228,12 +247,15 @@ describe("AccountPoolDesignExamples", () => {
   });
 
   it("stops every save and check before it reaches the server, and says so in place", async () => {
-    await act(async () => root.render(<AccountPoolDesignExamples />));
-    await settle();
+    await renderExamples();
 
     const migrated = [...container.querySelectorAll("[data-agent-claude-account]")][1]!;
     await click(buttonIn(migrated, "Confirm"));
     expect(migrated.querySelector("[role='alert']")?.textContent).toBe("This is an example: nothing was saved.");
+
+    const leftOver = container.querySelector("[data-agent-claude-account-left-over]")!;
+    await click(buttonIn(leftOver, "Remove"));
+    expect(leftOver.querySelector("[role='alert']")?.textContent).toBe("This is an example: nothing was saved.");
 
     const banner = container.querySelector("[data-testid='resource-wait-banner']")!;
     await click(banner.querySelector("[data-testid='resource-wait-check-now']"));
@@ -245,6 +267,7 @@ describe("AccountPoolDesignExamples", () => {
     expect(document.body.querySelector("[role='dialog'] [role='alert']")?.textContent).toBe("This is an example: nothing was saved.");
 
     expect(poolApi.reviewAgentBinding).not.toHaveBeenCalled();
+    expect(poolApi.clearAgentBinding).not.toHaveBeenCalled();
     expect(issuesApi.retryScheduledRetryNow).not.toHaveBeenCalled();
     expect(devicesApi.linkTarget).not.toHaveBeenCalled();
     expect(pushToast).not.toHaveBeenCalled();

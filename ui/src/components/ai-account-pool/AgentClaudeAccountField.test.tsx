@@ -8,6 +8,9 @@ import {
   RESOURCE_WAIT_ERROR_CODE_BY_KIND,
   type AgentAiAccountBindingDetail,
   type AiAccountBindingAccountRef,
+  type AiConnectionList,
+  type AiManagedConnectionSummary,
+  type AiRuntimeConnectionBinding,
   type CompanyAiAccountOption,
   type EnvironmentAvailabilitySummary,
   type ExecutionDeviceRef,
@@ -17,29 +20,44 @@ import {
   type SetAgentAiAccountResponse,
 } from "@paperclipai/shared";
 import { ApiError } from "@/api/client";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT,
+  AI_ACCOUNT_BINDING_STATE_SHORT_TEXT,
+  RESPONSIBLE_USER_CONNECTION_LABEL,
   accountOptionsWithCurrent,
   accountSelectValueForBinding,
+  agentAiConnection,
+  agentClaudeAccountUsageText,
+  agentDevicePhrase,
   agentDeviceSummary,
   aiAccountPoolRefusalMessage,
-  aiConnectionOverrideText,
   bindingSavedToast,
   bindingWaitReason,
+  claudeEnvironmentCredentials,
+  currentAiConnectionChoice,
   currentResourceWaitRun,
   deviceAvailabilityNotes,
   deviceDisplayName,
   isCurrentSelection,
   routerPoolsOffered,
+  showsClaudeAccountField,
+  type ClaudeEnvironmentCredential,
 } from "@/lib/agent-claude-account";
 import {
   AI_ACCOUNT_BINDING_STATE_TEXT,
   AI_ACCOUNT_UNSELECTABLE_REASON_TEXT,
+  CURRENT_AI_CONNECTION_OPTION_TEXT,
   DEVICE_LOGIN_NOT_PERMITTED_TEXT,
   aiAccountPoolErrorMessage,
 } from "@/lib/ai-account-pool";
 import { resourceWaitReasonText } from "@/lib/resource-wait";
-import { AgentClaudeAccountCard, AgentClaudeAccountOverviewRows, AiConnectionOverrideNote } from "./AgentClaudeAccountCard";
+import {
+  AGENT_CLAUDE_ACCOUNT_FIELD_ID,
+  AgentClaudeAccountField,
+  AgentClaudeAccountLeftOver,
+  AgentClaudeAccountOverviewRows,
+} from "./AgentClaudeAccountField";
 import { RunResourceWaitBadge } from "./RunResourceWaitBadge";
 
 const poolApi = vi.hoisted(() => ({
@@ -50,6 +68,8 @@ const poolApi = vi.hoisted(() => ({
   listCompanyAccounts: vi.fn(),
 }));
 const invalidatePool = vi.hoisted(() => vi.fn(async () => undefined));
+const connectionsApi = vi.hoisted(() => ({ list: vi.fn() }));
+const agentsApiMock = vi.hoisted(() => ({ getClaudeOAuthTokenStatus: vi.fn() }));
 const runsApi = vi.hoisted(() => ({ list: vi.fn(), get: vi.fn() }));
 const devicesApi = vi.hoisted(() => ({ list: vi.fn() }));
 const pushToast = vi.hoisted(() => vi.fn());
@@ -58,6 +78,8 @@ vi.mock("@/api/ai-account-pool", async () => {
   const actual = await vi.importActual<typeof import("@/api/ai-account-pool")>("@/api/ai-account-pool");
   return { ...actual, aiAccountPoolApi: poolApi, invalidateAiAccountPoolQueries: invalidatePool };
 });
+vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: connectionsApi }));
+vi.mock("@/api/agents", () => ({ agentsApi: agentsApiMock }));
 vi.mock("@/api/execution-devices", async () => {
   const actual = await vi.importActual<typeof import("@/api/execution-devices")>("@/api/execution-devices");
   return { ...actual, executionDevicesApi: devicesApi };
@@ -107,6 +129,23 @@ const OFFLINE: EnvironmentAvailabilitySummary = {
   unavailableSince: new Date(2026, 9, 16, 11, 30).toISOString(),
 };
 const RETIRED: EnvironmentAvailabilitySummary = { ...AVAILABLE, state: "retired" };
+
+const RESPONSIBLE_USER: AiRuntimeConnectionBinding = { provider: "anthropic", method: "subscription", mode: "responsible_user" };
+const SHARED_ID = "00000000-0000-4000-8000-000000000001";
+const SHARED: AiRuntimeConnectionBinding = {
+  provider: "anthropic",
+  method: "subscription",
+  mode: "shared",
+  connectionId: SHARED_ID,
+  grantId: "00000000-0000-4000-8000-000000000002",
+};
+
+// The agent's own Claude credential variables, as `claudeEnvironmentCredentials` reads them.
+const SAVED_LOGIN: ClaudeEnvironmentCredential = { key: "CLAUDE_CODE_OAUTH_TOKEN", perPerson: true, savedLogin: true, required: true };
+const API_KEY: ClaudeEnvironmentCredential = { key: "ANTHROPIC_API_KEY", perPerson: false, savedLogin: false, required: false };
+const OAUTH_TOKEN: ClaudeEnvironmentCredential = { key: "CLAUDE_CODE_OAUTH_TOKEN", perPerson: false, savedLogin: false, required: false };
+const SAVED_LOGIN_USAGE = "No account is chosen, so runs use the Claude login that the person responsible for each task saved "
+  + "under My secrets (this agent's CLAUDE_CODE_OAUTH_TOKEN variable) on Build box.";
 
 /** The company's device list entry of a device, as the Devices page reads it. */
 function deviceSummary(device: ExecutionDeviceRef, availability: EnvironmentAvailabilitySummary): ExecutionDeviceSummary {
@@ -199,10 +238,31 @@ const ON_MINE = {
   mode: "pool_account" as const,
   account: accountRef({ id: "acct-mine", label: "My Pro", ownedByMe: true, ownerName: "Me" }),
 };
+const ON_DEVICE_LOGIN = { state: "device_login" as const, mode: "device_login" as const };
 
 function setResponse(overrides: Partial<SetAgentAiAccountResponse> = {}): SetAgentAiAccountResponse {
   const { options: _options, canBindAny: _canBindAny, ...summary } = binding(ON_MINE);
   return { ...summary, appliesFrom: "next_run", runningRunIds: [], warnings: [], ...overrides };
+}
+
+function connection(overrides: Partial<AiManagedConnectionSummary> = {}): AiManagedConnectionSummary {
+  return {
+    id: "00000000-0000-4000-8000-000000000003",
+    grantId: "00000000-0000-4000-8000-000000000004",
+    companyId: AGENT.companyId,
+    provider: "anthropic",
+    method: "subscription",
+    name: "My Claude",
+    ownership: "personal",
+    ownerUserId: "me",
+    isDefault: true,
+    status: "connected",
+    ...overrides,
+  };
+}
+
+function connectionList(connections: AiManagedConnectionSummary[]): AiConnectionList {
+  return { currentUserId: "me", canManageConnections: false, pools: [], connections };
 }
 
 function run(overrides: Partial<HeartbeatRun> = {}): HeartbeatRun {
@@ -286,6 +346,9 @@ beforeEach(() => {
     disconnect() {}
   };
   poolApi.listCompanyAccounts.mockResolvedValue({ accounts: [TEAM, MINE], canBindAny: true });
+  connectionsApi.list.mockResolvedValue(connectionList([connection()]));
+  // The viewer has saved a Claude login under My secrets.
+  agentsApiMock.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", latestVersion: 1 });
   runsApi.list.mockResolvedValue([]);
   devicesApi.list.mockResolvedValue({ limitPerDevice: 3, devices: [] });
   container = document.createElement("div");
@@ -312,19 +375,45 @@ async function render(node: ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   root = createRoot(container);
   await act(async () => {
-    root!.render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
+    root!.render(
+      <QueryClientProvider client={client}>
+        <TooltipProvider>{node}</TooltipProvider>
+      </QueryClientProvider>,
+    );
   });
   await settle();
   return client;
 }
 
-async function renderCard(detail: AgentAiAccountBindingDetail, agent: typeof AGENT = AGENT) {
+async function unmount() {
+  await act(async () => root?.unmount());
+  root = null;
+}
+
+async function renderField(
+  detail: AgentAiAccountBindingDetail,
+  props: Partial<ComponentProps<typeof AgentClaudeAccountField>> = {},
+) {
   poolApi.getAgentBinding.mockResolvedValue(detail);
-  return render(<AgentClaudeAccountCard agent={agent} now={NOW} />);
+  return render(<AgentClaudeAccountField agent={AGENT} now={NOW} {...props} />);
+}
+
+async function renderLeftOver(detail: AgentAiAccountBindingDetail) {
+  poolApi.getAgentBinding.mockResolvedValue(detail);
+  return render(<AgentClaudeAccountLeftOver agentId={CODEX_AGENT.id} />);
 }
 
 function trigger() {
   return container.querySelector<HTMLButtonElement>("button[role='combobox']");
+}
+
+function usage() {
+  return container.querySelector("[data-claude-account-usage]")?.textContent;
+}
+
+/** The link under the picker to where a person connects their own AI connection. */
+function appsLink() {
+  return Array.from(container.querySelectorAll("[data-claude-account-usage] a")).find((link) => link.textContent === "Apps");
 }
 
 async function openSelect() {
@@ -362,73 +451,230 @@ function alerts() {
   return Array.from(container.querySelectorAll("[role='alert']")).map((element) => element.textContent);
 }
 
-describe("AgentClaudeAccountCard", () => {
-  it("renders every binding state, with the wait its next run would hit", async () => {
-    await renderCard(binding());
-    expect(container.querySelector("[data-binding-state='unbound']")?.textContent).toBe(AI_ACCOUNT_BINDING_STATE_TEXT.unbound);
+describe("AgentClaudeAccountField", () => {
+  it("renders every binding state and says what the runs use, with the wait the next run would hit", async () => {
+    await renderField(binding());
+    expect(container.querySelector("label")?.textContent).toBe("Claude account");
     expect(trigger()?.textContent).toContain("Choose a Claude account");
+    expect(usage()).toBe("No account is chosen, so runs use the device's own Claude login on Build box.");
     expect(container.querySelector("[role='note']")).toBeNull();
-    expect(button("Clear")).toBeUndefined();
-    await act(async () => root?.unmount());
+    await unmount();
 
-    await renderCard(binding({ state: "device_login", mode: "device_login" }));
-    expect(container.querySelector("[data-binding-state='device_login']")?.textContent).toBe("Device's own login");
+    await renderField(binding(ON_DEVICE_LOGIN));
     expect(trigger()?.textContent).toContain("Device's own login");
-    await act(async () => root?.unmount());
+    expect(usage()).toBe("Runs use the device's own Claude login on Build box.");
+    // Switching away happens in the picker; there is no separate Clear.
+    expect(button("Clear")).toBeUndefined();
+    await unmount();
 
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     expect(trigger()?.textContent).toContain("Team Max");
-    const state = container.querySelector("[data-binding-state='pool_account']");
-    expect(state?.textContent).toContain("Owner: Ada");
-    expect(state?.textContent).toContain("Subscription");
-    expect(state?.querySelector("[data-account-state='active']")?.textContent).toBe("Active");
-    await act(async () => root?.unmount());
+    // The chosen account's state shows in the picker, Active included.
+    expect(trigger()?.querySelector("[data-account-state='active']")?.textContent).toBe("Active");
+    expect(usage()).toBe("Runs use Ada's Claude account Team Max on Build box.");
+    await unmount();
 
-    await renderCard(binding({ state: "unassigned", mode: "pool_account", account: null }));
-    expect(container.querySelector("[data-binding-state='unassigned']")?.textContent).toBe(AI_ACCOUNT_BINDING_STATE_TEXT.unassigned);
+    await renderField(binding({ state: "unassigned", mode: "pool_account", account: null }));
     expect(trigger()?.textContent).toContain("No account chosen");
+    expect(usage()).toBe("No account is chosen, so runs wait until one is.");
     expect(container.textContent).toContain("Tasks wait: no account chosen");
     expect(container.textContent).toContain(resourceWaitReasonText("unassigned"));
-    await act(async () => root?.unmount());
+    await unmount();
 
-    await renderCard(binding({ state: "account_unavailable", mode: "pool_account", account: null }));
-    expect(container.querySelector("[data-binding-state='account_unavailable']")?.textContent)
-      .toBe(AI_ACCOUNT_BINDING_STATE_TEXT.account_unavailable);
+    await renderField(binding({ state: "account_unavailable", mode: "pool_account", account: null }));
     // The picker names it as the Claude accounts page does, not as "No account chosen".
     expect(trigger()?.textContent).toContain(AI_ACCOUNT_BINDING_STATE_TEXT.account_unavailable);
     expect(trigger()?.textContent).not.toContain("No account chosen");
+    expect(usage()).toBe("The chosen account is no longer available in this company, so runs wait until another one is chosen.");
     expect(container.textContent).toContain("The account is no longer available in this company");
     // The company cannot see the account, so it is never named.
     expect(container.textContent).not.toContain("Team Max");
-    await act(async () => root?.unmount());
+    await unmount();
 
-    await renderCard(binding({
-      ...ON_TEAM,
-      account: accountRef({ state: "limited", exhaustedUntil: TODAY_18.toISOString(), limitSource: "estimated" }),
-    }));
-    expect(container.querySelector("[data-account-state='limited']")?.textContent).toBe("Limited until 18:00 (estimated)");
+    const limited = { state: "limited" as const, exhaustedUntil: TODAY_18.toISOString(), limitSource: "estimated" as const };
+    await renderField(binding({ ...ON_TEAM, account: accountRef(limited), options: [option(limited), MINE] }));
+    expect(trigger()?.querySelector("[data-account-state='limited']")?.textContent).toBe("Limited until 18:00 (estimated)");
     expect(container.textContent).toContain("Tasks wait: usage limit");
-    expect(container.textContent).toContain("Paperclip never moves a task to another account");
+  });
+
+  it("names the account's owner when that helps, and the device of an unpinned agent", async () => {
+    await renderField(binding(ON_MINE));
+    expect(usage()).toBe("Runs use your Claude account My Pro on Build box.");
+    await unmount();
+
+    // A label that is the owner's name is said once.
+    await renderField(binding({ ...ON_TEAM, account: accountRef({ label: "Berna Manav", ownerName: "Berna Manav" }) }));
+    expect(usage()).toBe("Runs use Berna Manav's Claude account on Build box.");
+    await unmount();
+
+    await renderField(binding({ ...ON_TEAM, account: accountRef({ ownerName: null }), pinned: false, devices: [BUILD_BOX, SERVER] }));
+    expect(usage()).toBe("Runs use the Claude account Team Max on the device of each task's project.");
+  });
+
+  it("says that a change saves at once, apart from the form, and links to where accounts are added", async () => {
+    await renderField(binding({ ...ON_TEAM, overridesAiConnection: true }));
+    expect(container.textContent).toContain(
+      "A change here saves at once, without the Save button, and applies from the agent's next run.",
+    );
+    const add = Array.from(container.querySelectorAll("a")).find((link) => link.textContent === "Add account");
+    expect(add?.getAttribute("href")).toBe("/company/settings/claude-accounts");
+    // The AI connection it overrides is no longer shown anywhere, so nothing refers to it.
+    expect(container.textContent).not.toContain("overrides the AI connection");
+    expect(connectionsApi.list).not.toHaveBeenCalled();
+  });
+
+  it("shows the agent's AI connection as the current choice while it has no selection", async () => {
+    poolApi.setAgentBinding.mockResolvedValue(setResponse());
+    await renderField(binding(), { aiConnection: RESPONSIBLE_USER });
+    expect(connectionsApi.list).toHaveBeenCalledWith(AGENT.companyId, AGENT.id);
+    expect(trigger()?.textContent).toBe(RESPONSIBLE_USER_CONNECTION_LABEL);
+    expect(usage()).toBe("Each task uses the Claude connection of the person responsible for it: for your tasks, that is My Claude.");
+    // The viewer's own connection is connected, so there is nothing to fix.
+    expect(appsLink()).toBeUndefined();
+
+    await openSelect();
+    const current = item(RESPONSIBLE_USER_CONNECTION_LABEL);
+    expect(current?.textContent).toContain(CURRENT_AI_CONNECTION_OPTION_TEXT);
+    expect(current?.getAttribute("aria-disabled")).not.toBe("true");
+    expect(item("Device's own login")).toBeDefined();
+    expect(item("Team Max")).toBeDefined();
+    // Picking the current choice again saves nothing.
+    await act(async () => {
+      current?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    await settle();
+    expect(poolApi.setAgentBinding).not.toHaveBeenCalled();
+
+    await choose("My Pro");
+    expect(poolApi.setAgentBinding).toHaveBeenCalledWith(AGENT.id, { mode: "pool_account", accountId: "acct-mine" });
+    expect(trigger()?.textContent).toContain("My Pro");
+    // Once another option is chosen, the AI connection is no longer offered.
+    await openSelect();
+    expect(item(RESPONSIBLE_USER_CONNECTION_LABEL)).toBeUndefined();
+  });
+
+  it("names the viewer's own connection behind a responsible-user connection, or says it cannot, with the fix", async () => {
+    connectionsApi.list.mockResolvedValue(connectionList([connection({ status: "expired" })]));
+    await renderField(binding(), { aiConnection: RESPONSIBLE_USER });
+    expect(usage()).toBe(
+      "Each task uses the Claude connection of the person responsible for it: for your tasks, that is My Claude (expired). "
+      + "Your tasks cannot run until you reconnect it under Apps or choose a Claude account above.",
+    );
+    expect(appsLink()?.getAttribute("href")).toBe("/apps");
+    await unmount();
+
+    // Another member's connection is not the viewer's default.
+    connectionsApi.list.mockResolvedValue(connectionList([connection({ ownerUserId: "someone-else" })]));
+    await renderField(binding(), { aiConnection: RESPONSIBLE_USER });
+    expect(usage()).toBe(
+      "Each task uses the Claude connection of the person responsible for it. You have not connected one yet. "
+      + "Your tasks cannot run until you connect one under Apps or choose a Claude account above.",
+    );
+    expect(appsLink()?.getAttribute("href")).toBe("/apps");
+    await unmount();
+
+    // Unread connections: the text stays general and names no fix.
+    connectionsApi.list.mockRejectedValue(new ApiError("Forbidden", 403, { error: "Forbidden" }));
+    await renderField(binding(), { aiConnection: RESPONSIBLE_USER });
+    expect(usage()).toBe("Each task uses the Claude connection of the person responsible for it: for your tasks, that is your own Claude connection.");
+    expect(appsLink()).toBeUndefined();
+    expect(alerts()).toEqual([]);
+  });
+
+  it("names a company-shared connection as the AI connection picker does", async () => {
+    connectionsApi.list.mockResolvedValue(connectionList([connection({ id: SHARED_ID, name: "Team Claude", ownership: "shared", ownerUserId: undefined, isDefault: false })]));
+    await renderField(binding(), { aiConnection: SHARED });
+    expect(trigger()?.textContent).toBe("Team Claude");
+    expect(usage()).toBe("Runs use the company-shared Claude connection Team Claude on Build box.");
+  });
+
+  it("does not offer the AI connection once the agent has a selection", async () => {
+    await renderField(binding({ ...ON_TEAM, overridesAiConnection: true }), { aiConnection: RESPONSIBLE_USER });
+    expect(trigger()?.textContent).toContain("Team Max");
+    expect(usage()).toBe("Runs use Ada's Claude account Team Max on Build box.");
+    await openSelect();
+    expect(item(RESPONSIBLE_USER_CONNECTION_LABEL)).toBeUndefined();
+    expect(connectionsApi.list).not.toHaveBeenCalled();
+  });
+
+  it("names a Claude credential in the agent's own environment ahead of the device's own login, and what to remove for it", async () => {
+    // A plain value or a company secret serves every run, so the viewer's own saved login does not matter.
+    await renderField(binding(), { environmentCredentials: [OAUTH_TOKEN] });
+    expect(usage()).toBe("No account is chosen, so runs use the Claude credential in this agent's CLAUDE_CODE_OAUTH_TOKEN variable on Build box.");
+    expect(agentsApiMock.getClaudeOAuthTokenStatus).not.toHaveBeenCalled();
+    await unmount();
+
+    // The device's own login is chosen, but the variables still apply.
+    await renderField(binding(ON_DEVICE_LOGIN), { environmentCredentials: [API_KEY, OAUTH_TOKEN] });
+    expect(usage()).toBe(
+      "Runs use the Claude credential in this agent's ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN variables on Build box, not the device's own login. "
+      + "To use the device's own login, remove ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN under Environment variables.",
+    );
+    await unmount();
+
+    // A pool account replaces them.
+    await renderField(binding(ON_TEAM), { environmentCredentials: [OAUTH_TOKEN] });
+    expect(usage()).toBe("Runs use Ada's Claude account Team Max on Build box.");
+  });
+
+  it("says a saved login is each task's responsible person's, and whether the viewer has saved one", async () => {
+    await renderField(binding(), { environmentCredentials: [SAVED_LOGIN] });
+    expect(agentsApiMock.getClaudeOAuthTokenStatus).toHaveBeenCalledWith(AGENT.companyId);
+    expect(usage()).toBe(`${SAVED_LOGIN_USAGE} Your Claude login is saved.`);
+    await unmount();
+
+    // The status route answers 404 while the viewer has saved none.
+    agentsApiMock.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Not found", 404, { error: "Not found" }));
+    await renderField(binding(), { environmentCredentials: [SAVED_LOGIN] });
+    expect(usage()).toBe(
+      `${SAVED_LOGIN_USAGE} You have not saved a Claude login, so your tasks cannot run until you save one under My secrets `
+      + "or choose a Claude account above.",
+    );
+    await unmount();
+
+    // Unknown: nothing is said about the viewer's own.
+    agentsApiMock.getClaudeOAuthTokenStatus.mockRejectedValue(new ApiError("Server error", 500, { error: "Server error" }));
+    await renderField(binding(), { environmentCredentials: [SAVED_LOGIN] });
+    expect(usage()).toBe(SAVED_LOGIN_USAGE);
+    expect(alerts()).toEqual([]);
+    await unmount();
+
+    // On the device's own login the variable still applies: the text names the fix, not the viewer's login.
+    agentsApiMock.getClaudeOAuthTokenStatus.mockClear();
+    await renderField(binding(ON_DEVICE_LOGIN), { environmentCredentials: [SAVED_LOGIN] });
+    expect(usage()).toBe(
+      "Runs use the Claude login that the person responsible for each task saved under My secrets (this agent's "
+      + "CLAUDE_CODE_OAUTH_TOKEN variable) on Build box, not the device's own login. "
+      + "To use the device's own login, remove CLAUDE_CODE_OAUTH_TOKEN under Environment variables.",
+    );
+    expect(agentsApiMock.getClaudeOAuthTokenStatus).not.toHaveBeenCalled();
+    await unmount();
+
+    // An AI connection replaces the agent's own credential variables.
+    await renderField(binding(), { aiConnection: RESPONSIBLE_USER, environmentCredentials: [SAVED_LOGIN] });
+    expect(usage()).toBe("Each task uses the Claude connection of the person responsible for it: for your tasks, that is My Claude.");
+    expect(agentsApiMock.getClaudeOAuthTokenStatus).not.toHaveBeenCalled();
   });
 
   it("shows the device and its owner for display only", async () => {
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     const device = container.querySelector("[data-device='device-1']");
     expect(device?.textContent).toContain("Build box — owner ada@example.com");
     expect(device?.textContent).toContain("SSH host");
     expect(container.textContent).toContain("Device");
-    await act(async () => root?.unmount());
+    await unmount();
 
-    await renderCard(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER] }));
+    await renderField(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER] }));
     expect(container.textContent).toContain("Devices (varies by project)");
     expect(container.querySelector("[data-device='device-2']")?.textContent).toContain("Paperclip server");
     expect(container.textContent).toContain("its device depends on the task's project");
-    await act(async () => root?.unmount());
+    await unmount();
 
     // A pool account on an agent without a known device waits until the device is known.
     devicesApi.list.mockClear();
-    await renderCard(binding({ ...ON_TEAM, devices: [] }));
+    await renderField(binding({ ...ON_TEAM, devices: [] }));
     expect(container.textContent).toContain("Unknown");
+    expect(usage()).toBe("Runs use Ada's Claude account Team Max.");
     expect(container.textContent).toContain("Tasks wait: device unknown");
     expect(devicesApi.list).not.toHaveBeenCalled();
   });
@@ -438,7 +684,7 @@ describe("AgentClaudeAccountCard", () => {
       limitPerDevice: 3,
       devices: [deviceSummary(BUILD_BOX, AVAILABLE), deviceSummary(SERVER, OFFLINE), deviceSummary(STUDIO, RETIRED)],
     });
-    await renderCard(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER, STUDIO] }));
+    await renderField(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER, STUDIO] }));
     expect(devicesApi.list).toHaveBeenCalledWith(AGENT.companyId);
     const badge = (deviceId: string) => container.querySelector(`[data-device='${deviceId}'] [data-device-availability]`);
     expect(badge(BUILD_BOX.id)?.textContent).toBe("Available");
@@ -451,14 +697,14 @@ describe("AgentClaudeAccountCard", () => {
 
   it("shows no availability for a device the list leaves out, or when the list fails", async () => {
     devicesApi.list.mockResolvedValue({ limitPerDevice: 3, devices: [deviceSummary(SERVER, OFFLINE)] });
-    await renderCard(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER] }));
+    await renderField(binding({ ...ON_TEAM, pinned: false, devices: [BUILD_BOX, SERVER] }));
     expect(container.querySelector(`[data-device='${BUILD_BOX.id}'] [data-device-availability]`)).toBeNull();
     expect(container.querySelector(`[data-device='${SERVER.id}'] [data-device-availability]`)?.textContent)
       .toBe("Offline since 11:30");
-    await act(async () => root?.unmount());
+    await unmount();
 
     devicesApi.list.mockRejectedValue(new ApiError("Forbidden", 403, { error: "Forbidden" }));
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     expect(container.querySelector("[data-device-availability]")).toBeNull();
     expect(container.querySelector(`[data-device='${BUILD_BOX.id}']`)?.textContent).toContain("Build box — owner ada@example.com");
     expect(alerts()).toEqual([]);
@@ -486,12 +732,14 @@ describe("AgentClaudeAccountCard", () => {
     })],
   ])("shows a %s refusal inline, with no toast", async (_status, error) => {
     poolApi.setAgentBinding.mockRejectedValue(error);
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     await choose("My Pro");
     expect(poolApi.setAgentBinding).toHaveBeenCalledWith(AGENT.id, { mode: "pool_account", accountId: "acct-mine" });
     expect(alerts()).toContain(aiAccountPoolErrorMessage(error));
     expect(pushToast).not.toHaveBeenCalled();
     expect(invalidatePool).not.toHaveBeenCalled();
+    // The picker still shows what the agent uses.
+    expect(trigger()?.textContent).toContain("Team Max");
   });
 
   it("shows other companies' accounts as a count only in a device limit refusal", async () => {
@@ -499,14 +747,14 @@ describe("AgentClaudeAccountCard", () => {
       code: "device_account_limit",
       details: { code: "device_account_limit", deviceName: "Build box", limit: 3, inUse: 3, accounts: ["Team Max"], otherCompaniesAccounts: 2 },
     }));
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     await choose("My Pro");
     expect(alerts().join(" ")).toContain("Build box already runs 3 of 3 Claude accounts (Team Max, 2 accounts of other companies)");
   });
 
   it("saves a choice, toasts when it applies and refreshes every pool query", async () => {
     poolApi.setAgentBinding.mockResolvedValue(setResponse({ runningRunIds: ["run-9"] }));
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     await choose("My Pro");
     expect(poolApi.setAgentBinding).toHaveBeenCalledWith(AGENT.id, { mode: "pool_account", accountId: "acct-mine" });
     expect(pushToast).toHaveBeenCalledWith({
@@ -515,9 +763,18 @@ describe("AgentClaudeAccountCard", () => {
       tone: "success",
     });
     expect(invalidatePool).toHaveBeenCalled();
-    // The card shows the saved choice at once.
+    // The field shows the saved choice at once.
     expect(trigger()?.textContent).toContain("My Pro");
+    expect(usage()).toBe("Runs use your Claude account My Pro on Build box.");
     expect(alerts()).toEqual([]);
+  });
+
+  it("switches to the device's own login from the picker", async () => {
+    poolApi.setAgentBinding.mockResolvedValue(setResponse({ ...ON_DEVICE_LOGIN, account: null }));
+    await renderField(binding(ON_TEAM));
+    await choose("Device's own login");
+    expect(poolApi.setAgentBinding).toHaveBeenCalledWith(AGENT.id, { mode: "device_login" });
+    expect(usage()).toBe("Runs use the device's own Claude login on Build box.");
   });
 
   it("warns in the toast when the chosen account is at its limit", async () => {
@@ -525,7 +782,7 @@ describe("AgentClaudeAccountCard", () => {
       account: accountRef({ id: "acct-mine", label: "My Pro", ownedByMe: true, state: "limited", exhaustedUntil: TODAY_18.toISOString(), limitSource: "provider" }),
       warnings: ["usage_limit"],
     }));
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     await choose("My Pro");
     expect(pushToast).toHaveBeenCalledWith({
       title: "Claude account saved",
@@ -535,14 +792,14 @@ describe("AgentClaudeAccountCard", () => {
   });
 
   it("does not save the account the agent already has", async () => {
-    await renderCard(binding(ON_MINE));
+    await renderField(binding(ON_MINE));
     await choose("My Pro");
     expect(poolApi.setAgentBinding).not.toHaveBeenCalled();
   });
 
   it("offers the binding's own options for this agent, with the server's reason per account, and no second request", async () => {
     // The binding's options are this agent's: Team Max would take a new slot on a full device.
-    await renderCard(binding({ ...ON_MINE, options: [option({ selectable: false, reason: "device_account_limit" }), MINE] }));
+    await renderField(binding({ ...ON_MINE, options: [option({ selectable: false, reason: "device_account_limit" }), MINE] }));
     await openSelect();
     expect(item("Team Max")?.getAttribute("aria-disabled")).toBe("true");
     expect(item("Team Max")?.textContent).toContain(AI_ACCOUNT_UNSELECTABLE_REASON_TEXT.device_account_limit);
@@ -553,7 +810,7 @@ describe("AgentClaudeAccountCard", () => {
 
   it("keeps the agent's own paused account named in the picker", async () => {
     // A paused account is not eligible, so the binding's options leave it out.
-    await renderCard(binding({ ...ON_TEAM, account: accountRef({ state: "withdrawn" }), options: [MINE] }));
+    await renderField(binding({ ...ON_TEAM, account: accountRef({ state: "withdrawn" }), options: [MINE] }));
     expect(trigger()?.textContent).toContain("Team Max");
     expect(trigger()?.textContent).toContain("Paused by owner");
     expect(trigger()?.textContent).not.toContain(AI_ACCOUNT_BINDING_STATE_TEXT.account_unavailable);
@@ -562,19 +819,18 @@ describe("AgentClaudeAccountCard", () => {
   });
 
   it("is read-only for a person who may not change the assignment", async () => {
-    await renderCard(binding({ ...ON_TEAM, canChange: false }));
+    await renderField(binding({ ...ON_TEAM, canChange: false }));
     expect(trigger()?.disabled).toBe(true);
     expect(container.textContent).toContain(AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT);
-    expect(button("Clear")).toBeUndefined();
+    expect(container.textContent).not.toContain("A change here saves at once");
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
   });
 
   it("offers an owner the device login only while the agent is on their own account (D4)", async () => {
     // Not a company admin: the binding says so itself.
-    poolApi.setAgentBinding.mockResolvedValue(setResponse({ state: "device_login", mode: "device_login", account: null }));
-    await renderCard(binding({ ...ON_MINE, canBindAny: false }));
+    poolApi.setAgentBinding.mockResolvedValue(setResponse({ ...ON_DEVICE_LOGIN, account: null }));
+    await renderField(binding({ ...ON_MINE, canBindAny: false }));
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
-    expect(button("Clear")).toBeDefined();
     await openSelect();
     expect(item("Device's own login")?.getAttribute("aria-disabled")).not.toBe("true");
     await act(async () => {
@@ -582,35 +838,17 @@ describe("AgentClaudeAccountCard", () => {
     });
     await settle();
     expect(poolApi.setAgentBinding).toHaveBeenCalledWith(AGENT.id, { mode: "device_login" });
-    await act(async () => root?.unmount());
+    await unmount();
     document.body.innerHTML = "";
     document.body.appendChild(container);
 
-    await renderCard(binding({ canBindAny: false }));
+    await renderField(binding({ canBindAny: false }));
     await openSelect();
     expect(item("Device's own login")?.getAttribute("aria-disabled")).toBe("true");
     expect(item("Device's own login")?.textContent).toContain(DEVICE_LOGIN_NOT_PERMITTED_TEXT);
     // The owner may still bind their own account to the unbound agent; another member's stays closed.
     expect(item("My Pro")?.getAttribute("aria-disabled")).not.toBe("true");
     expect(item("Team Max")?.getAttribute("aria-disabled")).toBe("true");
-  });
-
-  it("lets a company admin clear the selection", async () => {
-    poolApi.clearAgentBinding.mockResolvedValue(undefined);
-    await renderCard(binding({ state: "device_login", mode: "device_login" }));
-    await click("Clear");
-    expect(poolApi.clearAgentBinding).toHaveBeenCalledWith(AGENT.id);
-    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Claude account selection cleared", tone: "success" }));
-    expect(invalidatePool).toHaveBeenCalled();
-  });
-
-  it("shows a refused clear inline", async () => {
-    const error = new ApiError("Forbidden", 403, { code: "ai_account_binding_forbidden" });
-    poolApi.clearAgentBinding.mockRejectedValue(error);
-    await renderCard(binding(ON_TEAM));
-    await click("Clear");
-    expect(alerts()).toContain(aiAccountPoolErrorMessage(error));
-    expect(pushToast).not.toHaveBeenCalled();
   });
 
   it("shows the agent's current wait from its newest waiting run", async () => {
@@ -622,7 +860,7 @@ describe("AgentClaudeAccountCard", () => {
     });
     runsApi.list.mockResolvedValue([run({ id: "run-done" }), waiting]);
     runsApi.get.mockResolvedValue({ ...waiting, contextSnapshot: { resourceWait: waitContext() } });
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     expect(runsApi.list).toHaveBeenCalledWith(AGENT.companyId, AGENT.id, 25, { summary: true });
     expect(runsApi.get).toHaveBeenCalledWith("run-wait");
     expect(container.textContent).toContain("Waiting for Claude account Team Max: the usage limit resets at 18:00 (estimated)");
@@ -632,75 +870,139 @@ describe("AgentClaudeAccountCard", () => {
   it("names the lane while the waiting run's reason is still loading", async () => {
     runsApi.list.mockResolvedValue([run({ id: "run-wait", status: "scheduled_retry", scheduledRetryReason: "environment_wait" })]);
     runsApi.get.mockReturnValue(new Promise(() => {}));
-    await renderCard(binding(ON_TEAM));
+    await renderField(binding(ON_TEAM));
     expect(container.textContent).toContain("Waiting for a device");
     expect(container.textContent).toContain("Starts automatically when the device is available.");
   });
 
   it("asks a company admin to confirm a migrated assignment", async () => {
     poolApi.reviewAgentBinding.mockResolvedValue(binding(ON_TEAM));
-    await renderCard(binding({ ...ON_TEAM, needsReview: true, source: "migrated_host_pool", migrationNote: "Used most by this agent in the last 45 days." }));
+    await renderField(binding({ ...ON_TEAM, needsReview: true, source: "migrated_host_pool", migrationNote: "Used most by this agent in the last 45 days." }));
+    expect(container.textContent).toContain("Review this migrated assignment");
     expect(container.textContent).toContain("Used most by this agent in the last 45 days.");
     await click("Confirm");
     expect(poolApi.reviewAgentBinding).toHaveBeenCalledWith(AGENT.id);
     expect(invalidatePool).toHaveBeenCalled();
   });
 
-  it("notes an overridden AI connection and repeats the product rule", async () => {
-    await renderCard(binding({ ...ON_TEAM, overridesAiConnection: true }));
-    expect(container.textContent).toContain("This selection overrides the AI connection set in the agent's configuration.");
-    expect(container.textContent).toContain("Paperclip never moves a task to another account.");
-    expect(container.querySelector("a[href='/company/settings/claude-accounts']")).not.toBeNull();
+  it("leaves a migrated assignment's confirmation to a company admin, and shows a refused one inline", async () => {
+    await renderField(binding({ ...ON_TEAM, needsReview: true, canBindAny: false }));
+    expect(container.textContent).toContain("A company admin confirms it.");
+    expect(button("Confirm")).toBeUndefined();
+    await unmount();
+
+    const error = new ApiError("Forbidden", 403, { code: "ai_account_binding_forbidden" });
+    poolApi.reviewAgentBinding.mockRejectedValue(error);
+    await renderField(binding({ ...ON_TEAM, needsReview: true }));
+    await click("Confirm");
+    expect(alerts()).toContain(aiAccountPoolErrorMessage(error));
+    expect(invalidatePool).not.toHaveBeenCalled();
   });
 
   it("shows a load failure with a retry", async () => {
     poolApi.getAgentBinding.mockRejectedValueOnce(new ApiError("Not found", 404, { error: "Not found" }));
-    await render(<AgentClaudeAccountCard agent={AGENT} now={NOW} />);
+    await render(<AgentClaudeAccountField agent={AGENT} now={NOW} />);
     expect(alerts().join(" ")).toContain("Not found");
+    expect(runsApi.list).not.toHaveBeenCalled();
     poolApi.getAgentBinding.mockResolvedValue(binding(ON_TEAM));
     await click("Try again");
     expect(trigger()?.textContent).toContain("Team Max");
   });
 
-  it("stays hidden for another adapter unless a selection is left over", async () => {
-    await renderCard(binding({ supported: false, adapterType: "codex_local" }), CODEX_AGENT);
+  describe("scrolling to the field", () => {
+    const scrollIntoView = vi.fn();
+    /** The field's own scrolls; the picker's list scrolls its items too. */
+    const fieldScrolls = () => scrollIntoView.mock.contexts
+      .map((context, index) => ({ context, args: scrollIntoView.mock.calls[index] }))
+      .filter(({ context }) => context === document.getElementById(AGENT_CLAUDE_ACCOUNT_FIELD_ID));
+
+    beforeEach(() => {
+      Element.prototype.scrollIntoView = scrollIntoView;
+    });
+
+    afterEach(() => {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+      window.history.replaceState(null, "", "/");
+    });
+
+    it("brings the field into view once it loads when the URL names it", async () => {
+      window.history.replaceState(null, "", `/agents/coder/runtime#${AGENT_CLAUDE_ACCOUNT_FIELD_ID}`);
+      poolApi.setAgentBinding.mockResolvedValue(setResponse());
+      await renderField(binding(ON_TEAM));
+      expect(document.getElementById(AGENT_CLAUDE_ACCOUNT_FIELD_ID)?.querySelector("button[role='combobox']")).toBe(trigger());
+      expect(fieldScrolls().map(({ args }) => args)).toEqual([[{ behavior: "smooth", block: "center" }]]);
+
+      // A save refreshes the field without moving the page again.
+      await choose("My Pro");
+      expect(trigger()?.textContent).toContain("My Pro");
+      expect(fieldScrolls()).toHaveLength(1);
+    });
+
+    it("stays put without the hash", async () => {
+      window.history.replaceState(null, "", "/agents/coder/runtime");
+      await renderField(binding(ON_TEAM));
+      expect(document.getElementById(AGENT_CLAUDE_ACCOUNT_FIELD_ID)).not.toBeNull();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("AgentClaudeAccountLeftOver", () => {
+  it("renders nothing for another adapter without a selection, and reads nothing else", async () => {
+    await renderLeftOver(binding({ supported: false, adapterType: "codex_local" }));
     expect(container.innerHTML).toBe("");
     expect(runsApi.list).not.toHaveBeenCalled();
-    // Nothing to remove, so no account list and no device list either.
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
     expect(devicesApi.list).not.toHaveBeenCalled();
-    await act(async () => root?.unmount());
+    await unmount();
 
+    // A Claude agent's selection is the field's, not a left-over.
+    await renderLeftOver(binding(ON_TEAM));
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("offers to remove a selection left from when the agent ran Claude", async () => {
     poolApi.clearAgentBinding.mockResolvedValue(undefined);
-    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }), CODEX_AGENT);
+    await renderLeftOver(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }));
     expect(container.textContent).toContain("A Claude account selection is left over");
     expect(container.textContent).toContain("still counts toward its device's Claude account limit");
     // Whether the caller is a company admin comes with the binding: no account list is read.
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
     await click("Remove");
-    expect(poolApi.clearAgentBinding).toHaveBeenCalledWith(AGENT.id);
+    expect(poolApi.clearAgentBinding).toHaveBeenCalledWith(CODEX_AGENT.id);
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Claude account selection removed", tone: "success" }));
+    expect(invalidatePool).toHaveBeenCalled();
   });
 
-  it("offers Remove on a left-over selection only to those who may clear it", async () => {
-    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: false }), CODEX_AGENT);
+  it("shows a refused removal inline", async () => {
+    const error = new ApiError("Forbidden", 403, { code: "ai_account_binding_forbidden" });
+    poolApi.clearAgentBinding.mockRejectedValue(error);
+    await renderLeftOver(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }));
+    await click("Remove");
+    expect(alerts()).toContain(aiAccountPoolErrorMessage(error));
+    expect(pushToast).not.toHaveBeenCalled();
+  });
+
+  it("offers Remove only to those who may clear it", async () => {
+    await renderLeftOver(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: false }));
     expect(container.textContent).toContain("A Claude account selection is left over");
     expect(button("Remove")).toBeUndefined();
-    await act(async () => root?.unmount());
+    await unmount();
 
     // An owner may remove it while it is their own account.
-    await renderCard(binding({ ...ON_MINE, supported: false, adapterType: "codex_local", canBindAny: false }), CODEX_AGENT);
+    await renderLeftOver(binding({ ...ON_MINE, supported: false, adapterType: "codex_local", canBindAny: false }));
     expect(button("Remove")).toBeDefined();
-    await act(async () => root?.unmount());
+    await unmount();
 
     // A binding from a server that does not say whether the caller is a company admin: only the owner's rule applies.
-    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: undefined }), CODEX_AGENT);
+    await renderLeftOver(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: undefined }));
     expect(button("Remove")).toBeUndefined();
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
   });
 });
 
 describe("AgentClaudeAccountOverviewRows", () => {
-  const RUNTIME_HREF = "/agents/coder/runtime";
+  const RUNTIME_HREF = `/agents/coder/runtime#${AGENT_CLAUDE_ACCOUNT_FIELD_ID}`;
 
   function Row({ label, children }: { label: string; children: ReactNode }) {
     return <div data-row={label}>{children}</div>;
@@ -726,7 +1028,7 @@ describe("AgentClaudeAccountOverviewRows", () => {
     const device = container.querySelector("[data-row='Device']");
     expect(device?.querySelector("[data-device-availability='unavailable']")?.textContent).toBe("Offline since 11:30");
     expect(device?.textContent).toBe("Build box — owner ada@example.comOffline since 11:30");
-    await act(async () => root?.unmount());
+    await unmount();
 
     devicesApi.list.mockResolvedValue({ limitPerDevice: 3, devices: [deviceSummary(BUILD_BOX, AVAILABLE)] });
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} now={NOW} />);
@@ -734,11 +1036,11 @@ describe("AgentClaudeAccountOverviewRows", () => {
   });
 
   it("names the selection when no account is chosen, and renders nothing for another adapter", async () => {
-    poolApi.getAgentBinding.mockResolvedValue(binding({ state: "device_login", mode: "device_login", pinned: false, devices: [BUILD_BOX, SERVER] }));
+    poolApi.getAgentBinding.mockResolvedValue(binding({ ...ON_DEVICE_LOGIN, pinned: false, devices: [BUILD_BOX, SERVER] }));
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} now={NOW} />);
     expect(container.querySelector("[data-row='Device']")?.textContent).toBe("Varies by project (2 devices)");
     expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Device's own login");
-    await act(async () => root?.unmount());
+    await unmount();
 
     poolApi.getAgentBinding.mockClear();
     await render(<AgentClaudeAccountOverviewRows agent={CODEX_AGENT} Row={Row} />);
@@ -746,7 +1048,37 @@ describe("AgentClaudeAccountOverviewRows", () => {
     expect(poolApi.getAgentBinding).not.toHaveBeenCalled();
   });
 
-  it("links the Claude account row to where the account is chosen, for those who may change it", async () => {
+  it("names the agent's AI connection as the field does while the agent has no selection", async () => {
+    const onConnection = { ...AGENT, runtimeConfig: { aiConnection: RESPONSIBLE_USER } };
+    poolApi.getAgentBinding.mockResolvedValue(binding());
+    await render(<AgentClaudeAccountOverviewRows agent={onConnection} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe(`${RESPONSIBLE_USER_CONNECTION_LABEL}·Change`);
+    await unmount();
+
+    // A company-shared connection by its name, as the field's picker shows it.
+    connectionsApi.list.mockResolvedValue(connectionList([
+      connection({ id: SHARED_ID, name: "Team Claude", ownership: "shared", ownerUserId: undefined, isDefault: false }),
+    ]));
+    await render(<AgentClaudeAccountOverviewRows agent={{ ...AGENT, runtimeConfig: { aiConnection: SHARED } }} Row={Row} now={NOW} />);
+    expect(connectionsApi.list).toHaveBeenCalledWith(AGENT.companyId, AGENT.id);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Team Claude");
+    await unmount();
+
+    // A selection overrides the AI connection.
+    connectionsApi.list.mockClear();
+    poolApi.getAgentBinding.mockResolvedValue(binding(ON_DEVICE_LOGIN));
+    await render(<AgentClaudeAccountOverviewRows agent={onConnection} Row={Row} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Device's own login");
+    expect(connectionsApi.list).not.toHaveBeenCalled();
+    await unmount();
+
+    // With neither, nothing is set.
+    poolApi.getAgentBinding.mockResolvedValue(binding());
+    await render(<AgentClaudeAccountOverviewRows agent={{ ...AGENT, runtimeConfig: {} }} Row={Row} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe(AI_ACCOUNT_BINDING_STATE_SHORT_TEXT.unbound);
+  });
+
+  it("links the Claude account row to the Claude account field, for those who may change it", async () => {
     poolApi.getAgentBinding.mockResolvedValue(binding(ON_TEAM));
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
     const account = container.querySelector("[data-row='Claude account']");
@@ -764,45 +1096,24 @@ describe("AgentClaudeAccountOverviewRows", () => {
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} now={NOW} />);
     expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Team Max");
     expect(container.querySelector("a")).toBeNull();
-    await act(async () => root?.unmount());
+    await unmount();
 
     poolApi.getAgentBinding.mockResolvedValue(binding({ ...ON_TEAM, canChange: false }));
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
     expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Team Max");
     expect(container.querySelector("a")).toBeNull();
-    await act(async () => root?.unmount());
+    await unmount();
 
     poolApi.getAgentBinding.mockReturnValue(new Promise(() => {}));
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
     expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Loading…");
     expect(container.querySelector("a")).toBeNull();
-    await act(async () => root?.unmount());
+    await unmount();
 
     poolApi.getAgentBinding.mockRejectedValue(new ApiError("Not found", 404, { error: "Not found" }));
     await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
     expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Could not load");
     expect(container.querySelector("a")).toBeNull();
-  });
-});
-
-describe("AiConnectionOverrideNote", () => {
-  it("tells the AI connection field that the Claude account selection overrides it", async () => {
-    poolApi.getAgentBinding.mockResolvedValue(binding({ state: "device_login", mode: "device_login" }));
-    await render(<AiConnectionOverrideNote agentId={AGENT.id} adapterType="claude_local" />);
-    expect(container.textContent).toContain("Overridden by the Claude account selection");
-    expect(container.textContent).toContain("This agent uses its device's own login.");
-  });
-
-  it("stays hidden without a selection and for another adapter", async () => {
-    poolApi.getAgentBinding.mockResolvedValue(binding());
-    await render(<AiConnectionOverrideNote agentId={AGENT.id} adapterType="claude_local" />);
-    expect(container.innerHTML).toBe("");
-    await act(async () => root?.unmount());
-
-    poolApi.getAgentBinding.mockClear();
-    await render(<AiConnectionOverrideNote agentId={AGENT.id} adapterType="codex_local" />);
-    expect(container.innerHTML).toBe("");
-    expect(poolApi.getAgentBinding).not.toHaveBeenCalled();
   });
 });
 
@@ -830,9 +1141,17 @@ describe("agent Claude account helpers", () => {
     expect(routerPoolsOffered("paperclip_runner", undefined, pools)).toEqual(pools);
   });
 
+  it("shows the Claude account field only while the saved agent and the form both run Claude", () => {
+    expect(showsClaudeAccountField("claude_local", "claude_local")).toBe(true);
+    expect(showsClaudeAccountField("claude_local", "codex_local")).toBe(false);
+    expect(showsClaudeAccountField("codex_local", "claude_local")).toBe(false);
+    // An acpx Claude runner keeps the AI connection field: pool accounts apply to claude_local only.
+    expect(showsClaudeAccountField("paperclip_runner", "paperclip_runner")).toBe(false);
+  });
+
   it("reads the account wait of the next run in the server's order", () => {
     expect(bindingWaitReason(binding())).toBeNull();
-    expect(bindingWaitReason(binding({ state: "device_login", mode: "device_login" }))).toBeNull();
+    expect(bindingWaitReason(binding(ON_DEVICE_LOGIN))).toBeNull();
     expect(bindingWaitReason(binding({ state: "unassigned", mode: "pool_account" }))).toBe("unassigned");
     expect(bindingWaitReason(binding({ state: "account_unavailable", mode: "pool_account" }))).toBeNull();
     expect(bindingWaitReason(binding(ON_TEAM))).toBeNull();
@@ -862,20 +1181,94 @@ describe("agent Claude account helpers", () => {
     });
   });
 
-  it("formats devices, picks and the override note", () => {
+  it("formats devices and picks", () => {
     expect(deviceDisplayName(BUILD_BOX)).toBe("Build box — owner ada@example.com");
     expect(deviceDisplayName(SERVER)).toBe("Paperclip server");
     expect(agentDeviceSummary(binding({ devices: [] }))).toBe("Unknown");
     expect(agentDeviceSummary(binding({ pinned: false }))).toBe("Build box — owner ada@example.com (varies by project)");
+    expect(agentDevicePhrase(binding())).toBe("on Build box");
+    expect(agentDevicePhrase(binding({ pinned: false }))).toBe("on Build box (varies by project)");
+    expect(agentDevicePhrase(binding({ pinned: false, devices: [BUILD_BOX, SERVER] }))).toBe("on the device of each task's project");
+    expect(agentDevicePhrase(binding({ devices: [] }))).toBeNull();
     expect(isCurrentSelection({ mode: "pool_account", accountId: "acct-mine" }, binding(ON_MINE))).toBe(true);
     expect(isCurrentSelection({ mode: "device_login" }, binding(ON_MINE))).toBe(false);
-    expect(isCurrentSelection({ mode: "device_login" }, binding({ mode: "device_login", state: "device_login" }))).toBe(true);
-    expect(aiConnectionOverrideText(binding())).toBeNull();
-    expect(aiConnectionOverrideText(binding(ON_TEAM))).toBe(
-      "This agent uses the Claude account Team Max. The AI connection below applies only if that selection is cleared in the Claude account section.",
+    expect(isCurrentSelection({ mode: "device_login" }, binding(ON_DEVICE_LOGIN))).toBe(true);
+  });
+
+  it("says what the runs use for every selection", () => {
+    expect(agentClaudeAccountUsageText(binding(ON_TEAM))).toBe("Runs use Ada's Claude account Team Max on Build box.");
+    expect(agentClaudeAccountUsageText(binding({ ...ON_TEAM, account: accountRef({ label: "ada", ownerName: "Ada" }) })))
+      .toBe("Runs use Ada's Claude account on Build box.");
+    expect(agentClaudeAccountUsageText(binding(ON_DEVICE_LOGIN))).toBe("Runs use the device's own Claude login on Build box.");
+    expect(agentClaudeAccountUsageText(binding({ devices: [] }))).toBe("No account is chosen, so runs use the device's own Claude login.");
+    expect(agentClaudeAccountUsageText(binding(), { aiConnection: { usage: "Runs use a connection." } })).toBe("Runs use a connection.");
+    // The AI connection applies only without a selection.
+    expect(agentClaudeAccountUsageText(binding(ON_DEVICE_LOGIN), { aiConnection: { usage: "Runs use a connection." } }))
+      .toBe("Runs use the device's own Claude login on Build box.");
+    expect(agentClaudeAccountUsageText(binding({ state: "unassigned", mode: "pool_account" })))
+      .toBe("No account is chosen, so runs wait until one is.");
+    // A value for every run beside each responsible person's own saved login.
+    expect(agentClaudeAccountUsageText(binding(), { environmentCredentials: [API_KEY, SAVED_LOGIN], savedClaudeLogin: true })).toBe(
+      "No account is chosen, so runs use the Claude credential in this agent's ANTHROPIC_API_KEY variable and the Claude login that the "
+      + "person responsible for each task saved under My secrets (this agent's CLAUDE_CODE_OAUTH_TOKEN variable) on Build box. "
+      + "Your Claude login is saved.",
     );
-    expect(aiConnectionOverrideText(binding({ state: "unassigned", mode: "pool_account" })))
-      .toContain("This agent waits until a Claude account is chosen for it.");
+    // A saved login a run may go without stops no task.
+    expect(agentClaudeAccountUsageText(binding(), { environmentCredentials: [{ ...SAVED_LOGIN, required: false }], savedClaudeLogin: false }))
+      .toBe(`${SAVED_LOGIN_USAGE} You have not saved a Claude login.`);
+  });
+
+  it("names the agent's AI connection as the AI connection picker does", () => {
+    const list = connectionList([
+      connection(),
+      connection({ id: SHARED_ID, name: "Team Claude", ownership: "shared", ownerUserId: undefined, isDefault: false }),
+    ]);
+    const context = { companyId: AGENT.companyId, list, devicePhrase: "on Build box" };
+    expect(currentAiConnectionChoice(RESPONSIBLE_USER, context)).toEqual({
+      label: "Responsible user's connection",
+      usage: "Each task uses the Claude connection of the person responsible for it: for your tasks, that is My Claude.",
+    });
+    // The viewer's own connection is missing, or not connected: the field names the fix.
+    expect(currentAiConnectionChoice(RESPONSIBLE_USER, { ...context, list: connectionList([]) }).ownConnectionFix).toBe("connect");
+    expect(currentAiConnectionChoice(RESPONSIBLE_USER, { ...context, list: connectionList([connection({ status: "revoked" })]) }))
+      .toMatchObject({ usage: expect.stringContaining("that is My Claude (revoked)."), ownConnectionFix: "reconnect" });
+    expect(currentAiConnectionChoice(SHARED, context)).toEqual({
+      label: "Team Claude",
+      usage: "Runs use the company-shared Claude connection Team Claude on Build box.",
+    });
+    expect(currentAiConnectionChoice(SHARED, { companyId: AGENT.companyId })).toEqual({
+      label: "Company shared connection",
+      usage: "Runs use a company-shared Claude connection.",
+    });
+    expect(currentAiConnectionChoice({ provider: "anthropic", method: "subscription", mode: "company_pool" }, context).label)
+      .toBe("Company account pool (retired)");
+    const router = currentAiConnectionChoice({ mode: "router", connectionId: SHARED_ID }, context);
+    expect(router.label).toBe("Connection pool");
+    expect(router.usage).toContain("Pools are retired for Claude agents: choose a Claude account instead.");
+  });
+
+  it("finds the Claude credential variables of the agent's own environment, and whose value each holds", () => {
+    expect(claudeEnvironmentCredentials(undefined)).toEqual([]);
+    // The saved login a Claude sign-in binds: each run's responsible person's own, required unless it says otherwise.
+    expect(claudeEnvironmentCredentials({
+      CLAUDE_CODE_OAUTH_TOKEN: { type: "user_secret_ref", key: "CLAUDE_CODE_OAUTH_TOKEN", version: "latest" },
+      ANTHROPIC_API_KEY: { type: "plain", value: "" },
+      ANTHROPIC_AUTH_TOKEN: "",
+      OPENAI_API_KEY: "sk-test",
+    })).toEqual([SAVED_LOGIN]);
+    expect(claudeEnvironmentCredentials({
+      ANTHROPIC_API_KEY: { type: "user_secret_ref", key: "MY_ANTHROPIC_KEY", required: false },
+      CLAUDE_CODE_OAUTH_TOKEN: { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000009" },
+    })).toEqual([{ key: "ANTHROPIC_API_KEY", perPerson: true, savedLogin: false, required: false }, OAUTH_TOKEN]);
+    expect(claudeEnvironmentCredentials({ ANTHROPIC_API_KEY: { type: "plain", value: "sk-ant-test" }, ANTHROPIC_AUTH_TOKEN: "token" }))
+      .toEqual([API_KEY, { key: "ANTHROPIC_AUTH_TOKEN", perPerson: false, savedLogin: false, required: false }]);
+  });
+
+  it("reads the agent's saved AI connection", () => {
+    expect(agentAiConnection({ aiConnection: RESPONSIBLE_USER })).toEqual(RESPONSIBLE_USER);
+    expect(agentAiConnection({ aiConnection: { mode: "unknown" } })).toBeNull();
+    expect(agentAiConnection({})).toBeNull();
+    expect(agentAiConnection(undefined)).toBeNull();
   });
 
   it("names an account that is no longer available in the picker, and keeps the agent's current account listed", () => {
@@ -884,7 +1277,7 @@ describe("agent Claude account helpers", () => {
     expect(accountSelectValueForBinding(binding(ON_TEAM))).toEqual({ mode: "pool_account", accountId: "acct-team" });
     expect(accountSelectValueForBinding(binding({ state: "unassigned", mode: "pool_account" })))
       .toEqual({ mode: "pool_account", accountId: null });
-    expect(accountSelectValueForBinding(binding({ state: "device_login", mode: "device_login" }))).toEqual({ mode: "device_login" });
+    expect(accountSelectValueForBinding(binding(ON_DEVICE_LOGIN))).toEqual({ mode: "device_login" });
     expect(accountSelectValueForBinding(binding())).toBeNull();
 
     expect(accountOptionsWithCurrent([TEAM, MINE], accountRef())).toEqual([TEAM, MINE]);

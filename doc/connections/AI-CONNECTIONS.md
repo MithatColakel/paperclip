@@ -244,7 +244,9 @@ Pages:
   for company admins.
 - **Instance settings → Devices & Claude accounts** (instance admins): every
   device and account, the migration report, and the legacy host pool section.
-- The agent page has a Claude account card; a waiting task shows a banner.
+- **An agent's Configuration view → Adapter**: a Claude agent's Claude account
+  field (see [Bindings](#bindings)), in place of the AI connection field. The
+  overview's Change link opens it. A waiting task shows a banner.
 
 ### Accounts
 
@@ -322,10 +324,58 @@ never exported or imported.
 
 | Binding | The agent's runs use |
 | --- | --- |
-| No row | The upstream `runtimeConfig.aiConnection`, otherwise the device's own login. An unbound agent never receives a pool token. |
-| `device_login` | The device's own login. It also overrides an upstream `aiConnection`. |
+| No row | The upstream `runtimeConfig.aiConnection`, otherwise the Claude credential variables of the agent's own environment, else the device's own login. An unbound agent never receives a pool token. |
+| `device_login` | The device's own login, unless the agent's own environment sets a Claude credential variable, which still applies. It also overrides an upstream `aiConnection`. |
 | `pool_account` with an account | That account, on any device the agent runs on. |
 | `pool_account` without an account | No credential: runs wait as `unassigned` until an account is bound. They never fall back to the device's login. |
+
+**The Claude account field.** An existing Claude agent's Configuration view has
+one Claude account field in its Adapter section, in place of the AI connection
+field; the overview's Change link opens it (`#claude-account`). The picker
+offers the pool accounts with their state (an account the caller cannot choose
+stays visible, disabled, with the reason), the device's own login, and the
+agent's `aiConnection`, named as the AI connection picker names it (e.g.
+"Responsible user's connection"), only while the agent has no row: once
+another choice is saved, it is no longer offered there. The text under the
+picker says what the runs use now, and what to do where they cannot run for
+the viewer:
+
+- A pool account: the account, with its owner, on the agent's device.
+- A responsible-user connection: the connection of each task's responsible
+  person, naming the viewer's own. While the viewer's own is missing or not
+  connected, their tasks cannot run until they connect or reconnect it under
+  Apps (a link to `/apps`) or choose a Claude account.
+- Otherwise the Claude credential variables of the agent's own environment
+  (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`),
+  else the device's own login. A variable bound to a user secret
+  (`user_secret_ref`, such as the saved Claude login a sign-in binds) holds
+  each task's responsible person's own value from My secrets: the text says
+  so, and whether the viewer has saved a Claude login
+  (`GET /api/companies/:companyId/claude-oauth-token-status`); without one,
+  under a required binding, their tasks cannot run. With the device's own
+  login chosen these variables still apply, so the text names the ones to
+  remove under Environment variables.
+
+A choice saves at once (`PUT /api/agents/:agentId/ai-account`), apart from the
+form's Save button, and applies from the next run. The field keeps the agent's
+devices with their availability, the wait its tasks are in, the
+migrated-assignment review and the reason it is read-only, and it links to
+Company settings → Claude accounts to add an account. While the agent has no
+row, the overview's Claude account row names its `aiConnection` as the picker
+does (e.g. "Responsible user's connection"), or "Not set" without one. The
+create flow, other adapters and a form switched to another adapter keep the AI
+connection field; an agent moved to another adapter that still has a row shows
+a notice there with Remove.
+
+Sign-ins beside the field: the form shows no "Use saved login" bind for an
+existing Claude agent. A sandbox environment whose Test reports missing
+authentication (on a provider with a login terminal) still offers its sign-in
+while the agent has neither a row nor an `aiConnection`: it saves the person's
+Claude login under My secrets (or uses the one saved there) and binds
+`CLAUDE_CODE_OAUTH_TOKEN` to each task's responsible person's saved login,
+which the field then names. Once the agent has a row, the sign-in is hidden: a
+pool run blanks the agent's own credential variables, and the variable would
+override the device's own login.
 
 Routes:
 

@@ -138,8 +138,9 @@ describe("AgentOverview", () => {
     expect(markup).toContain("Build box — owner ada@example.com");
     expect(markup).toContain("Claude account");
     expect(markup).toContain("Team Max");
-    // The row links to where the account is chosen; Configure has the same href, so match the label.
-    expect(markup).toMatch(/<a href="\/agents\/claudecoder\/runtime"[^>]*aria-label="Change the Claude account"[^>]*>Change<\/a>/);
+    // The row links to the Claude account field in the Configuration view; Configure links to the view itself.
+    expect(markup).toMatch(/<a href="\/agents\/claudecoder\/runtime#claude-account"[^>]*aria-label="Change the Claude account"[^>]*>Change<\/a>/);
+    expect(markup).toMatch(/<a [^>]*href="\/agents\/claudecoder\/runtime"[^>]*>Configure<\/a>/);
   });
 });
 

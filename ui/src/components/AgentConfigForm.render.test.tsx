@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { useState } from "react";
+import { useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -90,6 +90,17 @@ vi.mock("../api/secrets", () => ({
 vi.mock("../api/ai-account-pool", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/ai-account-pool")>();
   return { ...actual, aiAccountPoolApi: { ...actual.aiAccountPoolApi, ...mockAiAccountPoolApi } };
+});
+
+// Fork: the Claude account field links to the Claude accounts page; the form renders without a router.
+vi.mock("../lib/router", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/router")>();
+  return {
+    ...actual,
+    Link: ({ to, children, ...props }: { to: string; children?: ReactNode } & ComponentProps<"a">) => (
+      <a href={to} {...props}>{children}</a>
+    ),
+  };
 });
 
 vi.mock("../lib/clipboard", () => ({
@@ -276,6 +287,8 @@ async function renderForm(
   agentOverrides: Partial<Agent> = {},
   options: {
     showAdapterTestEnvironmentButton?: boolean;
+    // Fork: the Claude account field tests move the edit form between adapters.
+    showAdapterTypeField?: boolean;
     content?: "configuration" | "secrets";
     environmentVariablesPlacement?: "configuration" | "secrets";
     hideInlineSave?: boolean;
@@ -313,7 +326,8 @@ async function renderForm(
               onDirtyChange={options.onDirtyChange}
               onSaveActionChange={options.onSaveActionChange}
               onCancelActionChange={options.onCancelActionChange}
-              showAdapterTypeField={false}
+              // Fork: the Claude account field tests show the Adapter type picker.
+              showAdapterTypeField={options.showAdapterTypeField ?? false}
               showAdapterTestEnvironmentButton={options.showAdapterTestEnvironmentButton ?? false}
             />
           </TooltipProvider>
@@ -324,6 +338,25 @@ async function renderForm(
 
   await flushReact();
   return { container, root, onSave };
+}
+
+/**
+ * Fork: moves the edit form to another adapter, as the Adapter type picker
+ * does (unsaved), for the Claude account field tests.
+ */
+async function switchAdapter(container: HTMLElement, from: string, to: string) {
+  const current = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === from);
+  expect(current, `Missing adapter picker showing ${from}`).toBeDefined();
+  await act(async () => {
+    current!.click();
+  });
+  await flushReact();
+  const next = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent?.trim() === to);
+  expect(next, `Missing adapter choice ${to}`).toBeDefined();
+  await act(async () => {
+    next!.click();
+  });
+  await flushReact();
 }
 
 async function renderCreateForm(
@@ -2852,11 +2885,15 @@ describe("AgentConfigForm environment selector", () => {
 
   it("offers the saved Claude login bind for a local environment and saves it with the apply-existing flag", async () => {
     mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", latestVersion: 1 });
+    // Fork: a saved Claude agent chooses its credential in the Claude account
+    // field alone, so the bind shows while the form moves an agent to Claude.
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
-      { adapterType: "claude_local" },
+      { adapterType: "codex_local" },
+      { showAdapterTypeField: true },
     );
     roots.push(result.root);
+    await switchAdapter(result.container, "Codex", "Claude Code");
 
     await flushUntil(() => Boolean(findButton(result.container, "Use saved login")));
     // The sandbox login panel stays hidden for a local environment.
@@ -2866,6 +2903,7 @@ describe("AgentConfigForm environment selector", () => {
     await flushUntil(() => result.onSave.mock.calls.length > 0);
 
     const patch = result.onSave.mock.calls[0]![0] as Record<string, unknown>;
+    expect(patch.adapterType).toBe("claude_local");
     expect(patch.applyStoredClaudeLogin).toBe(true);
     const env = ((patch.adapterConfig ?? {}) as Record<string, unknown>).env as Record<string, unknown>;
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toMatchObject({
@@ -3930,10 +3968,13 @@ describe("AgentConfigForm managed-sandbox-only host surfaces", () => {
   });
 });
 
-// Fork: a Claude agent's account selection decides its credential, not the AI connection field.
-describe("AgentConfigForm Claude account override note", () => {
+// Fork: a Claude agent chooses its Claude account in the Adapter section, in place of the AI connection field.
+describe("AgentConfigForm Claude account field", () => {
   let roots: Root[] = [];
-  const NOTE_TITLE = "Overridden by the Claude account selection";
+  const FIELD = "[data-agent-claude-account]";
+  const USAGE = "[data-claude-account-usage]";
+  // The AI connection field of an agent without a managed connection.
+  const AI_CONNECTION_NOTICE = "Existing authentication — not managed by Connections";
 
   const poolBinding: AgentAiAccountBindingDetail = {
     agentId: "agent-1",
@@ -3964,6 +4005,14 @@ describe("AgentConfigForm Claude account override note", () => {
     updatedAt: null,
     options: [],
   };
+  const unboundBinding: AgentAiAccountBindingDetail = {
+    ...poolBinding,
+    state: "unbound",
+    mode: null,
+    account: null,
+    source: null,
+    overridesAiConnection: false,
+  };
 
   beforeEach(() => {
     mockAgentsApi.adapterModels.mockResolvedValue([]);
@@ -3993,31 +4042,137 @@ describe("AgentConfigForm Claude account override note", () => {
     vi.clearAllMocks();
   });
 
-  it("notes a Claude agent's account selection above its AI connection", async () => {
+  it("shows a Claude agent's Claude account field in the Adapter section, in place of the AI connection", async () => {
     mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(poolBinding);
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
-      { adapterType: "claude_local" },
+      { adapterType: "claude_local", runtimeConfig: { aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } } },
     );
     roots.push(result.root);
-    await flushUntil(() => result.container.textContent?.includes(NOTE_TITLE) ?? false);
+    await flushUntil(() => result.container.querySelector(USAGE) !== null);
 
     expect(mockAiAccountPoolApi.getAgentBinding).toHaveBeenCalledWith("agent-1");
-    expect(result.container.textContent).toContain(NOTE_TITLE);
-    expect(result.container.textContent).toContain("This agent uses the Claude account Team Max.");
+    const field = result.container.querySelector(FIELD);
+    expect(field?.closest("[data-config-section='adapter']")).not.toBeNull();
+    expect(field?.querySelector("label")?.textContent).toBe("Claude account");
+    expect(field?.querySelector("button[role='combobox']")?.textContent).toContain("Team Max");
+    // The selection overrides the saved AI connection, so only the account is named.
+    expect(field?.querySelector(USAGE)?.textContent).toBe("Runs use Ada's Claude account Team Max.");
+    expect(result.container.textContent).not.toContain(AI_CONNECTION_NOTICE);
+    expect(result.container.querySelector("section[aria-label='AI connection']")).toBeNull();
+    expect(result.container.textContent).not.toContain("Responsible user");
   });
 
-  it("shows no note for an agent on another adapter", async () => {
-    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue({ ...poolBinding, adapterType: "codex_local" });
+  it("shows the saved AI connection as the field's current choice while the agent has no selection", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(unboundBinding);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local", runtimeConfig: { aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } } },
+    );
+    roots.push(result.root);
+    await flushUntil(() => result.container.querySelector(USAGE) !== null);
+
+    const field = result.container.querySelector(FIELD);
+    expect(field?.querySelector("button[role='combobox']")?.textContent).toBe("Responsible user's connection");
+    expect(field?.querySelector(USAGE)?.textContent).toContain("Each task uses the Claude connection of the person responsible for it");
+    expect(result.container.querySelector("section[aria-label='AI connection']")).toBeNull();
+  });
+
+  it("names a Claude credential in the agent's own environment, and offers no saved-login bind beside the field", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(unboundBinding);
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", version: 1 });
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      {
+        adapterType: "claude_local",
+        adapterConfig: { env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "secret-2", version: "latest" } } },
+      },
+    );
+    roots.push(result.root);
+    await flushUntil(() => result.container.querySelector(USAGE) !== null);
+
+    expect(result.container.querySelector(USAGE)?.textContent)
+      .toBe("No account is chosen, so runs use the Claude credential in this agent's ANTHROPIC_API_KEY variable.");
+    expect(result.container.textContent).not.toContain("Use saved login");
+  });
+
+  it("offers the sandbox sign-in only while the Claude agent has no Claude account selection", async () => {
+    mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
+    const deviceLoginBinding: AgentAiAccountBindingDetail = { ...unboundBinding, state: "device_login", mode: "device_login" };
+    // A pool account blanks the credential variable the sign-in binds, and the variable would override the device's own login.
+    for (const selection of [poolBinding, deviceLoginBinding]) {
+      mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(selection);
+      mockAgentsApi.testEnvironment.mockClear();
+      const result = await renderClaudeSandbox();
+      await flushUntil(() => result.container.querySelector(USAGE) !== null);
+      await runTest(result.container);
+      await flushUntil(() => result.container.textContent?.includes("no ready authentication") ?? false);
+
+      expect(mockAgentsApi.testEnvironment).toHaveBeenCalled();
+      expect(result.container.textContent).toContain("The sandbox has no ready authentication for this adapter.");
+      expect(findButton(result.container, "Sign in")).toBeFalsy();
+      expect(findButton(result.container, "Use saved login")).toBeFalsy();
+      await act(async () => {
+        result.root.unmount();
+      });
+      result.container.remove();
+    }
+
+    // Without one, the sign-in binds the agent's own credential, which the field then names.
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(unboundBinding);
+    const result = await renderClaudeSandbox();
+    roots.push(result.root);
+    await flushUntil(() => result.container.querySelector(USAGE) !== null);
+    await runTest(result.container);
+    await flushUntil(() => Boolean(findButton(result.container, "Sign in")));
+    expect(findButton(result.container, "Sign in")).toBeTruthy();
+  });
+
+  it("keeps the AI connection field for another adapter, with the notice of a selection left from Claude", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue({ ...poolBinding, adapterType: "codex_local", supported: false });
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
       { adapterType: "codex_local" },
     );
     roots.push(result.root);
-    await flushReact();
+    await flushUntil(() => result.container.textContent?.includes("A Claude account selection is left over") ?? false);
 
-    expect(mockAiAccountPoolApi.getAgentBinding).not.toHaveBeenCalled();
-    expect(result.container.textContent).not.toContain(NOTE_TITLE);
+    expect(result.container.querySelector(FIELD)).toBeNull();
+    expect(result.container.textContent).toContain(AI_CONNECTION_NOTICE);
+    expect(result.container.querySelector("[data-agent-claude-account-left-over]")?.closest("[data-config-section='adapter']"))
+      .not.toBeNull();
+  });
+
+  it("shows no left-over notice for another adapter without a selection", async () => {
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "codex_local" },
+    );
+    roots.push(result.root);
+    await flushUntil(() => result.container.textContent?.includes(AI_CONNECTION_NOTICE) ?? false);
+
+    expect(result.container.querySelector(FIELD)).toBeNull();
+    expect(result.container.querySelector("[data-agent-claude-account-left-over]")).toBeNull();
+  });
+
+  it("switches to the AI connection field while the form moves a Claude agent to another adapter", async () => {
+    mockAiAccountPoolApi.getAgentBinding.mockResolvedValue(poolBinding);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local" },
+      { showAdapterTypeField: true },
+    );
+    roots.push(result.root);
+    await flushUntil(() => result.container.querySelector(USAGE) !== null);
+    expect(result.container.textContent).not.toContain(AI_CONNECTION_NOTICE);
+
+    await switchAdapter(result.container, "Claude Code", "Codex");
+    await flushUntil(() => result.container.textContent?.includes(AI_CONNECTION_NOTICE) ?? false);
+
+    expect(result.container.querySelector(FIELD)).toBeNull();
+    expect(result.container.textContent).toContain(AI_CONNECTION_NOTICE);
+    // The saved agent still runs Claude, so its selection is no left-over.
+    expect(result.container.querySelector("[data-agent-claude-account-left-over]")).toBeNull();
   });
 });
 

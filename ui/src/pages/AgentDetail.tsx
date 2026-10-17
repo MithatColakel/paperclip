@@ -1,5 +1,5 @@
 import { AiConnectionPoolRunDetails } from "@/components/ai-connections/AiConnectionPoolRunDetails";
-import { AgentClaudeAccountCard, AgentClaudeAccountOverviewRows } from "@/components/ai-account-pool/AgentClaudeAccountCard";
+import { AGENT_CLAUDE_ACCOUNT_FIELD_ID, AgentClaudeAccountOverviewRows } from "@/components/ai-account-pool/AgentClaudeAccountField";
 import { RunResourceWaitBadge } from "@/components/ai-account-pool/RunResourceWaitBadge";
 import { invalidateAiAccountPoolQueries } from "@/api/ai-account-pool";
 import { aiAccountPoolRefusalMessage } from "@/lib/agent-claude-account";
@@ -1417,8 +1417,6 @@ export function AgentDetail() {
 
       {activeView === "runtime" && (
         <div>
-          {/* Fork: the agent's Claude account saves on its own, apart from the form below. */}
-          <AgentClaudeAccountCard agent={agent} className="mb-6" />
           <ConfigurationTab
             agent={agent}
             companyId={resolvedCompanyId ?? undefined}
@@ -1768,8 +1766,8 @@ export function AgentOverview({
           <div className="space-y-3">
             <SummaryRow label="Adapter"><span className="text-sm">{adapterLabels[agent.adapterType] ?? agent.adapterType}</span></SummaryRow>
             <SummaryRow label="Model"><span className="max-w-64 truncate text-sm font-mono">{configuredModel}</span></SummaryRow>
-            {/* Fork: Device and Claude account rows for a Claude agent. */}
-            <AgentClaudeAccountOverviewRows agent={agent} Row={SummaryRow} changeHref={agentDetailHref(agentRouteId, "runtime")} />
+            {/* Fork: Device and Claude account rows for a Claude agent; Change lands on the Claude account field. */}
+            <AgentClaudeAccountOverviewRows agent={agent} Row={SummaryRow} changeHref={`${agentDetailHref(agentRouteId, "runtime")}#${AGENT_CLAUDE_ACCOUNT_FIELD_ID}`} />
             <SummaryRow label="Session"><span className="max-w-64 truncate text-sm font-mono">{runtimeState?.sessionDisplayId ?? runtimeState?.sessionId ?? "No session"}</span></SummaryRow>
             <SummaryRow label="Last run">
               <span className="text-sm">{lastRun ? `${lastRun.status} · ${relativeTime(lastRun.createdAt)}` : "No runs"}</span>

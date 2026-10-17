@@ -9,7 +9,11 @@ import { ApiError } from "@/api/client";
 import {
   AI_ACCOUNT_INCOMPATIBLE_REASON_TEXT,
   AI_ACCOUNT_UNSELECTABLE_REASON_TEXT,
+  AI_CONNECTION_SELECT_VALUE,
+  CURRENT_AI_CONNECTION_OPTION_TEXT,
   DEVICE_LOGIN_NOT_PERMITTED_TEXT,
+  DEVICE_LOGIN_OPTION_TEXT,
+  accountSelectKey,
   accountSelectSelection,
   accountSelectValueFromBinding,
   aiAccountPoolErrorMessage,
@@ -246,6 +250,30 @@ describe("buildAccountSelectGroups", () => {
     expect(accountSelectValueFromBinding({ mode: "pool_account", account: null })).toEqual({ mode: "pool_account", accountId: null });
     expect(accountSelectValueFromBinding({ mode: null, account: null })).toBeNull();
   });
+
+  it("lists the agent's current AI connection first, only when given, and never as a PUT body", () => {
+    const groups = buildAccountSelectGroups({
+      options: [TEAM],
+      canBindAny: true,
+      includeDeviceLogin: true,
+      currentAiConnection: { label: "Responsible user's connection" },
+      now: NOW,
+    });
+    expect(groups.map((group) => group.label)).toEqual(["AI connection", "Device", "Claude accounts"]);
+    expect(groups[0].options[0]).toMatchObject({
+      value: AI_CONNECTION_SELECT_VALUE,
+      label: "Responsible user's connection",
+      disabled: false,
+      account: null,
+      description: CURRENT_AI_CONNECTION_OPTION_TEXT,
+    });
+    expect(groups[1].options[0]).toMatchObject({ label: "Device's own login", description: DEVICE_LOGIN_OPTION_TEXT });
+    expect(groups[2].options[0]).toMatchObject({ label: "Team Max", description: null });
+    expect(buildAccountSelectGroups({ options: [TEAM], canBindAny: true, currentAiConnection: null, now: NOW }).map((group) => group.id))
+      .toEqual(["other"]);
+    expect(accountSelectKey({ mode: "ai_connection" })).toBe(AI_CONNECTION_SELECT_VALUE);
+    expect(accountSelectSelection(AI_CONNECTION_SELECT_VALUE)).toBeNull();
+  });
 });
 
 describe("AccountSelect", () => {
@@ -346,6 +374,69 @@ describe("AccountSelect", () => {
     await open();
     flushSync(() => item("Team Max")?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
     expect(onChange).toHaveBeenCalledWith({ mode: "pool_account", accountId: "acct-team" });
+  });
+
+  it("selects the agent's current AI connection, and saves nothing when it is picked again", async () => {
+    const onChange = vi.fn();
+    render(
+      <AccountSelect
+        options={[TEAM]}
+        canBindAny
+        value={{ mode: "ai_connection" }}
+        currentAiConnection={{ label: "Responsible user's connection" }}
+        onChange={onChange}
+        includeDeviceLogin
+        disablePortal
+        now={NOW}
+      />,
+    );
+    expect(container.querySelector("button[role='combobox']")?.textContent).toBe("Responsible user's connection");
+    await open();
+    expect(item("Responsible user's connection")?.textContent).toContain(CURRENT_AI_CONNECTION_OPTION_TEXT);
+    expect(item("Responsible user's connection")?.querySelector("[data-account-option='ai-connection']")).not.toBeNull();
+    flushSync(() => item("Responsible user's connection")?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    expect(onChange).not.toHaveBeenCalled();
+
+    await open();
+    flushSync(() => item("Team Max")?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })));
+    expect(onChange).toHaveBeenCalledWith({ mode: "pool_account", accountId: "acct-team" });
+  });
+
+  it("wraps what a choice that is not an account means, and keeps an account's details on one line", async () => {
+    render(
+      <AccountSelect
+        options={[TEAM]}
+        canBindAny
+        value={{ mode: "ai_connection" }}
+        currentAiConnection={{ label: "Responsible user's connection" }}
+        onChange={vi.fn()}
+        includeDeviceLogin
+        disablePortal
+        now={NOW}
+      />,
+    );
+    await open();
+    const description = (choice: string) => container.querySelector(`[data-account-option='${choice}'] [data-account-option-description]`);
+    // Cut to one line, these would hide what the choice means (the popover is at most 32rem wide).
+    expect(description("ai-connection")?.textContent).toBe(CURRENT_AI_CONNECTION_OPTION_TEXT);
+    expect(description("ai-connection")?.classList.contains("truncate")).toBe(false);
+    expect(description("device-login")?.textContent).toBe(DEVICE_LOGIN_OPTION_TEXT);
+    expect(description("device-login")?.classList.contains("truncate")).toBe(false);
+    const meta = container.querySelector("[data-account-option='acct-team'] [data-account-option-meta]");
+    expect(meta?.textContent).toBe("Ada · Max · Subscription");
+    expect(meta?.classList.contains("truncate")).toBe(true);
+    expect(container.querySelector("[data-account-option='acct-team'] [data-account-option-description]")).toBeNull();
+  });
+
+  it("shows an active account's state in the trigger only when asked to", () => {
+    const props = { options: [TEAM], canBindAny: true, value: { mode: "pool_account" as const, accountId: "acct-team" }, onChange: vi.fn(), disablePortal: true, now: NOW };
+    render(<AccountSelect {...props} />);
+    const trigger = () => container.querySelector("button[role='combobox']");
+    expect(trigger()?.textContent).toBe("Team Max");
+    expect(trigger()?.querySelector("[data-account-state]")).toBeNull();
+
+    flushSync(() => root!.render(<AccountSelect {...props} showActiveState />));
+    expect(trigger()?.querySelector("[data-account-state='active']")?.textContent).toBe("Active");
   });
 
   describe("the device's own login (decision D4)", () => {
