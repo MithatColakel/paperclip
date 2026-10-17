@@ -79,13 +79,32 @@ keyed by user and announcement so they persist across companies. Their audit
 context must still validate company membership. The announcement publication-ID
 registry is instance-level feed metadata; it contains no company or user data.
 
-Explicit exception (fork): host AI account pools (`ai_account_hosts`,
-`ai_account_host_environments`, `ai_accounts`) are instance-level. A machine
-that runs agents serves every company's runs, so its Claude credentials and
-their usage limits belong to the machine, not to a company. Only instance
-admins read or change them; every change is logged in every company, and each
-run's use, limit and sign-in failure is logged in the run's own company. See
-`doc/connections/AI-CONNECTIONS.md` ("Host account pools").
+Explicit exception (fork): Claude pool accounts (`ai_accounts`) are
+instance-level rows owned by users. Only the owner sees an account's unmasked
+e-mail hint. Instance admins, and members of companies where the owner is an
+active member, see its label, owner name, masked e-mail, type and state. No API
+response, activity row, run event, log line, plugin message or command line
+carries its secret. An account is selectable only in companies where its owner
+is an active member; elsewhere it shows as an account that is no longer
+available, with no label, owner or e-mail. Instance admins may transfer an
+account to another existing user and may import the server's environment token
+into their own pool. Execution devices (`ai_account_hosts`,
+`ai_account_host_environments`) and the availability registry
+(`environment_availability`) are also instance-level, because one machine
+serves every company's runs. A device uses at most 3 distinct pool accounts,
+and only instance admins edit devices. The binding backfill's marker
+(`deferred_data_migrations`) is instance-level too; its report lists agents and
+accounts of every company, and only instance admins read it.
+
+Agent bindings, wait settings, wait episodes, notices and run slots are
+company-scoped. Their audit is company-scoped too, and nothing fans out to every
+company: a binding change is logged in the agent's company; an account change
+in every company where its owner is an active member (a transfer in the old and
+the new owner's companies), or, when the owner has none, in the companies whose
+agents use the account, without its label; a device change in the companies
+whose agents use the device; and a run's use, limit and sign-in failure in the
+run's own company. See
+[AI Connections](doc/connections/AI-CONNECTIONS.md#claude-account-pool-fork).
 
 2. Keep contracts synchronized.
 If you change schema/API behavior, update all impacted layers:
@@ -100,6 +119,11 @@ If you change schema/API behavior, update all impacted layers:
 - Approval gates for governed actions
 - Budget hard-stop auto-pause behavior
 - Activity logging for mutating actions
+- Fork: no account failover. Paperclip never moves a task to another account;
+  there is no failover, rotation or balancing between accounts. When an account
+  hits its limit, its tasks wait for the reset and start again on the same
+  account. See
+  [AI Connections](doc/connections/AI-CONNECTIONS.md#claude-account-pool-fork).
 
 4. Do not replace strategic docs wholesale unless asked.
 Prefer additive updates. Keep `doc/SPEC.md` and `doc/SPEC-implementation.md` aligned.

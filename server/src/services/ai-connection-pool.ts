@@ -28,7 +28,7 @@ export function isAiConnectionPoolExhausted(error: unknown): error is HttpError 
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_pool_exhausted";
 }
 
-/** Earliest time a pool account becomes usable again, carried on `ai_connection_pool_exhausted`. */
+/** When the agent's own pool account becomes usable again, carried on `ai_connection_pool_exhausted`. */
 export function aiConnectionPoolRetryAt(error: HttpError): Date | null {
   const value = (error.details as { retryAt?: unknown } | undefined)?.retryAt;
   const parsed = typeof value === "string" ? new Date(value) : null;
@@ -81,6 +81,8 @@ export type AiConnectionPoolMember = {
   grantId: string;
   priority: number;
   exhaustedUntil: Date | null;
+  /** Fork: who set `exhaustedUntil`; a `usage_probe` mark is from an older release and never holds a run (P7). */
+  quotaSource: AiConnectionQuotaSource | null;
   usageCheckedAt: Date | null;
   usageWindows: AiConnectionPoolUsageWindow[];
 };
@@ -104,6 +106,7 @@ export function aiConnectionPoolService(db: Db) {
       grantId: member.grantId,
       priority: member.priority,
       exhaustedUntil: state?.exhaustedUntil ?? null,
+      quotaSource: state?.source ?? null,
       usageCheckedAt: state?.usageCheckedAt ?? null,
       usageWindows: state?.usageWindows ?? [],
     }));
@@ -125,6 +128,7 @@ export function aiConnectionPoolService(db: Db) {
     runId?: string | null;
   }) {
     // A later limit always wins so a short estimate never shortens a known reset.
+    // Fork: a mark of the retired usage probe is no limit, so it never extends one (P7).
     const until = sql`${input.until.toISOString()}::timestamptz`;
     await db
       .insert(aiConnectionQuotaStates)
@@ -139,7 +143,7 @@ export function aiConnectionPoolService(db: Db) {
       .onConflictDoUpdate({
         target: [aiConnectionQuotaStates.companyId, aiConnectionQuotaStates.connectionId],
         set: {
-          exhaustedUntil: sql`greatest(coalesce(${aiConnectionQuotaStates.exhaustedUntil}, ${until}), ${until})`,
+          exhaustedUntil: sql`case when ${aiConnectionQuotaStates.source} = 'usage_probe' then ${until} else greatest(coalesce(${aiConnectionQuotaStates.exhaustedUntil}, ${until}), ${until}) end`,
           reason: input.reason,
           source: input.source,
           lastRunId: input.runId ?? null,

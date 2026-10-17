@@ -43,8 +43,10 @@ and caller-supplied validation URLs are rejected.
   New configuration offers personal defaults or shared accounts.
 
 - `company_pool`: use the company's ordered pool of company-shared accounts
-  for the provider (see "Company account pool" below). `method` is a wire
-  hint only; any method in the pool may serve the run.
+  for the provider (see [Company account pool](#company-account-pool-deprecated)
+  below). `method` is a wire hint only; any method in the pool may serve the
+  run. Deprecated (fork): new or changed `company_pool` bindings are refused,
+  and an existing one stays on the member it used last.
 
 “Which humans can use this credential?” is the sole permission for whose work
 can use the account. “Just me” means the personal owner; shared accounts allow
@@ -78,78 +80,1001 @@ there): a company-shared account installed only for that agent and selected for
 it with an explicit `shared` binding. It changes no one's default; **My account**
 keeps the personal-default path above.
 
-## Company account pool
+## Company account pool (deprecated)
+
+> **Deprecated (fork).** The company account pool takes no new agents. Claude
+> agents use the [Claude account pool](#claude-account-pool-fork) instead. The
+> `/:company/apps` card titled "Claude account pool" is this company pool; the
+> new pool lives in Company settings → Claude accounts.
+>
+> - **Refused.** A new or changed `company_pool` binding returns 422
+>   `ai_connection_company_pool_retired`, for every adapter. An agent-made hire
+>   that names no connection and would inherit its hiring agent's
+>   `company_pool` binding gets the responsible user's own connection instead
+>   (see [Bindings](#bindings)).
+> - **Still works during this release.** An agent that keeps its current
+>   `company_pool` binding on the same adapter keeps running, and it can still
+>   be renamed, reconfigured and pinned. It stays on the member it used last
+>   (the first member by priority when it has used none, or when that member
+>   left the pool) and waits for that member's reset. The pool never moves a
+>   task to another member, and it no longer reads usage to skip one. The
+>   tables and the pool routes stay; the order now only picks the member of an
+>   agent that has used none.
+> - **Moved by the backfill.** The one-time binding backfill binds a
+>   `company_pool` agent to the pool account that holds the same credential as
+>   its member (the one it used last in the last 45 days, else the pool's first
+>   member), when such an account exists and passes the binding checks (see
+>   [Binding backfill](#binding-backfill)).
 
 A company orders its company-shared accounts for a provider in
-`ai_connection_pool_members` (`/:company/apps` → Claude account pool). Only that
-company's own shared accounts can join; composite foreign keys keep every member
-inside its company, and a run never reaches another company's account.
+`ai_connection_pool_members` (`/:company/apps` → the company pool card, still
+titled "Claude account pool"). Only that company's own shared accounts can
+join; composite foreign keys keep every member inside its company, and a run
+never reaches another company's account.
 
-Selection walks the pool in order and applies the same checks as a `shared`
-selection to each account (health, grant status, human audience, agent access).
-An account that fails a check is skipped. Per-account usage state lives in
+Selection takes the member the agent used last, otherwise (no member used yet,
+or that member left the pool) the first member by priority, and applies the same
+checks as a `shared` selection (health, grant status, human audience, agent
+access). A pinned member that fails a check fails the run
+(`configuration_incomplete`, with the check's error); the pool never moves on
+to another member. Before this fork release it walked the pool in order and
+skipped an account that failed a check. Per-account usage state lives in
 `ai_connection_quota_states`:
 
-- **Limit after a failure.** A `company_pool` run that ends with
-  `provider_quota` marks its account limited until the provider's reset time,
-  or for 60 minutes when the provider gives none. A later reset always wins
-  over a shorter one. The run is retried at once with reason
-  `ai_connection_failover`; runtime preparation then picks the next available
-  account. The hand-off does not consume the bounded failure-retry allowance
-  and is capped at twice the pool size per task.
-- **Limit before a run.** For a Claude subscription, selection reads the
-  account's usage (`api/oauth/usage`) at most once per 5 minutes. When the
-  session window, the weekly window, or the weekly window for the agent's model
-  family is at or above 95%, the account is skipped until that window resets.
-  An unreadable usage never blocks the account; API keys are not probed.
-- **Every account limited.** Preparation raises `ai_connection_pool_exhausted`
-  with the earliest reset. The run is deferred through the existing
+- **Limit after a failure.** A `company_pool` run whose CLI output reports
+  `provider_quota` marks its account limited until the provider's reset time
+  (at most 7 days and 1 hour ahead), or for 60 minutes when the provider gives
+  none. A later reset always wins over a shorter one. The task then waits in
+  the `ai_connection_pool_wait` lane until that reset, plus up to 2 minutes of
+  jitter, and runs on the same account again. The `ai_connection_failover`
+  hand-off to the next account is gone.
+- **Limit before a run.** Removed. Selection no longer reads the account's
+  usage (`api/oauth/usage`), and no usage level skips an account.
+- **Pinned member limited.** Preparation raises `ai_connection_pool_exhausted`
+  with that member's reset. The run is deferred through the existing
   `ai_connection_busy` wait until then; it does not need a reconnect.
 
-A different account is a different credential identity, so the retry starts a
-fresh provider session. Board users with `tools:manage_connections` reorder the
-pool and clear a recorded limit; both write activity (`ai_connection.pool_updated`,
+Board users with `tools:manage_connections` reorder the pool and clear a
+recorded limit; both write activity (`ai_connection.pool_updated`,
 `ai_connection.pool_limit_cleared`). The heartbeat records
 `ai_connection.pool_limit_reached`. Run detail shows the pool position that
 served the run.
 
-## Host account pools (fork)
+## Host account pools (fork, deprecated)
+
+> **Deprecated (fork).** The [Claude account pool](#claude-account-pool-fork)
+> replaces host pools: accounts belong to users, each agent is bound to one
+> account, and hosts become [execution devices](#devices-and-ownership).
+>
+> - **Still works during this release.** Instance admins list hosts
+>   (`GET /api/instance/ai-hosts`), add, rename and remove them, and edit their
+>   environment mappings (`PUT /api/instance/ai-hosts/:hostId/environments`),
+>   in Instance settings → Devices & Claude accounts. A mapping edit that would
+>   put a device over its account limit, or a cap below the accounts bound to
+>   the device, returns 409. Host changes are logged only in the companies whose
+>   agents use the device. Existing host accounts are pool accounts owned by
+>   their creator; an account that was "Not in pool" is now "Paused by owner",
+>   and its owner can resume it. An account without a recorded creator has no
+>   owner and is not eligible anywhere until an instance admin transfers it or
+>   deletes it. `PATCH`, `POST …/clear-limit` and
+>   `DELETE /api/instance/ai-accounts/:id` are served by the account pool's
+>   instance routes. `PATCH` takes only `{adminDisabled, reason, ownerUserId}`
+>   (the old fields are refused), and `DELETE` answers 409 `ai_account_in_use`
+>   while agents use the account, unless `?release=true`. `host_pool` runs
+>   still running at deploy count toward their device's limit until they
+>   finish.
+> - **Removed.** Automatic selection, balancing and failover. An agent without a
+>   binding never receives a pool token; the one-time
+>   [binding backfill](#binding-backfill) bound the agents that used a host
+>   pool.
+> - **410.** `POST /api/instance/ai-hosts/:hostId/accounts` and
+>   `PUT /api/instance/ai-accounts/:id/projects` return 410 with code
+>   `ai_account_route_moved`, naming the routes that replace them. Accounts are
+>   added with `POST /api/me/ai-accounts`, and only an account's owner clears its
+>   project reservation.
 
 A host is a machine that runs agents: the Paperclip server (the single Local
-environment), a runner server (its SSH environments), or a Mac reached over SSH.
-Instance admins manage hosts in Instance settings → Claude accounts
-(`/api/instance/ai-hosts`). Each host holds at most three credentials, and a
-credential (by fingerprint) or an account email lives on one host only.
+environment), a runner server (its SSH environments), or another computer
+reached over SSH. Each host held at most three credentials, and a credential
+(by fingerprint) or an account email lived on one host only. The rules below
+describe host pools before this release.
 
-- **Who uses it.** Every `claude_local` run without an explicit
-  `runtimeConfig.aiConnection` whose environment is mapped to a host with at least
-  one pool-enabled account. An explicit binding still wins. Mac Fleet sandboxes are
-  not covered: the Mac agent replaces any token Paperclip sends with its own login.
+- **Who used it.** Every `claude_local` run without an explicit
+  `runtimeConfig.aiConnection` whose environment was mapped to a host with at
+  least one pool-enabled account. An explicit binding still won. Sandbox
+  environments of environment driver plugins were not covered.
 - **Credential types.** A subscription token from `claude setup-token`
   (delivered as `CLAUDE_CODE_OAUTH_TOKEN`) or a Claude Console API key (delivered as
   `ANTHROPIC_API_KEY`). The run's other auth variables are blanked, and every env
   layer's own auth variables are stripped, so an environment's old token cannot
-  leak in. No `HOME` or `CLAUDE_CONFIG_DIR` rewrite happens, so SSH runs work.
-- **Balanced selection.** Among active, pool-enabled accounts whose limit has
-  passed, the run takes the one serving the fewest running host-pool runs, then the
-  least recently picked. Selection holds a row lock on the host.
-- **Usage limits.** A host-pool run that ends with `provider_quota` rests its
-  account until the provider's reset (60 minutes without one; 24 hours for an API key
-  whose credit balance ran out) and retries at once with reason
-  `ai_connection_failover`, capped at twice the host's account count. When every
-  account rests, the run waits for the earliest reset through the `ai_connection_busy`
-  deferral. A sign-in failure marks the account `auth_failed` and moves the task to
-  another account; an admin sets it active again after fixing it.
-- **Attribution and audit.** `contextSnapshot.aiConnection` records `mode:
-  "host_pool"`, the account and the host; the run log shows which account served the
-  run. `ai_account.limit_reached` and `ai_account.auth_failed` are logged in the run's
-  company; host and account changes are logged in every company.
-- **Imports.** An admin can add the server's own `CLAUDE_CODE_OAUTH_TOKEN` or their
-  own personal Claude connection from any company without the value reaching the
-  browser.
-- **Terms.** Anthropic's documentation allows API keys managed by the customer for
-  its own authorized users, and describes subscription sign-in (OAuth) as intended
-  for the purchaser's ordinary use. Prefer API keys on shared hosts.
+  leak in. Pool accounts keep both types and this stripping; sandbox and SSH pool
+  runs now also get a [per-account config directory](#ssh-secret-staging-and-the-per-account-config-directory).
+- **Balanced selection.** Removed. Among active, pool-enabled accounts whose limit
+  had passed, the run took the one serving the fewest running host-pool runs, then
+  the least recently picked.
+- **Usage limits.** Removed. A host-pool run that ended with `provider_quota`
+  rested its account and retried at once on another account with reason
+  `ai_connection_failover`, and a sign-in failure moved the task to another
+  account. A limit or a sign-in failure now makes the task
+  [wait](#waiting-states) for the same account.
+- **Attribution and audit.** `contextSnapshot.aiConnection` recorded `mode:
+  "host_pool"`, the account and the host; older runs keep it, and new runs record
+  `mode: "pool_account"`. Host and account changes were logged in every company.
+- **Imports.** An admin could add the server's own `CLAUDE_CODE_OAUTH_TOKEN` or
+  their own personal Claude connection without the value reaching the browser.
+  Both imports now create an account in the caller's own pool
+  (`POST /api/me/ai-accounts`); the server token is for instance admins only.
+
+## Claude account pool (fork)
+
+Claude agents (`claude_local`) can run with an account from the Claude account
+pool. Each pool account belongs to one user. The owner adds it once and can use
+it in every company where they are an active member. The owner or a company
+admin binds it to an agent, and the agent's runs then use it on whatever device
+they run on. Pool accounts, execution devices and the availability registry are
+instance-level; bindings, waits, notices and their audit are company-scoped
+(see the fork exception to core rule 1 in [AGENTS.md](../../AGENTS.md)).
+
+**Product rule.** Paperclip never moves a task to another account. There is no
+failover, rotation or balancing between accounts, and a usage check never picks
+an account. When an account hits its limit, its tasks wait for the reset, start
+again automatically on the same account, and the task's manager agent and the
+board get a notice at once. A task that waits for its device is never moved to
+another device either; the notice tells people how to move the agent
+themselves.
+
+Pages:
+
+- **Company settings → Claude accounts** (every member): "My Claude accounts",
+  the accounts "Available in <company>", and "Agent assignments" with a picker
+  per agent and a "Review migrated assignments" banner.
+- **Company settings → Devices**: the devices that run the company's agents,
+  their availability, accounts in use and waits, plus "Waiting notifications"
+  for company admins.
+- **Instance settings → Devices & Claude accounts** (instance admins): every
+  device and account, the migration report, and the legacy host pool section.
+- The agent page has a Claude account card; a waiting task shows a banner.
+
+### Accounts
+
+- **Credential.** One encrypted credential per account: a subscription token
+  from `claude setup-token` (delivered as `CLAUDE_CODE_OAUTH_TOKEN`) or a Claude
+  Console API key (delivered as `ANTHROPIC_API_KEY`). It is stored with
+  `local_encrypted` and decrypted only after the run has its device slot. No API
+  response, activity row, run event, log line, plugin message or command line
+  carries it; only the run environment delivered to the target does.
+- **Adding.** `POST /api/me/ai-accounts` takes a pasted value, the caller's own
+  saved Claude connection (`importFrom: {kind: "ai_connection", companyId,
+  connectionId}`; never another member's or a shared one), or the server's
+  environment token for the account's type (`importFrom: {kind: "server_env"}`,
+  instance admins only; 403 otherwise). Imported values never reach the browser.
+  The caller owns the new account in every case. The owner must be an active
+  member of at least one company (422 otherwise), so the creation is always
+  audited. A credential that is already in the pool, or an e-mail hint the owner
+  already uses, returns a generic 409 `ai_account_duplicate` that names no other
+  owner.
+- **Owner actions** on `/api/me/ai-accounts/:id` (others get 404): edit the label,
+  e-mail hint and plan; pause (`status: "disabled"`) or resume; clear the project
+  reservation (`clearProjectRestriction: true`); replace the token
+  (`PUT …/credential`, same type); clear a limit (`POST …/clear-limit`); remove
+  (`DELETE`). A new token or a cleared limit also clears the strikes, the probe
+  claim and an unconfirmed sign-in failure, and wakes the account's waits. A
+  signed-out account cannot be paused (422): replace its token or remove it.
+  Removing an account that agents use returns 409 `ai_account_in_use`; with
+  `?release=true` those agents keep a binding without an account and wait as
+  `unassigned`.
+- **States**, in precedence order: "Disabled by admin", "Paused by owner",
+  "Signed out", "Limited until …", active. Only an instance admin clears the
+  admin flag, and only the owner resumes an account they paused.
+  `pool_enabled` is kept in step with these states for older images.
+- **Visibility.** `GET /api/me/ai-accounts` lists the caller's own accounts;
+  `usedBy` names only the caller's companies and counts the rest. Agent keys get
+  403. Label, owner name, masked e-mail, type and state are visible to the owner,
+  to instance admins and to members of companies where the owner is an active
+  member. Elsewhere the account shows as "an account that is no longer available
+  in this company", with no label, owner or e-mail.
+- **Instance admins** (`/api/instance/ai-accounts`) list every account, masked,
+  including legacy and ownerless ones. They disable or re-enable an account
+  (`PATCH {adminDisabled, reason}`), clear a limit, delete one (same `release`
+  rule) and transfer it to another existing user (`PATCH {ownerUserId}`): 422
+  `ai_account_owner_unknown` for an unknown user, 409 `ai_account_duplicate`
+  when the new owner already has that e-mail hint. A transfer keeps the account's
+  limit state and wakes its waits. Bindings in companies where the new owner is
+  not a member then wait with `owner_not_member`.
+- **Project reservations** from the host pool (`ai_account_projects`) stay as a
+  company restriction: the account is usable only in companies that own one of
+  the reserved projects, until its owner clears the reservation.
+- **Audit.** Account entries (`ai_account.created`, `updated`,
+  `credential_replaced`, `limit_cleared`, `deleted`, `admin_disabled`,
+  `admin_enabled`) go to every company where the owner is an active member.
+  `ai_account.owner_changed` goes to the companies of the old and the new
+  owner, without naming the new owner where they are not a member. An account
+  whose owner has no active company logs instead in the companies whose agents
+  use it, without its label. No other company gets an entry. The run path logs
+  `ai_account.limit_reached` (once per limit) and `ai_account.signed_out` in
+  the run's company.
+
+### Bindings
+
+An agent's binding (`ai_account_agent_bindings`) is read at every run start, so
+a change applies from the next run; a running run is never touched. Only
+`claude_local` agents take a binding. Hires never inherit one, and bindings are
+never exported or imported.
+
+| Binding | The agent's runs use |
+| --- | --- |
+| No row | The upstream `runtimeConfig.aiConnection`, otherwise the device's own login. An unbound agent never receives a pool token. |
+| `device_login` | The device's own login. It also overrides an upstream `aiConnection`. |
+| `pool_account` with an account | That account, on any device the agent runs on. |
+| `pool_account` without an account | No credential: runs wait as `unassigned` until an account is bound. They never fall back to the device's login. |
+
+Routes:
+
+- `GET /api/companies/:companyId/ai-accounts[?agentId=]`: the accounts eligible
+  in the company, with `canBind` per account; with `agentId` also `selectable`,
+  `reason` and `warning`.
+- `GET /api/companies/:companyId/ai-account-bindings`: every Claude agent and its
+  binding. An agent moved off `claude_local` that still has a row is listed with
+  `supported: false`. That row still holds a device slot, and removing it is
+  always allowed.
+- `GET /api/agents/:agentId/ai-account`: the binding with its candidate devices
+  and options. Company members may read it, and an agent its own.
+- `PUT /api/agents/:agentId/ai-account` with `{mode: "pool_account", accountId}`
+  or `{mode: "device_login"}`, and `DELETE` to remove the row. A change answers
+  with `appliesFrom: "next_run"`, the ids of running runs and any warnings, and
+  wakes the agent's waits.
+- `POST /api/agents/:agentId/ai-account/review`: a company admin confirms a
+  migrated binding.
+
+The two company lists are for board users; agent keys get 403.
+
+**Audit.** Binding changes are logged in the agent's company as
+`ai_account.binding_updated`, `ai_account.binding_cleared` (`DELETE`) and
+`ai_account.binding_reviewed` (review). The boot backfill logs
+`ai_account.binding_updated` as the system actor `ai-account-migration` (a
+re-run, as the instance admin who started it), and an account removed with
+`release` logs it for each released agent with reason `account_removed`.
+
+**Who may bind.**
+
+| Actor | May |
+| --- | --- |
+| An agent | Nothing: 403 `ai_account_binding_forbidden`, also through an environment change. |
+| A company admin | Any change in the company: bind any eligible account, set `device_login`, remove the row. A company admin is the `local_trusted` board, a member with role owner or admin, or an instance admin with access to the company. |
+| The account's owner (an active, non-viewer member) | Bind their own account while the agent is unbound, on `device_login`, on one of the owner's accounts, or in pool mode without an account. Set `device_login` or remove the row only while the agent is on one of the owner's accounts. |
+| Anyone else | Read only. |
+
+An instance admin who is not a member of the company gets 403 for binding
+writes and for the company account and binding lists, and 404 for an agent's
+binding.
+
+**Eligibility.** An account is eligible in a company when its effective owner
+(the owner, else the creator) has an active `user` membership there (in
+`local_trusted` the local board counts as a member), it is neither paused nor
+disabled by an admin, and any project reservation names a project of that
+company. Listing, binding and every run start apply the same rule. When the
+owner leaves the company, runs wait with `owner_not_member`. A signed-out
+account cannot be chosen as a new selection; a limited one can, with a warning.
+
+**The device limit.** A device uses at most 3 distinct pool accounts (its cap
+is `min(maxAccounts, 3)`; instance admins may lower it). A binding is checked in
+one transaction under an advisory lock:
+
+1. who may bind (above), and that the agent is a `claude_local` agent;
+2. eligibility;
+3. the candidate environments: a pinned agent's environment, otherwise the
+   inheritable defaults of the company's projects plus the company, instance and
+   Local fallbacks;
+4. each candidate maps to a device (otherwise 422 `ai_account_incompatible`,
+   reason `device_unknown`) and accepts the account's credential type (reason
+   `credential_type_unsupported`);
+5. the cap: the distinct accounts bound to agents of any company whose
+   candidate devices include the device, paused agents included. Over the cap:
+   409 `device_account_limit` with `{deviceName, limit, inUse, accounts,
+   otherCompaniesAccounts}`. `accounts` names only accounts eligible in the
+   caller's company; other companies' accounts are a count.
+
+Other refusals: 422 `ai_account_not_eligible` (a missing account and an account
+that is not eligible here give the same answer; only `reserved_elsewhere` is
+named), and 422 `ai_account_incompatible` with `adapter_unsupported`,
+`account_signed_out` or `account_disabled`. At run time a slot table counts the
+accounts running on the device, and an extra account waits for a free slot
+(`device_slot_wait`).
+
+An unpinned agent is checked against every candidate environment. One project
+default without a device therefore refuses its bindings with `device_unknown`.
+Pinning the agent to an environment fixes it.
+
+**Moving a pool-bound agent.** A change of `defaultEnvironmentId` on a
+pool-bound agent (`PATCH /api/agents/:id`, a revision rollback or a hire
+approval) needs the account's owner or a company admin; agents get 403. The move
+runs the binding checks for the new candidates under the bindings lock and is
+saved in the same transaction; its config revision still records the
+environment change. It can fail with 409 `placement_conflict` (the agent changed
+meanwhile) or `device_account_limit`, or with 422 `ai_account_incompatible`
+(`device_unknown`, `credential_type_unsupported`). An approval that moves a
+pending hire holding a pool account writes the environment under the lock
+before activation; other hires take their environment at activation, as
+upstream does. Project, company and instance default-environment edits are never
+refused for the cap; the devices are re-checked afterwards (see
+[Over the limit](#over-the-limit)).
+
+**Retired connection modes.** New or changed `company_pool` bindings are
+refused for every adapter (422 `ai_connection_company_pool_retired`). A `router`
+binding is refused for a `claude_local` agent (422
+`ai_connection_router_unsupported`), because a router switches accounts by
+itself. The checks cover agent create, update and hire, and a hire that would
+inherit a router for a Claude agent. An existing agent that keeps its current
+`company_pool` or router binding on the same adapter can still be renamed,
+reconfigured and pinned. An agent-made hire that names no connection and would
+inherit its hiring agent's `company_pool` binding gets the responsible user's
+own connection (`responsible_user`, same provider and method); give it a Claude
+account afterwards.
+
+#### Binding backfill
+
+Once, at boot, after the migrations and before the scheduler starts, a job binds
+the agents that used a host pool or a company pool. Its marker is
+`ai-account-bindings-v1` in `deferred_data_migrations`. A failure is logged and
+recorded on the marker; boot continues, and the next boot tries again.
+
+- **Candidates.** Non-terminated `claude_local` agents without a binding row
+  that either have no `aiConnection` and have host-pool history (or run on a
+  device with a usable legacy account), or have a `company_pool` binding. History
+  means project- or shared-scoped host-pool runs in the last 45 days; overflow
+  runs are ignored. Agents are processed by company, then creation time, then
+  id.
+- **Account choice**, first rule that applies:
+  1. the agent's projects (from its runs in the last 45 days) map to exactly one
+     reserved account;
+  2. the account with the most history runs of this agent;
+  3. the account with the most history runs of the agent's company on the
+     agent's devices;
+  4. none: the agent stays unbound, with a review note.
+
+  A `company_pool` agent gets the pool account that holds the same credential
+  (by fingerprint) as its member: the one it used last in the last 45 days,
+  else the pool's first member by priority.
+- **Checks.** Every choice passes the binding checks for a system actor: the
+  owner's membership, reservations, an active account that no admin disabled, a
+  device for every candidate environment (Local maps to the server device), the
+  credential type, and the cap in processing order. A chosen account that fails
+  a check never falls through to the next rule.
+- **Outcomes.**
+  - *Bound*: source `migrated_host_pool` or `migrated_company_pool`, with a note
+    that names the rule. The row shows "review" until a company admin confirms
+    it.
+  - *Unassigned*: a binding without an account and the reason in the note, for
+    agents over a cap and for agents with history whose account fails another
+    check. They wait as `unassigned`, with a notice, instead of falling back to
+    the device's login.
+  - *Unbound*: agents without a choice, agents without history that fail a
+    check, and `company_pool` agents that fail a check (they keep their pinned
+    pool) stay as they are and are listed.
+
+  `runtime_config` is never rewritten. `ai_account_projects`,
+  `ai_connection_pool_members` and `ai_connection_quota_states` are not touched.
+
+**Report and go/no-go.** `GET /api/instance/ai-accounts/migration` (instance
+admins) returns the job's status and summary: bound agents, skips with reasons,
+agents left unassigned or unbound with a review note, and devices over their
+cap. Before the first run its status is `pending`. It also computes a go/no-go
+list on every request. `POST /api/instance/ai-accounts/migration/run` runs the
+job again and only adds missing bindings; it answers 200 with the report even
+when the run failed (`status: "failed"`, `lastError`). The instance page shows
+both, with "Run now" or "Run again".
+
+Go means every `claude_local` agent with a host-pool run in the last 7 days
+plans to use its account. An agent whose runs would fall back to the device's
+own login is listed as "would use its device's own login: <why>" and blocks go.
+Agents without a binding row that use their own AI connection are left out,
+because their runs never fall back to the device's login.
+
+Before an upgrade, run the read-only report against the database:
+
+```sh
+psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f scripts/ai-account-pool-report.sql
+```
+
+It works on the schema before and after the upgrade. To rehearse, restore a
+snapshot into a scratch database and boot the new image on it with the
+heartbeat scheduler off (`HEARTBEAT_SCHEDULER_ENABLED=false`), on a host that
+cannot reach your devices or outside services, because a wake can still start
+a run; the migrations and the binding backfill still run at boot. Then read the
+migration report. Fixes made on the copy do not carry over: make them on the
+current image before the deploy, or right after boot (see the
+[Upgrade Guide](../../releases/fork-claude-account-pool.md#upgrade-guide)).
+
+### Pool runs
+
+At run start the binding decides the credential, in this order:
+
+1. a persisted router selection keeps its upstream behaviour, but only while
+   that same persisted run resumes;
+2. the fork binding row of a `claude_local` agent: `pool_account` takes the pool
+   path, `device_login` takes neither the pool nor an upstream binding;
+3. the upstream `runtimeConfig.aiConnection`, including a pinned legacy
+   `company_pool`;
+4. the device's own login.
+
+The pool path then checks the account again (the eligibility rule, the device,
+the credential type and the limit) and takes a slot on the device: the device
+row is locked, the accounts running there are counted, and an account that is
+not yet running there waits when the device is full. A suspended (persisted)
+native run keeps the credential it started with; it never waits and never
+switches. If its pool account is no longer usable in the run's company
+(removed, paused, disabled, signed out, or its owner left), the run is refused
+with `ai_connection_changed`.
+
+A pool run:
+
+- strips the AI auth variables of the environment, agent, project and routine
+  layers, blanks `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+  `CLAUDE_CODE_OAUTH_TOKEN`, and sets the account's own variable;
+- deletes, never blanks, the credential carriers `CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+  `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_SESSION_ACCESS_TOKEN`,
+  `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_HOST_CREDS_FILE`,
+  `CLAUDE_CODE_HOST_AUTH_ENV_VAR`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` and
+  `ANTHROPIC_UNIX_SOCKET` (an empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` would
+  select the device user's own stored login);
+- sets the non-secret marker `PAPERCLIP_AI_CREDENTIAL_REF` (see
+  [the per-account config directory](#ssh-secret-staging-and-the-per-account-config-directory));
+- records `contextSnapshot.aiConnection` with `mode: "pool_account"`, the
+  account, its owner and the device, and logs the run event `Using Claude
+  account "<label>" (subscription | API key) on <device>`. The token is
+  redacted like other secrets. The token's value is part of the session
+  fingerprint (the `PAPERCLIP_*` marker is not), so another account, or a
+  replaced token, starts a fresh provider session.
+
+**Routing guard.** A pool run is refused (`ai_connection_incompatible`) when its
+environment, agent, project or routine layer sets a routing override: a key
+ending in `_BASE_URL` under `ANTHROPIC_` or `CLAUDE_CODE_`, any
+`CLAUDE_CODE_USE_*` switch, `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` in any
+case, `NODE_EXTRA_CA_CERTS` or `NODE_TLS_REJECT_UNAUTHORIZED`. It is also refused
+when the project's `.claude/settings.json` or `.claude/settings.local.json` sets
+such a key or a credential carrier in its `env` block, or sets `apiKeyHelper`,
+`awsAuthRefresh` or `awsCredentialExport`. A remote target's project settings are
+scanned on the target. A network that needs a proxy cannot run pool agents yet.
+The blocked task gets the notice "AI account blocked by a conflicting setting",
+which names the setting to remove.
+
+**Limits.** Only the CLI's own result and error output (stderr) can mark an
+account. A limit message found only in tool output or the transcript is a
+transient failure of that run, and the account is unchanged. When both a limit
+and a sign-in failure show, the limit wins.
+
+- A typed reset is clamped to 7 days and 1 hour ahead (24 hours for an exhausted
+  credit balance); a clamped value counts as estimated. Without a typed reset, a
+  credit balance waits 24 hours, and other limits wait 1 hour, doubling with each
+  limit in a row (1, 2, 4, 8, then every 12 hours). A provider reset replaces an
+  estimate; between two values of the same kind the later one stays.
+- Each run that hits the limit makes its task wait in `ai_account_wait`
+  (`usage_limit` or `credit_balance`) until the reset plus up to 2 minutes of
+  jitter. `ai_account.limit_reached` is logged once per limit episode.
+- A run that the provider then serves on the account clears the limit and wakes
+  the other waits, staggered.
+
+**Sign-in failures.** A typed 401 or 403, or a second sign-in failure on another
+run within 2 hours, marks the account signed out (`ai_account.signed_out`). Its
+runs then wait as `signed_out` until the owner replaces the token. A first
+untyped sign-in failure only makes that run wait 10 minutes as
+`auth_unconfirmed`; the account is unchanged.
+
+### Devices and ownership
+
+An execution device (`ai_account_hosts`) is one machine. Environments reach it,
+and several environments may reach the same device. Its kind is "Paperclip
+server", "SSH host", "Computer over SSH" (a legacy host kind) or "Plugin
+device" (a target an environment driver plugin reported).
+
+**Identity.** The device of an environment is, in order:
+
+1. an explicit mapping in `ai_account_host_environments`;
+2. for Local, the Paperclip server device (key `local`), a pool device like any
+   other;
+3. for SSH, the device keyed `ssh:<host>:<port>` (host trimmed and lower-cased,
+   port 22 when unset), created on first use and named `SSH · <environment
+   name>`. The host and port appear only in the key and in instance-admin views;
+4. for a sandbox, the plugin device of the same provider whose `configMatch`
+   fields the environment's config contains, managed by the plugin that
+   provides that sandbox;
+5. otherwise none. Pool bindings to such an environment are refused, and pool
+   runs on it wait as `device_unknown`.
+
+Device names stay unique with a ` (n)` suffix. Migration `0310` set the keys of
+existing hosts whose mapped environments agree on one host and port (and `local`
+for the server host), so a new SSH environment on a known machine joins its
+device. Hosts it could not key are listed by the pre-deploy report.
+
+**Ownership is for display only.** A plugin may report a device's owner, and the
+device pages show the owner's name or e-mail. Ownership never decides which runs
+a device takes: any eligible pool account may run on any device, owned or not.
+The plugin decides which companies and projects its devices serve. A report that
+names an unknown user leaves the device unowned. Paperclip server and SSH devices
+have no owner.
+
+**Visibility.** A company sees a device when its agents' candidate environments
+map to it, or when the plugin lists the company among those the device serves.
+Other companies' accounts on it appear only as a count. Routes:
+`GET /api/companies/:companyId/devices` and `…/devices/:deviceId` (company access;
+404 for a device the company cannot see), and `GET /api/instance/devices` for
+instance admins (keys, environments, owner, cap, over-limit state, duplicate
+hints, and accounts with labels). Instance admins rename a device and set its
+cap with `PATCH /api/instance/devices/:id {name, maxAccounts}`; a cap below the
+bound accounts returns 409.
+
+**Mappings.** An explicit mapping is edited in Devices & Claude accounts → the
+device card → Map environments (`PUT /api/instance/ai-hosts/:hostId/environments`).
+Allowed drivers per kind: Paperclip server, local; SSH host, ssh; Computer over
+SSH, ssh or sandbox; Plugin device, sandbox. An edit that would put a device over
+its cap returns 409. A mapping only places an environment for the cap; its
+leases and availability still follow the target in its config.
+
+**Linking duplicates.** One machine reached two ways, for example over an SSH
+tunnel and as a plugin target, would be two devices with two caps. An instance
+admin links them with `POST /api/instance/devices/:id/link-target {pluginId,
+provider, targetKey}`. It writes the plugin target onto an existing SSH host or
+Computer over SSH device, so later reports update that row, and it merges the
+separate plugin device into it: run slots, mappings and open waits move, then
+the plugin device is deleted. Only SSH host and Computer over SSH devices take a
+link; other kinds get 409. The route answers 404 for an unknown device, or a
+plugin that is not installed or does not provide the provider, and 409 when more
+than one installed plugin provides it, the device is already linked to another
+target, or the target is linked to another device. Linking is never refused for
+the cap; an over-cap result sets the over-limit flag.
+
+A plugin device that is likely the same machine as an SSH device, because a
+hostname it reports matches the SSH key's host or its label equals an SSH
+environment's name, shows "Likely the same machine as <device>". Instance admins
+can link it from that hint, on the instance page or on the company Devices page.
+
+**Reinstalled plugins.** A target is identified by its provider and the plugin's
+own target key. A reinstalled plugin (with a new plugin id) takes over the
+devices of its uninstalled predecessor on its first report or link, with their
+names, mappings, slots and links. A device of a plugin that is still installed is
+never taken over. Until that first report its environments plan as
+`device_unknown`.
+
+#### Over the limit
+
+Some changes cannot be refused at once: project, company and instance
+default-environment edits, plugin target reports and environments a plugin
+creates. They can leave a device with more bound accounts than its cap. After
+such a change the devices are re-checked. A device over its cap gets
+`over_limit_at` and shows "Over limit", and its runs wait for a device slot.
+Each company whose agents count toward it gets one `execution_device.over_limit`
+activity entry (actor: system `ai-account-pool`; details `{deviceName, limit,
+inUse}`) and an inbox item that stays while the flag does. The entry is written
+when the flag is set, never when it clears. A device that fits again, for
+example after a binding is cleared, loses the flag, so a later overflow is
+noticed again. A link that leaves a device over its cap sets the same flag,
+with the same entry and inbox item.
+
+Device edits (`execution_device.updated`), removals (`execution_device.deleted`)
+and links (`execution_device.linked`) are logged only in the companies whose
+agents use the device. Adding a host logs nothing, because no agent uses it
+before an environment is mapped to it.
+
+### Waiting states
+
+A run whose device, account or device slot is not available does not fail. It
+ends as a deferral, and a waiting run takes its place:
+
+- **The deferral** is the run, cancelled before any provider work. The
+  cancellation is expected, the error code is `environment_unavailable`,
+  `ai_account_unavailable` or `device_slots_full`, and
+  `resultJson.executionRecovery` is `{kind: "resource_wait", providerWorkStarted:
+  false}`. It uses no failure retry and no daily run cap slot, raises no error
+  report and starts no legacy reconciliation. The run list shows it as "Waited".
+- **The waiting run** is a `scheduled_retry` run in a wait lane. It keeps the
+  task's execution lock, so the task stays in progress and the agent stays idle.
+  Its `contextSnapshot.resourceWait` (version 1) names the kind, reason,
+  environment, device, account and the expected resume time with its source.
+- **The episode** (`resource_wait_episodes`) is the wait people see. A task (or an
+  agent, for runs without a task) has at most one open episode, which keeps its
+  start time and notice state across every replacement run. A deferral for
+  another resource closes it and opens a new one.
+
+The wait ends, with the event "Resumed" and `resource_wait.resolved`, only after
+the step that waited succeeds for that run: the lease for a device wait, the slot
+for an account or slot wait. The task shows a banner such as "Waiting for device
+<name> (offline since 13:02)" that says it starts automatically and names the
+agent whose run waits, with a link to that run. The run ledger folds
+consecutive deferrals into one "Waited: <reason>" entry. A waiting task never
+shows a failed run or the blocked status. A resolved interaction continuation
+keeps its identity while it waits, and its usual claim checks still apply when
+it runs.
+
+| Lane | Scope | Reasons | Held until | Notice |
+| --- | --- | --- | --- | --- |
+| `environment_wait` | target | `offline`, `paused`, `maintenance`, `updating`, `unreachable` | The registry shows the target available, or a report or check changes it; once its row is 10 minutes old, the oldest wait makes one real attempt | After the notify-after hours |
+| `environment_wait` | admission | `not_allowed`, `not_serving` | A plugin wake; otherwise an attempt every 5 minutes, doubling to 60 | At once |
+| `environment_wait` | admission | `stopped` | As above | None |
+| `environment_wait` | admission | `busy`, `throttled` | The driver's `retryAfter`, else 60 s (`busy`) or 30 to 60 s (`throttled`) | After the notify-after hours |
+| `environment_wait` | admission | `restarting`, `plugin_upgrade_pending` | The plugin is enabled again; otherwise 30 s (`restarting`) or every 5 minutes, doubling to 60 | After the notify-after hours |
+| `environment_wait` | admission | `other` | The driver's `retryAfter`, or 60 s doubling to 10 minutes | After the notify-after hours |
+| `ai_account_wait` | account | `usage_limit`, `credit_balance` | The reset plus up to 2 minutes; at the reset one waiting run goes first as a probe | At once, once per limit |
+| `ai_account_wait` | account | `auth_unconfirmed` | 10 minutes, for this run only | None |
+| `ai_account_wait` | account | `signed_out`, `withdrawn`, `unassigned`, `owner_not_member`, `reserved_elsewhere`, `device_unknown`, `credential_type_unsupported` | A database check every 60 s ± 20 %, plus event wakes | At once |
+| `device_slot_wait` | device | `slots_full` | A free slot, first in first out; checked every 60 s ± 20 % | At once |
+
+A target-scope reason means the target is down for everyone: it is recorded in
+the availability registry, and every company's runs on that environment wait. An
+admission-scope reason concerns this run only.
+
+**Refusals.** Only real configuration problems block a task (as
+`configuration_incomplete`), each with a notice that names the fix:
+
+- `environment_refused`: the driver refused the run with `retryable: false`, or
+  the device was removed. Notice: "Execution device refused the run"; it names
+  the move to another device.
+- `ai_connection_incompatible`: a routing override or a conflicting
+  authentication setting (see [Pool runs](#pool-runs)). Notice: "AI account
+  blocked by a conflicting setting".
+- `ai_connection_changed`: the account of a suspended native run changed or is
+  gone. Notice: "AI account of a suspended run changed"; start a new execution,
+  because a suspended run never continues on another account.
+
+**Holding and waking.** Each scheduler tick checks the due waiting runs before
+promotion, with database reads only. At most every 5 minutes it also checks the
+task: a task that was closed, reassigned, blocked, paused or stopped by its
+budget ends its wait, releases its lock and gets no notice. A wait is re-armed
+with a compare-and-set, so a wake that arrives meanwhile is never lost. Waits
+wake on events: a plugin report of an available target, a `wake` flag, a retired
+target or a change of accepted credential types; a successful check; a plugin
+that is enabled or loaded again (for `restarting` and `plugin_upgrade_pending`);
+an account change (limit cleared, token replaced, resumed, re-enabled by an
+admin, transferred, reservation cleared, a served run after a limit); a binding
+set or cleared, or an agent's environment changed; and Check now. Membership
+changes have no hook; the 60-second check picks them up. An issue monitor that
+falls due while its task waits is moved past the wait, at least 15 minutes
+ahead, without counting an attempt.
+
+**Probes.** At an account's reset exactly one of its waiting runs goes first:
+the one whose wait is oldest. The others hold. If the provider serves it, the
+limit clears and the rest are woken, staggered over up to 2 minutes; if it hits
+the limit again, the next, longer estimate starts within the same episode. A
+probe that has not started within 15 minutes is released. Clearing the limit
+releases every waiting run at once. So a limit without a typed reset costs one
+failed attempt per estimate, not one per waiting task.
+
+**Check now.** On a waiting task, Check now
+(`POST /api/issues/:id/scheduled-retry/retry-now` for a lane run) first forces a
+check of the resource, then promotes the run only if the resource is available.
+Otherwise it answers 409 `resource_still_unavailable` with the fresh wait, shown
+as "Still unavailable (checked just now)". An admission-scope wait gets one real
+attempt. It works once per minute per task (429 `check_now_rate_limited`). On a
+device card, Check now (`POST /api/companies/:companyId/devices/:deviceId/check-now`,
+non-viewer members) checks the device's environments that the company can use,
+in that company's context, then wakes their waits. It works once per minute per
+device (429), and answers 404 for a device the company cannot see. Each device
+check is logged in that company as `execution_device.checked`.
+
+**Comments on waiting tasks.** A comment on a waiting task that is in progress
+leaves the task's status and its waiting run as they are. It joins the wait and
+triggers a check: a forced check for a target outage, a database check
+otherwise. It spends no admission attempt and never answers 409.
+
+**Notices.** All notices are company-scoped, and a key in
+`resource_wait_notices` makes each one post only once.
+
+- On the task: an immediate notice for limits and for problems a person must fix,
+  which names the fix (replace the token, resume or choose an account, enable the
+  project on the device, move the agent); a long-wait notice for device waits
+  after the notify-after hours ("This task has been waiting for device <name>
+  for 24 h …"); and "Started after waiting <duration>." when a notified wait
+  ends. The limit notice says: "Waiting for Claude account <label>: usage limit
+  reached. Resumes automatically at <time> (provider reset | estimated).
+  Paperclip never moves a task to another account. The owner can clear the limit
+  after checking."
+- To the manager agent: one wake per manager, resource and outage, with reason
+  `resource_wait_notice`, no task id, and up to 20 of the company's tasks that
+  wait for that resource in `contextSnapshot.resourceWaitNotice`. It always
+  gets a run of its own; a later wake merged into that queued run keeps the
+  summary, and so does the run's successor if the summary run itself has to
+  wait. The manager is the agent that created the task when that is not the
+  assignee, otherwise the assignee's manager. The wake is skipped when the
+  manager uses the same account or the same unavailable device.
+- In the inbox: one item per resource episode (an account's limit, a device
+  outage, or a problem a person must fix), shared by the tasks that wait on it.
+  Device outages appear after the notify-after hours. The item goes when the
+  wait ends.
+- Activity: `resource_wait.started`, `resource_wait.long_wait_notified` and
+  `resource_wait.resolved`.
+
+**Notify hours.** Company settings → Devices → Waiting notifications, for
+company admins (`GET` for members and `PUT` for admins on
+`/api/companies/:companyId/execution-wait-settings`):
+
+- "Notice after a task waits for its device for" (`notifyAfterHours`):
+  "Instance default" (`null`), a number of hours up to 168, or "Never" (`0`);
+- "Wake the task's manager agent right away for usage limits and problems a
+  person must fix" (`notifyPmOnAccountWait`, on by default);
+- "Also wake the task's manager agent when a device wait reaches the notice
+  time" (`notifyPmOnDeviceWait`, off by default).
+
+Changes are logged as `company.execution_wait_settings_updated`. The instance
+default comes from `PAPERCLIP_RESOURCE_WAIT_NOTIFY_HOURS`: 24 when unset, 0 for
+never, and values above 168 count as 168.
+
+**Availability registry.** `environment_availability` holds one row per
+environment, for target-level states only; a missing row means available. It is
+written by classified target-scope lease errors, plugin reports, sweep checks,
+and a successful lease after an outage. An `unavailable` row holds runs only
+while its last check is less than 10 minutes old. Once it is older, the oldest
+wait on the environment makes one real lease attempt, whose result refreshes
+the row, and the others re-check every 60 s. Checks back off
+`min(30 s × 2^failures, 10 min) ± 20 %`, never earlier than the driver's
+`retryAfter`. When the last wait on an environment ends, its row is deleted,
+unless the target was retired. A retired target refuses
+new runs, and its existing waits end as `environment_refused` with the message
+"<device> was removed; move <agent> to another device".
+
+SSH lease errors (ssh exit 255) are classified from stderr. A host that cannot be
+reached (connection refused or timed out, no route, network unreachable, host
+down, a name that does not resolve, or a banner exchange that times out, as a
+sleeping computer behind an open tunnel does) waits as target `unreachable`. A
+closed or reset connection or a failed key exchange, the usual sign of sshd
+`MaxStartups` during a burst, waits as admission `throttled` for 30 to 60 s and
+leaves the registry alone. `Permission denied` and host key failures stay
+configuration errors. A sandbox provider plugin whose worker is not running
+waits as `restarting`, and one in `upgrade_pending` as `plugin_upgrade_pending`.
+
+**Sweep.** A sweep runs on every heartbeat scheduler tick while scheduling is
+not suppressed, under an advisory lock. It runs up to 5 availability checks
+(15 s each: a plugin's `environmentCheckAvailability`, or the SSH environment
+probe in a waiting run's company), releases probe claims whose run has not
+started within 15 minutes, prunes the slots of runs that ended more than 24 hours
+ago, abandons episodes whose run ended more than 10 minutes ago without a newer
+waiting run, deletes idle registry rows and sends due notices.
+
+A fault in the wait code never switches accounts: a failing preflight lets the
+run go on to its lease, and a failing limit or sign-in handler falls back to the
+normal retry path.
+
+**Kill switch.** `PAPERCLIP_ENVIRONMENT_WAITS=off` (also `false`, `0` or
+`disabled`) turns device waits off. The server reads it once at startup, so a
+change needs a restart (a container restart in Docker). With it off, the
+environment preflight and the classification of lease errors are off, so
+environment errors fail runs as before this release (`setup_failed`), and every
+waiting `environment_wait` run gets one real attempt on the next tick. Account
+and slot waits cannot be switched off, because they replace failover.
+
+### Plugin targets API
+
+An environment driver plugin (one that declares a `sandbox_provider`) can take
+part in waits and in device identity. Plugins bundle the SDK
+(`@paperclipai/plugin-sdk`), so only a rebuilt plugin uses this API. It adds no
+capability, error code or manifest field: the worker→host methods need the
+existing `environment.drivers.register` capability.
+
+**Unavailable envelope.** A driver throws `PluginEnvironmentUnavailableError`
+from acquire, resume, realize, execute or checkAvailability when its target
+cannot take the run now. The worker forwards only the validated envelope as
+JSON-RPC error data (`paperclip/environment-unavailable/v1`):
+
+| Field | Meaning |
+| --- | --- |
+| `scope` | `target`: the target is down for every company. `admission`: this run only. |
+| `reason` | Target scope: `offline`, `paused`, `maintenance`, `updating` or `other`. Admission scope: `stopped`, `busy`, `not_allowed`, `not_serving`, `restarting` or `other`. |
+| `retryable` | `false` is a refusal: the run fails as `environment_refused`. |
+| `targetKey`, `targetLabel` | The target; the label is at most 80 characters. |
+| `retryAfter` | An ISO time to try again, at most 7 days ahead. |
+| `message` | Plain text for people, at most 300 characters; never provider internals or secrets. |
+
+The host finds the envelope on the error, its `.cause` chain or JSON-RPC error
+data, up to six levels deep. An older host ignores it.
+
+**`projectId`, negotiated.** `PluginEnvironmentDriverBaseParams` has an optional
+`projectId`. A plugin opts in with `definePlugin({ environmentDriverFeatures:
+{ projectId: true } })`, and its worker then advertises
+`feature:environment.projectId` in `supportedMethods`. Only then does the host
+send the `projectId` key: the run's project (or `null` for a run without one)
+on a run's acquire and resume, and `null` on checkAvailability. Probes, device
+logins, setup-token leases and native export resumes never carry it. A worker
+that does not advertise the marker never receives the key.
+
+**`environmentCheckAvailability`** (host→worker, optional). Defining
+`onEnvironmentCheckAvailability` advertises it. It must be cheap, free of side
+effects and target-level only: no company or project admission. It returns
+`{state: "available"}`, `{state: "unavailable", unavailable}` with a target-scope
+envelope, or `{state: "unknown"}`. The host calls it only from the sweep while
+runs wait, with a 10-second timeout. Without it, or with an unknown answer, the
+registry row is left to go stale: once it is 10 minutes old, the oldest wait on
+the environment makes one real attempt, and the others re-check every 60 s.
+
+**`ctx.environments.reportTargets`** (worker→host). The plugin reports the state
+of its targets:
+
+```ts
+{ driverKey: string; targets: Array<{
+  targetKey: string; label: string; configMatch: Record<string, string>; // 1–3 entries
+  state: "available" | "unavailable"; reason?: string; message?: string; retryAfter?: string;
+  acceptedCredentialTypes?: Array<"subscription" | "api_key">;
+  ownerUserId?: string | null; // display only
+  servedCompanyIds?: string[]; // at most 200; device visibility only
+  aliases?: string[];          // at most 5 hostnames; the duplicate hint
+  wake?: boolean; retired?: boolean;
+}> } // at most 500 targets → { accepted: number }
+```
+
+Host rules:
+
+- `driverKey` must be a `sandbox_provider` the caller declares and no other
+  installed plugin declares, and it may not be a built-in provider; otherwise
+  `CAPABILITY_DENIED`.
+- A malformed call or more than 500 targets refuses the whole call. Each target
+  is validated on its own: invalid targets and repeated keys are dropped and
+  logged without their values, and the rest are saved.
+- `configMatch` lists top-level string config fields, never `provider`;
+  `reason` is a target reason. A report is the full state of a target: an
+  omitted owner, served companies or aliases means none.
+- Each target upserts its device by target key, records the plugin and the
+  report time, and writes its state onto the availability rows of every active
+  environment of that provider whose config contains `configMatch`. Each target
+  is saved in its own transaction.
+- `acceptedCredentialTypes` says which pool credentials runs on the target
+  accept. If it is omitted, or the last report is older than 15 minutes, binding
+  and planning assume `subscription` only, so report well within that time.
+- After the commit: a target that became available wakes the target-scope waits
+  on its environments; `wake: true` and `retired: true` wake every wait there
+  (a retired target's waits then refuse); a change of accepted types wakes the
+  target-scope waits and the account waits for `credential_type_unsupported`
+  there. An owner change alone wakes nothing. Woken runs start right away.
+- New matches re-check the device caps (see [Over the limit](#over-the-limit)).
+- If a valid target cannot be saved, or a wake fails, the call throws after the
+  rest is saved; send the report again.
+
+The call carries no company, so a plugin may also call it outside invocations,
+for example from a timer.
+
+**`ctx.environments.ensureCompanyEnvironment`** (worker→host). It finds or
+creates the driver's environment for one company:
+`{companyId, driverKey, name, description?, config, match}` →
+`{environmentId, name, created}`.
+
+- Allowed only inside a `performAction` invocation whose host-derived actor is a
+  board user with write access to `companyId`: the local board in
+  `local_trusted`, an active non-viewer member, or an instance admin with a
+  membership. It is denied in `getData`, `onEvent` and `executeTool`.
+- The caller must be the only installed plugin that provides `driverKey`, and it
+  may not be a built-in provider.
+- It is idempotent per company, driver and `match`, under an advisory lock: an
+  active environment of the same company whose config contains `match` is
+  returned with `created: false`. Shared and archived environments are not
+  reused.
+- `config.provider` is forced to the driver key. `config` is at most 4 KB as
+  JSON and must contain `match` (1 to 3 fields). It may not hold `envVars`,
+  secret references, or any value at a secret-ref field of the provider's config
+  schema. The plugin's `validateConfig` is not called. The name is made unique
+  with ` (n)`.
+- The new environment's availability starts from its device's last report, read
+  under a share lock, so a report still in flight lands first. Activity:
+  `environment.created` with actor type `plugin`.
+
+**Invocation facts.** The host adds `method` and `actor {type, userId}` to the
+invocation scope, and `isInstanceAdmin` to the `performAction` actor context:
+true for a board actor that is the local board or an instance admin, false for
+other board actors, unset for others. Workers never supply these, and a plugin
+reads a missing `isInstanceAdmin` as false.
+
+**Error codes.**
+
+| Code | When |
+| --- | --- |
+| `INVOCATION_SCOPE_DENIED` (-32005) | ensureCompanyEnvironment outside a `performAction` by a board user with write access to the company. |
+| `CAPABILITY_DENIED` (-32001) | A driver key the plugin does not provide alone, a built-in provider, or a missing `environment.drivers.register` capability. |
+| `INTERNAL_ERROR` (-32603) | Any other host error, with a message. |
+| `METHOD_NOT_FOUND` (-32601) | Only from an older host that predates the methods. Stop calling them, and create environments through the admin REST API. |
+
+Compatibility:
+
+| Host | Plugin | Effect |
+| --- | --- | --- |
+| This release | Rebuilt, opted in | Everything above. |
+| This release | Not rebuilt | No `projectId`. No envelope, so an unavailable target still fails runs as `setup_failed`. No reports, so its environments have no device and pool bindings to them get 422 `device_unknown`. |
+| Previous image | Rebuilt | The envelope is ignored. Both host methods answer `METHOD_NOT_FOUND`. |
+
+### SSH secret staging and the per-account config directory
+
+**SSH secret staging.** Secret values never ride the ssh command line. Keys that
+look secret (the shared `SENSITIVE_ENV_KEY` pattern, which covers
+`PAPERCLIP_API_KEY` and the pool tokens) and keys a caller lists in
+`secretEnvKeys` are staged first. A separate ssh call writes them as
+`KEY='value'` lines over stdin into a private file (`umask 077`, a `mktemp -d`
+directory under `${TMPDIR:-/tmp}`), without sourcing any login profile. The main
+command then sources the login profiles, unsets the run's unset list, exports the
+staged values, deletes the directory and starts the command with only the
+non-secret keys on its command line. An exit trap removes the file when the
+script stops early, and the host removes it best effort after an ssh failure.
+The run's own values therefore win over values a profile exports. Bridge start
+and other SSH commands stage secrets the same way. Staging costs one extra ssh
+connection for each command that carries a secret, which is nearly every SSH
+agent run. A secret bound to a key whose name does not look secret still goes on
+the command line unless the caller lists it in `secretEnvKeys`.
+
+A pool run on an SSH target also unsets, after the login profiles, the provider
+routing keys (`*_BASE_URL` under `ANTHROPIC_` and `CLAUDE_CODE_`, every
+`CLAUDE_CODE_USE_*`), the proxy and TLS keys (`HTTP_PROXY`, `HTTPS_PROXY` and
+`ALL_PROXY` in any case, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`)
+and the credential carriers. Names are matched by pattern as well as by list,
+so a profile can neither route the run elsewhere nor hand it another credential.
+
+**Remote targets get the run's environment only.** On sandbox and SSH targets,
+install steps, resolvability probes and similar commands of claude-local and the
+other audited local adapters are built from the run's environment, never from
+the server's own process environment (`DATABASE_URL`, `BETTER_AUTH_SECRET` and the
+server's `PAPERCLIP_*` keys stay on the server).
+
+**Per-account Claude config directory.** The marker
+`PAPERCLIP_AI_CREDENTIAL_REF` is the first 16 hex characters of
+`sha256("paperclip-ai-account:" + accountId)`. It names the account and is not a
+secret. When a run on a sandbox or SSH target carries it, claude-local uses the
+account's own config directory, `config-<ref>`:
+
+- on a sandbox, under the run's `.paperclip-runtime/claude`;
+- on SSH, in a stable place on the host, outside every per-run directory and
+  worktree: `<remote workspace>/.paperclip-runtime/claude/config-<ref>`, or
+  `.paperclip-device/claude/config-<ref>` for device workspaces. Its sessions
+  survive for `--resume`.
+
+Each run seeds the directory again from settings with `env`, `apiKeyHelper`,
+`awsAuthRefresh` and `awsCredentialExport` removed, and it removes
+`.credentials.json` and `credentials.json` instead of copying them from `$HOME`.
+With the marker this directory wins over an explicit `CLAUDE_CONFIG_DIR`. So on
+these targets each account keeps its own directory and stored login per device,
+and the device user's own login and user-level settings can never back a pool
+run. Local pool runs keep today's config directory. Without the marker nothing
+changes.
+
+### Known residuals
+
+- **Local trust (pre-existing).** The Paperclip server (Local) is a pool device,
+  as before this release. Local child processes inherit the server's process
+  environment, `DATABASE_URL` and `BETTER_AUTH_SECRET` included when the server
+  has them; only the server's `PAPERCLIP_*` keys are removed, apart from its API
+  URL, listen host and port. They run as the server's OS user, which can read
+  the master key file; the local process sandbox is opt-in per agent. Any Local
+  run, pool-bound or not, can therefore read the master key and could decrypt
+  every pool credential. Local pool runs also keep the server user's config
+  directory, so that user's stored login and user-level settings still apply to
+  them. Carrier keys and proxy variables set
+  on the server process itself are neither removed nor refused for Local runs:
+  the routing guard checks only the run's own environment layers. Treat every
+  agent that runs on the server as able to read every pool credential.
+  Hardening Local execution is a separate project.
+- **Upstream project-auth walk.** Pool runs also reuse upstream's managed
+  project-auth check (`assertManagedAiProjectAuth`) unchanged. Its local and
+  remote walks still pass through `$HOME`, with its own narrower pattern
+  (`apiKeyHelper`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, …). A remote device user whose own
+  `~/.claude/settings.json` sets one of these therefore blocks pool runs on that
+  device, although the run reads its own `config-<ref>` directory.
+- **Shared OS users.** Runs under one OS user on one device (the server, one SSH
+  user, one computer) can read each other's environment, including a concurrent
+  pool run's token. This release accepts that.
+- **Pausing an agent.** `POST /api/agents/:id/pause` cancels the agent's waiting
+  runs at once. Upstream's release-time recovery then records a stranded-task
+  board escalation for each in-progress task, as it does for a paused agent's
+  queued or running work. A pause that the next tick's task check sees ends the
+  wait with no recovery entry.
+- **A manager at its daily run cap** (`maxDailyRuns`) skips the summary run while
+  the notice key stays claimed. The task notice and the inbox item remain.
+- **User-continued legacy turns.** A user-continued legacy turn whose task claim
+  was released before cleanup falls back to the provider-quota monitor. It still
+  waits for the same account.
+
+### Pool verification
+
+```sh
+pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+pnpm exec vitest run packages/shared/src/ai-account-pool.test.ts server/src/__tests__/ai-account-pool.test.ts server/src/__tests__/ai-account-pool-routes.test.ts server/src/__tests__/ai-account-pool-migration.test.ts server/src/__tests__/ai-account-pool-migration-job.test.ts server/src/__tests__/execution-devices.test.ts server/src/__tests__/heartbeat-ai-accounts.test.ts server/src/__tests__/heartbeat-ai-account-pool.test.ts server/src/__tests__/heartbeat-resource-waits.test.ts server/src/__tests__/resource-waits-hold.test.ts server/src/__tests__/resource-waits-notify.test.ts server/src/__tests__/resource-waits-classify.test.ts server/src/__tests__/plugin-environment-targets.test.ts
+pnpm exec vitest run packages/plugins/sdk/src/environment-availability.test.ts packages/adapter-utils/src/ssh-secret-staging.test.ts packages/adapters/claude-local/src/server/execute.pool-config.test.ts
+```
+
+The server resolves the SDK through its build output, so build it after an SDK
+change before the server suites run.
 
 ## Storage and API
 
@@ -169,8 +1094,9 @@ and authentication paths are never account labels.
 
 Company-scoped `/api/companies/:companyId/ai-connections` operations provide list,
 API-key creation/reconnect, personal defaults, completed login references,
-active-run attribution, and the account pool (`GET`/`PUT .../pool`,
-`POST .../pool/:connectionId/clear-limit`). The list includes `canManageConnections`, evaluated by
+active-run attribution, and the
+[company account pool](#company-account-pool-deprecated) (deprecated;
+`GET`/`PUT .../pool`, `POST .../pool/:connectionId/clear-limit`). The list includes `canManageConnections`, evaluated by
 the same server permission check as creation, including custom
 `tools:manage_connections` grants. Existing Connections operations handle naming,
 access, and revocation. Mutation authorization is enforced server-side. OpenAPI documents the new board-only

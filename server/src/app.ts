@@ -108,6 +108,10 @@ import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { aiAccountHostRoutes } from "./routes/ai-account-hosts.js";
+import { aiAccountPoolRoutes } from "./routes/ai-account-pool.js";
+import { aiAccountPoolMigrationRoutes } from "./routes/ai-account-pool-migration.js";
+import { executionDeviceRoutes } from "./routes/execution-devices.js";
+import { registerPluginResourceWaitWakes } from "./services/plugin-resource-wait-wakes.js";
 import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
@@ -825,6 +829,12 @@ export async function createApp(
   api.use(resourceMembershipRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  // Fork: the Claude account pool, its binding backfill and the execution
+  // devices (spec 12), before the legacy host routes, so the pool router
+  // serves `/instance/ai-accounts/:accountId`.
+  api.use(aiAccountPoolMigrationRoutes(db, { deploymentMode: opts.deploymentMode }));
+  api.use(aiAccountPoolRoutes(db, { deploymentMode: opts.deploymentMode }));
+  api.use(executionDeviceRoutes(db, { deploymentMode: opts.deploymentMode, heartbeat: connectionIntentHeartbeat }));
   api.use(aiAccountHostRoutes(db));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
@@ -834,6 +844,10 @@ export async function createApp(
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
   const lifecycle = pluginLifecycleManager(db, { workerManager });
+  // Fork: a plugin enabled or loaded again wakes its restarting and upgrade waits (spec 7.5).
+  const stopPluginResourceWaitWakes = registerPluginResourceWaitWakes(lifecycle, connectionIntentHeartbeat, {
+    enabled: () => !isWarmStandby(),
+  });
   const scheduler = createPluginJobScheduler({
     isBackgroundWorkEnabled: () => !isWarmStandby(),
     db,
@@ -1365,6 +1379,7 @@ export async function createApp(
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();
+      stopPluginResourceWaitWakes(); // Fork: plugin start wakes.
       chatReconciliation.stop();
       if (chatPublicationTimer) {
         clearInterval(chatPublicationTimer);

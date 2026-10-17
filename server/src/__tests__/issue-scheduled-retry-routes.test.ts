@@ -1,27 +1,34 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, inArray, like, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   agentWakeupRequests,
+  aiAccountAgentBindings,
   companies,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issueTreeHolds,
   issues,
+  resourceWaitEpisodes,
+  resourceWaitNotices,
 } from "@paperclipai/db";
+import { buildResourceWaitContext } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { captureQueries, explainAnalyze, rowsExamined, scansOf } from "./helpers/query-plan.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -403,6 +410,337 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       .send({});
 
     expect(res.status).toBe(404);
+  });
+
+  /**
+   * Fork (spec 7.5, 7.7): the task's assignee A finished waiting; agent B's run
+   * took the task's wait over (the open episode's current run, the older run),
+   * while agent C's reply run joined that wait for another resource and was
+   * re-armed later (newer, due sooner). The banner and "Check now" both act on
+   * B's wait.
+   */
+  async function seedSharedWait() {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date();
+    const minutes = (n: number) => new Date(now.getTime() + n * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false });
+    const agentRow = async (name: string) => (await db.insert(agents).values({
+      companyId,
+      name,
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    }).returning())[0]!;
+    const assignee = await agentRow("Assignee");
+    const builder = await agentRow("Builder");
+    const replier = await agentRow("Replier");
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Shared wait",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: assignee.id,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    // Builder waits for a Claude account: it is in pool mode without one.
+    await db.insert(aiAccountAgentBindings).values({ agentId: builder.id, companyId, mode: "pool_account", accountId: null });
+    const episodeId = randomUUID();
+    const laneRun = async (input: { agent: { id: string }; lane: string; context: ReturnType<typeof buildResourceWaitContext>; updatedAt: Date; scheduledRetryAt: Date }) => {
+      const [source] = await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: input.agent.id,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "cancelled",
+        errorCode: input.lane === "ai_account_wait" ? "ai_account_unavailable" : "environment_unavailable",
+        contextSnapshot: { issueId },
+        createdAt: minutes(-90),
+        updatedAt: minutes(-90),
+      }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: input.agent.id,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        retryOfRunId: source!.id,
+        scheduledRetryAt: input.scheduledRetryAt,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: input.lane,
+        contextSnapshot: { issueId, resourceWait: input.context },
+        createdAt: input.updatedAt,
+        updatedAt: input.updatedAt,
+      }).returning();
+      return run!;
+    };
+    const builderWait = buildResourceWaitContext({
+      episodeId,
+      kind: "ai_account",
+      reason: "unassigned",
+      scope: "account",
+      environmentId: null,
+      environmentName: null,
+      deviceId: null,
+      deviceName: null,
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+    });
+    const builderRun = await laneRun({ agent: builder, lane: "ai_account_wait", context: builderWait, updatedAt: minutes(-30), scheduledRetryAt: minutes(60) });
+    const replierRun = await laneRun({
+      agent: replier,
+      lane: "environment_wait",
+      context: buildResourceWaitContext({
+        ...builderWait,
+        kind: "environment",
+        reason: "busy",
+        scope: "admission",
+        environmentId: randomUUID(),
+        environmentName: "Busy box",
+      }),
+      updatedAt: minutes(-1),
+      scheduledRetryAt: minutes(10),
+    });
+    const since = minutes(-60);
+    const notifiedAt = minutes(-59);
+    await db.insert(resourceWaitEpisodes).values({
+      id: episodeId,
+      companyId,
+      agentId: builder.id,
+      issueId,
+      kind: "ai_account",
+      reason: "unassigned",
+      scope: "account",
+      resourceKey: "account:none",
+      since,
+      notifiedAt,
+      currentRunId: builderRun.id,
+    });
+    return { companyId, issueId, builder, replier, builderRun, replierRun, episodeId, since, notifiedAt, builderWait };
+  }
+
+  it("surfaces the task's own wait with its episode's start, even when a later run waits too", async () => {
+    const { companyId, issueId, builder, builderRun, since, notifiedAt, builderWait } = await seedSharedWait();
+
+    const res = await request(createApp(boardActor(companyId, "local_implicit"))).get(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.scheduledRetry).toMatchObject({
+      runId: builderRun.id,
+      status: "scheduled_retry",
+      agentId: builder.id,
+      agentName: "Builder",
+      scheduledRetryReason: "ai_account_wait",
+      resourceWait: { ...builderWait, since: since.toISOString(), notifiedAt: notifiedAt.toISOString() },
+    });
+    // The raw run context never leaves the server.
+    expect(res.body.scheduledRetry).not.toHaveProperty("resourceWaitContext");
+    expect(res.body.scheduledRetry).not.toHaveProperty("contextSnapshot");
+  });
+
+  it("ranks a task's waiting runs without reading the company's other tasks once per run", async () => {
+    const { companyId, issueId, builderRun } = await seedSharedWait();
+    await db.execute(sql`
+      insert into issues (company_id, title, status, priority)
+      select ${companyId}, 'Other task ' || n, 'todo', 'medium' from generate_series(1, 300) n
+    `);
+    await db.execute(sql`analyze issues`);
+    const capture = captureQueries(db);
+    let current: Awaited<ReturnType<ReturnType<typeof issueService>["getCurrentScheduledRetry"]>>;
+    try {
+      current = await issueService(db).getCurrentScheduledRetry(issueId);
+    } finally {
+      capture.restore();
+    }
+    expect(current).toMatchObject({ runId: builderRun.id });
+    const ranked = capture.queries.find((entry) => entry.query.includes('"execution_run_id"') && entry.query.includes('from "heartbeat_runs"'));
+    expect(ranked).toBeDefined();
+    // Index paths only, as on a large table: the task's own row is read by its key, not found among 300.
+    const plan = await explainAnalyze(db, ranked!, ["enable_seqscan = off"]);
+    expect(scansOf(plan, "issues").length).toBeGreaterThan(0);
+    expect(rowsExamined(plan, "issues")).toBeLessThan(20);
+  });
+
+  it("leaves since and notifiedAt empty for a wait joined for another resource", async () => {
+    const { companyId, issueId, replierRun } = await seedSharedWait();
+    // Only the replier waits now: the builder's wait ended.
+    await db.delete(resourceWaitEpisodes).where(eq(resourceWaitEpisodes.issueId, issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", scheduledRetryReason: null }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "scheduled_retry"), eq(heartbeatRuns.scheduledRetryReason, "ai_account_wait")));
+
+    const res = await request(createApp(boardActor(companyId, "local_implicit"))).get(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.scheduledRetry).toMatchObject({
+      runId: replierRun.id,
+      scheduledRetryReason: "environment_wait",
+      resourceWait: { kind: "environment", reason: "busy", since: null, notifiedAt: null },
+    });
+  });
+
+  it("checks the same wait the banner shows, answers 409 while it lasts and 429 within a minute", async () => {
+    const { companyId, issueId, builderRun, replierRun, episodeId } = await seedSharedWait();
+    const app = createApp(boardActor(companyId));
+
+    const res = await request(app).post(`/api/issues/${issueId}/scheduled-retry/retry-now`).send({});
+
+    // The replier's admission wait would have been promoted at once; the builder's account wait holds.
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({
+      code: "resource_still_unavailable",
+      details: {
+        code: "resource_still_unavailable",
+        resourceWait: { episodeId, kind: "ai_account", reason: "unassigned" },
+      },
+    });
+    expect(Date.parse(res.body.details.checkedAt)).not.toBeNaN();
+    const statuses = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(statuses.map((row) => row.id).sort()).toEqual([builderRun.id, replierRun.id].sort());
+
+    const again = await request(app).post(`/api/issues/${issueId}/scheduled-retry/retry-now`).send({});
+    expect(again.status).toBe(429);
+    expect(again.body).toMatchObject({ code: "check_now_rate_limited", details: { retryAfterMs: 60_000 } });
+  });
+
+  /**
+   * Fork (spec 7.6, 18 "Comment"): the assignee's own wait for a Claude
+   * account (it is in pool mode without one) as the run path leaves it: the
+   * waiting run holds the task's lock and owns the open episode.
+   */
+  async function seedAssigneeWait() {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date();
+    const minutes = (n: number) => new Date(now.getTime() + n * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false });
+    const [builder] = await db.insert(agents).values({
+      companyId,
+      name: "Builder",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    }).returning();
+    await db.insert(aiAccountAgentBindings).values({ agentId: builder!.id, companyId, mode: "pool_account", accountId: null });
+    const [deferral] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: builder!.id,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "cancelled",
+      errorCode: "ai_account_unavailable",
+      contextSnapshot: { issueId },
+      finishedAt: minutes(-10),
+      createdAt: minutes(-10),
+      updatedAt: minutes(-10),
+    }).returning();
+    const episodeId = randomUUID();
+    const [waiting] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: builder!.id,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      retryOfRunId: deferral!.id,
+      scheduledRetryAt: minutes(60),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "ai_account_wait",
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        resourceWait: buildResourceWaitContext({
+          episodeId,
+          kind: "ai_account",
+          reason: "unassigned",
+          scope: "account",
+          environmentId: null,
+          environmentName: null,
+          deviceId: null,
+          deviceName: null,
+          accountId: null,
+          accountLabel: null,
+          resumeAt: null,
+          resumeAtSource: null,
+          message: null,
+        }),
+      },
+      createdAt: minutes(-10),
+      updatedAt: minutes(-10),
+    }).returning();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Waiting for a Claude account",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: builder!.id,
+      executionRunId: waiting!.id,
+      executionAgentNameKey: "builder",
+      executionLockedAt: minutes(-10),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(resourceWaitEpisodes).values({
+      id: episodeId,
+      companyId,
+      agentId: builder!.id,
+      issueId,
+      kind: "ai_account",
+      reason: "unassigned",
+      scope: "account",
+      resourceKey: "account:none",
+      since: minutes(-10),
+      notifiedAt: minutes(-10),
+      currentRunId: waiting!.id,
+    });
+    return { companyId, issueId, builder: builder!, waiting: waiting!, episodeId };
+  }
+
+  it("keeps a waiting task, its waiting run and its episode on a board comment, and leaves Check now its own minute", async () => {
+    const { companyId, issueId, builder, waiting, episodeId } = await seedAssigneeWait();
+    const app = createApp(boardActor(companyId));
+
+    const posted = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Is the account sorted out?" });
+    expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+
+    // The comment's wake joins the waiting run, and the comment's own check takes its slot in the background.
+    await vi.waitFor(async () => {
+      const joined = await db.select({ runId: agentWakeupRequests.runId }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, builder.id), eq(agentWakeupRequests.status, "coalesced")));
+      expect(joined).toEqual([{ runId: waiting.id }]);
+      const slots = await db.select().from(resourceWaitNotices)
+        .where(and(eq(resourceWaitNotices.companyId, companyId), like(resourceWaitNotices.noticeKey, `check-now:%issue:${issueId}`)));
+      expect(slots).toHaveLength(1);
+    }, { timeout: 15_000, interval: 100 });
+
+    const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(task).toMatchObject({ status: "in_progress", executionRunId: waiting.id });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, waiting.id));
+    expect(run).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "ai_account_wait" });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"])))).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([]);
+    const [episode] = await db.select().from(resourceWaitEpisodes).where(eq(resourceWaitEpisodes.id, episodeId));
+    expect(episode).toMatchObject({ currentRunId: waiting.id, resolvedAt: null });
+
+    // The comment's check never spends the minute of "Check now".
+    const checked = await request(app).post(`/api/issues/${issueId}/scheduled-retry/retry-now`).send({});
+    expect(checked.status, JSON.stringify(checked.body)).toBe(409);
+    expect(checked.body).toMatchObject({ code: "resource_still_unavailable", details: { resourceWait: { episodeId, reason: "unassigned" } } });
   });
 
 });

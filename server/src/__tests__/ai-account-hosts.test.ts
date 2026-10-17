@@ -4,101 +4,35 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
-import { eq, sql } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import request from "supertest";
 import {
   activityLog,
   agents,
+  aiAccountAgentBindings,
   aiAccountHostEnvironments,
   aiAccountHosts,
   aiAccounts,
+  authUsers,
   companies,
   companyMemberships,
   costEvents,
   createDb,
   environments,
   heartbeatRuns,
-  projects,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 
-const { aiAccountHostService, pickBalancedAccount, pickAccountForRun, isCreditBalanceFailure } = await import("../services/ai-account-hosts.js");
+const hostsModule = await import("../services/ai-account-hosts.js");
+const { aiAccountHostService, isCreditBalanceFailure } = hostsModule;
 const { aiAccountHostRoutes } = await import("../routes/ai-account-hosts.js");
 const { errorHandler } = await import("../middleware/error-handler.js");
-const { isAiConnectionPoolExhausted, aiConnectionPoolRetryAt } = await import("../services/ai-connection-pool.js");
 const { heartbeatService } = await import("../services/heartbeat.js");
+const { encryptCredential } = await import("../services/ai-account-credentials.js");
+const { deviceForEnvironment } = await import("../services/execution-devices.js");
 
 const sub = (n: number) => `sk-ant-oat01-${"a".repeat(30)}${n}`;
 const key = (n: number) => `sk-ant-api03-${"b".repeat(30)}${n}`;
-const now = new Date("2026-10-14T12:00:00.000Z");
-const at = (minutes: number) => new Date(now.getTime() + minutes * 60_000);
-
-describe("pickBalancedAccount", () => {
-  const base = { poolEnabled: true, status: "active" as const, exhaustedUntil: null, lastSelectedAt: null, createdAt: at(-60) };
-  it("prefers the account with the fewest running runs, then the least recently picked", () => {
-    const accounts = [
-      { ...base, id: "a", lastSelectedAt: at(-1) },
-      { ...base, id: "b", lastSelectedAt: at(-5) },
-      { ...base, id: "c", lastSelectedAt: at(-10) },
-    ];
-    expect(pickBalancedAccount(accounts, new Map([["c", 2], ["b", 1]]), now).account?.id).toBe("a");
-    expect(pickBalancedAccount(accounts, new Map(), now).account?.id).toBe("c");
-  });
-
-  it("skips switched-off, signed-out and limited accounts and reports the earliest reset", () => {
-    const accounts = [
-      { ...base, id: "off", poolEnabled: false },
-      { ...base, id: "signed-out", status: "auth_failed" as const },
-      { ...base, id: "later", exhaustedUntil: at(90) },
-      { ...base, id: "sooner", exhaustedUntil: at(30) },
-    ];
-    const choice = pickBalancedAccount(accounts, new Map(), now);
-    expect(choice.account).toBeNull();
-    expect(choice.limitedUntil?.toISOString()).toBe(at(30).toISOString());
-    expect(choice.usable).toBe(2);
-  });
-
-  it("treats a passed limit as available again", () => {
-    const choice = pickBalancedAccount([{ ...base, id: "rested", exhaustedUntil: at(-1) }], new Map(), now);
-    expect(choice.account?.id).toBe("rested");
-  });
-});
-
-describe("pickAccountForRun", () => {
-  const base = { poolEnabled: true, status: "active" as const, exhaustedUntil: null, lastSelectedAt: null, createdAt: at(-60) };
-  const vpn = "project-vpn";
-  const arc = "project-arc";
-  const accounts = [
-    { ...base, id: "m" },
-    { ...base, id: "y" },
-    { ...base, id: "t" },
-  ];
-  const reservations = new Map([["m", new Set([vpn])], ["y", new Set([arc])]]);
-  const pick = (projectId: string | null, overrides: Partial<Parameters<typeof pickAccountForRun>[0]> = {}) =>
-    pickAccountForRun({ accounts, reservations, projectId, overflow: true, running: new Map(), now, ...overrides });
-
-  it("uses the project's own account first, and shared accounts for other runs", () => {
-    expect(pick(vpn)).toMatchObject({ account: { id: "m" }, scope: "project" });
-    expect(pick(arc)).toMatchObject({ account: { id: "y" }, scope: "project" });
-    expect(pick("project-without-account")).toMatchObject({ account: { id: "t" }, scope: "shared" });
-    expect(pick(null)).toMatchObject({ account: { id: "t" }, scope: "shared" });
-  });
-
-  it("moves on to shared, then another project's account, when the project's own accounts rest", () => {
-    const limited = accounts.map((a) => (a.id === "m" ? { ...a, exhaustedUntil: at(30) } : a));
-    expect(pick(vpn, { accounts: limited })).toMatchObject({ account: { id: "t" }, scope: "shared" });
-    const onlyOthers = limited.map((a) => (a.id === "t" ? { ...a, exhaustedUntil: at(45) } : a));
-    expect(pick(vpn, { accounts: onlyOthers })).toMatchObject({ account: { id: "y" }, scope: "overflow" });
-  });
-
-  it("waits for the project's own reset when the host does not allow overflow", () => {
-    const limited = accounts.map((a) => (a.id === "m" ? { ...a, exhaustedUntil: at(30) } : a));
-    const choice = pick(vpn, { accounts: limited, overflow: false });
-    expect(choice.account).toBeNull();
-    expect(choice.limitedUntil?.toISOString()).toBe(at(30).toISOString());
-    expect(pick(null, { overflow: false, accounts: accounts.filter((a) => a.id !== "t") }).account).toBeNull();
-  });
-});
 
 describe("isCreditBalanceFailure", () => {
   it("recognizes the API credit message only", () => {
@@ -108,32 +42,71 @@ describe("isCreditBalanceFailure", () => {
   });
 });
 
-describe("host AI account pools (database)", () => {
+// Fork: P7. The host service administers devices and never picks, balances or
+// moves accounts for a run; pool accounts are bound per agent instead.
+describe("legacy host pool retirement", () => {
+  it("offers no way to choose an account for a run", () => {
+    for (const name of ["pickBalancedAccount", "pickAccountForRun", "HOST_POOL_AUTH_ENV_KEYS", "HOST_POOL_FORBIDDEN_ROUTING_ENV_KEYS", "HOST_POOL_DRIVERS"]) {
+      expect(hostsModule).not.toHaveProperty(name);
+    }
+    const svc = aiAccountHostService({} as never);
+    for (const name of ["selectForRun", "poolHostForEnvironment", "hasAvailableAccount", "countPoolAccounts", "addAccount", "setAccountProjects", "markLimited", "markAuthFailed"]) {
+      expect(svc).not.toHaveProperty(name);
+    }
+  });
+});
+
+describe("execution devices on the legacy host routes (database)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let home: string;
   const companyId = randomUUID();
+  const companyA = randomUUID();
+  const companyB = randomUUID();
   const agentId = randomUUID();
   let localEnvId: string;
   let sshEnvId: string;
   let sandboxEnvId: string;
+  /** Shared SSH environments without a host, so only an explicit mapping gives them a device. */
+  let sharedEnvId: string;
+  let otherSharedEnvId: string;
+  /** Company B's own SSH environment. */
+  let companyBEnvId: string;
 
   beforeAll(async () => {
-    home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-hosts-tests-"));
+    home = await mkdtemp(path.join(process.env.PAPERCLIP_HOME ?? os.tmpdir(), "paperclip-ai-hosts-tests-"));
     vi.stubEnv("PAPERCLIP_HOME", home);
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "ai-hosts-fixture");
     database = await startEmbeddedPostgresTestDatabase("paperclip-ai-hosts-db-");
     db = createDb(database.connectionString);
-    await db.insert(companies).values({ id: companyId, name: "Hosts company", issuePrefix: "HST", defaultResponsibleUserId: "admin" });
-    await db.insert(companyMemberships).values({ companyId, principalId: "admin", principalType: "user", status: "active", membershipRole: "owner" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Builder", adapterType: "claude_local" });
+    await db.insert(companies).values([
+      { id: companyId, name: "Hosts company", issuePrefix: "HST", defaultResponsibleUserId: "admin" },
+      { id: companyA, name: "Alpha", issuePrefix: "ALP" },
+      { id: companyB, name: "Bravo", issuePrefix: "BRV" },
+    ]);
+    const now = new Date();
+    await db.insert(authUsers).values([
+      { id: "admin", name: "Ada Admin", email: "ada@example.com", createdAt: now, updatedAt: now },
+      { id: "owner", name: "Omar Owner", email: "omar@example.com", createdAt: now, updatedAt: now },
+    ]);
+    await db.insert(companyMemberships).values([
+      { companyId, principalId: "admin", principalType: "user", status: "active", membershipRole: "owner" },
+      { companyId: companyA, principalId: "owner", principalType: "user", status: "active", membershipRole: "owner" },
+      { companyId: companyB, principalId: "owner", principalType: "user", status: "active", membershipRole: "owner" },
+    ]);
     const [existingLocal] = await db.select().from(environments).where(eq(environments.driver, "local"));
     const [local] = existingLocal ? [existingLocal] : await db.insert(environments).values({ name: "Local", driver: "local" }).returning();
     const [ssh] = await db.insert(environments).values({ name: "runner: one", driver: "ssh" }).returning();
-    const [sandbox] = await db.insert(environments).values({ name: "Mac sandbox", driver: "sandbox" }).returning();
+    const [sandbox] = await db.insert(environments).values({ name: "Plugin sandbox", driver: "sandbox" }).returning();
+    const [shared] = await db.insert(environments).values({ name: "Build tunnel", driver: "ssh" }).returning();
+    const [otherShared] = await db.insert(environments).values({ name: "Spare tunnel", driver: "ssh" }).returning();
+    const [ownB] = await db.insert(environments).values({ name: "Bravo private tunnel", driver: "ssh", companyId: companyB }).returning();
     localEnvId = local!.id;
     sshEnvId = ssh!.id;
     sandboxEnvId = sandbox!.id;
+    sharedEnvId = shared!.id;
+    otherSharedEnvId = otherShared!.id;
+    companyBEnvId = ownB!.id;
   }, 120_000);
 
   afterAll(async () => {
@@ -143,189 +116,344 @@ describe("host AI account pools (database)", () => {
   });
 
   beforeEach(async () => {
-    await db.execute(sql`truncate table heartbeat_runs, cost_events cascade`);
+    // Agents go with their runs, cost events and bindings; the fixture agent comes back.
+    await db.execute(sql`truncate table agents, heartbeat_runs, cost_events cascade`);
+    await db.insert(agents).values({ id: agentId, companyId, name: "Builder", adapterType: "claude_local" });
     await db.delete(aiAccounts);
     await db.delete(aiAccountHostEnvironments);
     await db.delete(aiAccountHosts);
     await db.delete(activityLog);
   });
 
-  it("limits a host to three accounts and a credential or email to one host", async () => {
-    const svc = aiAccountHostService(db);
-    const server = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    const runner = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
-    for (const n of [1, 2, 3]) {
-      await svc.addAccount(server.id, { label: `S${n}`, credentialType: "subscription", value: sub(n) }, "admin");
-    }
-    await expect(svc.addAccount(server.id, { label: "S4", credentialType: "subscription", value: sub(4) }, "admin"))
-      .rejects.toMatchObject({ status: 409 });
-    await expect(svc.addAccount(runner.id, { label: "copy", credentialType: "subscription", value: sub(1) }, "admin"))
-      .rejects.toMatchObject({ status: 409 });
-    await svc.addAccount(runner.id, { label: "R1", emailHint: "one@example.com", credentialType: "api_key", value: key(1) }, "admin");
-    await expect(svc.addAccount(runner.id, { label: "R2", emailHint: "ONE@example.com", credentialType: "api_key", value: key(2) }, "admin"))
-      .rejects.toMatchObject({ status: 409 });
-  });
+  let accountCount = 0;
+  async function account(input: { label: string; hostId?: string | null; ownerUserId?: string | null; createdByUserId?: string | null; credentialType?: "subscription" | "api_key"; value?: string; emailHint?: string | null }) {
+    accountCount += 1;
+    const value = input.value ?? sub(accountCount);
+    const [row] = await db.insert(aiAccounts).values({
+      hostId: input.hostId ?? null,
+      credentialType: input.credentialType ?? "subscription",
+      label: input.label,
+      emailHint: input.emailHint ?? null,
+      ownerUserId: input.ownerUserId === undefined ? "owner" : input.ownerUserId,
+      createdByUserId: input.createdByUserId === undefined ? "owner" : input.createdByUserId,
+      origin: input.hostId ? "legacy_host_pool" : "pool",
+      credentialMaterial: await encryptCredential(value),
+      credentialFingerprint: randomUUID(),
+      credentialHint: `…${value.slice(-4)}`,
+    }).returning();
+    return row!;
+  }
 
-  it("rejects a credential of the wrong kind", async () => {
-    const svc = aiAccountHostService(db);
-    const host = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    await expect(svc.addAccount(host.id, { label: "x", credentialType: "subscription", value: key(1) }, "admin"))
-      .rejects.toMatchObject({ status: 422 });
-  });
+  /** A Claude agent pinned to an environment and bound to a pool account. */
+  async function boundAgent(company: string, environmentId: string, accountId: string) {
+    const [row] = await db.insert(agents).values({ companyId: company, name: `Agent ${randomUUID().slice(0, 8)}`, adapterType: "claude_local", defaultEnvironmentId: environmentId }).returning();
+    await db.insert(aiAccountAgentBindings).values({ agentId: row!.id, companyId: company, mode: "pool_account", accountId });
+    return row!;
+  }
 
-  it("maps only environments the host kind can run, and moves an environment between hosts", async () => {
+  async function mappedEnvironments(hostId: string) {
+    return (await db.select({ id: aiAccountHostEnvironments.environmentId }).from(aiAccountHostEnvironments)
+      .where(eq(aiAccountHostEnvironments.hostId, hostId))).map((row) => row.id).sort();
+  }
+
+  function appFor(actor: Record<string, unknown>) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: unknown }).actor = actor;
+      next();
+    });
+    app.use("/api", aiAccountHostRoutes(db));
+    app.use(errorHandler);
+    return app;
+  }
+  const admin = { type: "board", source: "session", userId: "admin", isInstanceAdmin: true, companyIds: [companyId] };
+  const member = { type: "board", source: "session", userId: "member", isInstanceAdmin: false, companyIds: [companyId] };
+
+  it("maps only environments the device kind can run, and lets a computer over SSH take plugin sandboxes too (spec 6.1)", async () => {
     const svc = aiAccountHostService(db);
     const server = await svc.createHost({ name: "Server", kind: "server" }, "admin");
     const runner = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
     await expect(svc.setEnvironments(server.id, [sshEnvId])).rejects.toMatchObject({ status: 422 });
-    await expect(svc.setEnvironments(runner.id, [sandboxEnvId])).rejects.toMatchObject({ status: 422 });
+    await expect(svc.setEnvironments(runner.id, [sandboxEnvId])).rejects.toMatchObject({ status: 422, message: expect.stringContaining("takes ssh environments only") });
     await svc.setEnvironments(server.id, [localEnvId]);
     await svc.setEnvironments(runner.id, [sshEnvId]);
-    const mac = await svc.createHost({ name: "Mac over SSH", kind: "mac" }, "admin");
-    await svc.setEnvironments(mac.id, [sshEnvId]);
+    const computer = await svc.createHost({ name: "Computer over SSH", kind: "mac" }, "admin");
+    await svc.setEnvironments(computer.id, [sshEnvId, sandboxEnvId]);
+    // A plugin device takes its plugin's sandboxes only; it comes from the plugin's reports, never from this route.
+    const [pluginDevice] = await db.insert(aiAccountHosts).values({ name: "Plugin device", kind: "external" }).returning();
+    await expect(svc.setEnvironments(pluginDevice!.id, [sshEnvId])).rejects.toMatchObject({ status: 422 });
+    await svc.setEnvironments(pluginDevice!.id, [sandboxEnvId]);
+    // The schema refuses the kind already; the service refuses it too. (`as never`: the schema may narrow the type.)
+    await expect(svc.createHost({ name: "Hand-made plugin device", kind: "external" as never }, "admin")).rejects.toMatchObject({ status: 422 });
     const listed = await svc.list();
     expect(listed.hosts.find((host) => host.id === runner.id)?.environments).toEqual([]);
-    expect(listed.hosts.find((host) => host.id === mac.id)?.environments.map((e) => e.id)).toEqual([sshEnvId]);
+    expect(listed.hosts.find((host) => host.id === computer.id)?.environments.map((e) => e.id)).toEqual([sshEnvId]);
+    expect(listed.hosts.find((host) => host.id === pluginDevice!.id)?.environments.map((e) => e.id)).toEqual([sandboxEnvId]);
     const unmapped = listed.unmappedEnvironments.map((e) => e.id);
-    expect(unmapped).toContain(sandboxEnvId);
+    expect(unmapped).not.toContain(sandboxEnvId);
     expect(unmapped).not.toContain(localEnvId);
     expect(unmapped).not.toContain(sshEnvId);
+    expect(unmapped).toContain(sharedEnvId);
   });
 
-  it("serves a run only on a mapped host with a pool account, never on Mac Fleet sandboxes", async () => {
+  it("refuses a mapping edit that would put more bound accounts on a device than its cap, and writes nothing", async () => {
     const svc = aiAccountHostService(db);
-    const server = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    await svc.setEnvironments(server.id, [localEnvId]);
-    expect(await svc.poolHostForEnvironment({ id: localEnvId, driver: "local" })).toBeNull();
-    await svc.addAccount(server.id, { label: "S", credentialType: "subscription", value: sub(1), poolEnabled: false }, "admin");
-    expect(await svc.poolHostForEnvironment({ id: localEnvId, driver: "local" })).toBeNull();
-    const [account] = await db.select().from(aiAccounts);
-    await svc.updateAccount(account!.id, { poolEnabled: true });
-    expect((await svc.poolHostForEnvironment({ id: localEnvId, driver: "local" }))?.id).toBe(server.id);
-    expect(await svc.poolHostForEnvironment({ id: sandboxEnvId, driver: "sandbox" })).toBeNull();
-    expect(await svc.poolHostForEnvironment(null)).toBeNull();
+    const app = appFor(admin);
+    const device = await svc.createHost({ name: "Studio", kind: "mac", maxAccounts: 1 }, "admin");
+    const first = await account({ label: "Max one" });
+    const second = await account({ label: "Max two" });
+    await boundAgent(companyA, sharedEnvId, first.id);
+    await boundAgent(companyB, otherSharedEnvId, second.id);
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId] }).expect(200);
+    await db.delete(activityLog);
+
+    const refused = await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`)
+      .send({ environmentIds: [sharedEnvId, otherSharedEnvId] }).expect(409);
+    expect(refused.body).toMatchObject({
+      code: "device_account_limit",
+      details: { code: "device_account_limit", deviceId: device.id, deviceName: "Studio", limit: 1, inUse: 2, accounts: ["Max one", "Max two"] },
+    });
+    expect(refused.body.error).toBe(
+      "With these environments, agents that can run on Studio would use 2 Claude accounts, more than its limit of 1. " +
+      "Move some of those agents to another device or give them other accounts first.",
+    );
+    expect(await mappedEnvironments(device.id)).toEqual([sharedEnvId]);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+
+    // A device already over its cap keeps its accounts and may still lose environments, but takes no new account.
+    await boundAgent(companyA, sharedEnvId, second.id);
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId] }).expect(200);
+    const third = await account({ label: "Max three" });
+    await boundAgent(companyB, otherSharedEnvId, third.id);
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId, otherSharedEnvId] }).expect(409);
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [] }).expect(200);
+    expect(await mappedEnvironments(device.id)).toEqual([]);
   });
 
-  it("spreads runs across accounts, decrypts the chosen credential and rests a limited account", async () => {
+  it("refuses to lower a device's cap below the accounts bound to agents that can run on it", async () => {
     const svc = aiAccountHostService(db);
+    const app = appFor(admin);
+    const device = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
+    await svc.setEnvironments(device.id, [sharedEnvId, otherSharedEnvId]);
+    const first = await account({ label: "Max one" });
+    const second = await account({ label: "Max two" });
+    await boundAgent(companyA, sharedEnvId, first.id);
+    await boundAgent(companyA, otherSharedEnvId, second.id);
+    // An agent on a device-login binding takes no account slot.
+    const [ownLogin] = await db.insert(agents).values({ companyId: companyA, name: "Own login", adapterType: "claude_local", defaultEnvironmentId: sharedEnvId }).returning();
+    await db.insert(aiAccountAgentBindings).values({ agentId: ownLogin!.id, companyId: companyA, mode: "device_login" });
+
+    const refused = await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ maxAccounts: 1 }).expect(409);
+    expect(refused.body).toMatchObject({ code: "device_account_limit", details: { deviceId: device.id, limit: 1, inUse: 2, accounts: ["Max one", "Max two"] } });
+    expect(refused.body.error).toBe(
+      "Agents that can run on Runner use 2 Claude accounts, more than 1. " +
+      "Move some of those agents to another device or give them other accounts before lowering the limit.",
+    );
+    expect((await svc.getHost(device.id)).maxAccounts).toBe(3);
+
+    expect((await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ maxAccounts: 2 }).expect(200)).body).toMatchObject({ maxAccounts: 2 });
+    await svc.createHost({ name: "Other", kind: "ssh_host" }, "admin");
+    const taken = await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ name: "Other" }).expect(409);
+    expect(taken.body.error).toBe("A device with this name already exists");
+  });
+
+  it("logs a device change only in the companies whose agents use the device, never in every company", async () => {
+    const svc = aiAccountHostService(db);
+    const app = appFor(admin);
+    const shared = await account({ label: "Max one" });
+    // Alpha runs on the shared tunnel, Bravo on its own private tunnel; the fixture company runs on neither.
+    await boundAgent(companyA, sharedEnvId, shared.id);
+    await db.insert(agents).values({ companyId: companyB, name: "Bravo agent", adapterType: "claude_local", defaultEnvironmentId: companyBEnvId });
+    const logged = async () => (await db.select().from(activityLog).orderBy(asc(activityLog.createdAt)))
+      .map((row) => ({ companyId: row.companyId, action: row.action, details: row.details }));
+
+    const device = (await request(app).post("/api/instance/ai-hosts").send({ name: "Build box", kind: "ssh_host" }).expect(201)).body;
+    // No agent uses a new device, so no company hears of it.
+    expect(await logged()).toEqual([]);
+
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId] }).expect(200);
+    expect(await logged()).toEqual([
+      { companyId: companyA, action: "execution_device.updated", details: { deviceName: "Build box", changedKeys: ["environments"], environments: ["Build tunnel"] } },
+    ]);
+    await db.delete(activityLog);
+
+    await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ name: "Build box 2" }).expect(200);
+    expect(await logged()).toEqual([
+      { companyId: companyA, action: "execution_device.updated", details: { deviceName: "Build box 2", changedKeys: ["name"], maxAccounts: 3, previousName: "Build box" } },
+    ]);
+    await db.delete(activityLog);
+
+    // Bravo starts using the device: both companies hear of it, and Alpha never sees Bravo's environment name.
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId, companyBEnvId] }).expect(200);
+    const both = await logged();
+    expect(both.map((row) => row.companyId).sort()).toEqual([companyA, companyB].sort());
+    expect(both.find((row) => row.companyId === companyA)?.details).toEqual({
+      deviceName: "Build box 2", changedKeys: ["environments"], environments: ["Build tunnel"], otherEnvironments: 1,
+    });
+    expect(both.find((row) => row.companyId === companyB)?.details).toEqual({
+      deviceName: "Build box 2", changedKeys: ["environments"], environments: expect.arrayContaining(["Build tunnel", "Bravo private tunnel"]),
+    });
+    expect(JSON.stringify(both.find((row) => row.companyId === companyA))).not.toContain("Bravo private tunnel");
+    await db.delete(activityLog);
+
+    await request(app).delete(`/api/instance/ai-hosts/${device.id}`).expect(200);
+    expect((await logged()).map((row) => `${row.companyId}:${row.action}`).sort())
+      .toEqual([`${companyA}:execution_device.deleted`, `${companyB}:execution_device.deleted`].sort());
+    expect((await db.select().from(activityLog)).some((row) => row.companyId === companyId)).toBe(false);
+  });
+
+  it("answers 410 on the moved account routes and names the routes that replace them", async () => {
+    const svc = aiAccountHostService(db);
+    const app = appFor(admin);
     const host = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
-    const { account: first } = await svc.addAccount(host.id, { label: "M", credentialType: "subscription", value: sub(1) }, "admin");
-    const { account: second } = await svc.addAccount(host.id, { label: "Y", credentialType: "api_key", value: key(2) }, "admin");
-    expect(first.credentialMaterial).not.toHaveProperty("value");
-    expect(JSON.stringify(first.credentialMaterial)).not.toContain(sub(1));
+    const added = await request(app).post(`/api/instance/ai-hosts/${host.id}/accounts`)
+      .send({ label: "S", credentialType: "subscription", value: sub(5) }).expect(410);
+    expect(added.body).toMatchObject({
+      code: "ai_account_route_moved",
+      details: { code: "ai_account_route_moved", replacements: ["POST /api/me/ai-accounts", "PUT /api/agents/{agentId}/ai-account"] },
+    });
+    expect(added.body.error).toContain("POST /api/me/ai-accounts");
+    expect(JSON.stringify(added.body)).not.toContain(sub(5));
+    // Any body and any caller get the same answer; nothing is stored.
+    await request(appFor(member)).post(`/api/instance/ai-hosts/${host.id}/accounts`).send({}).expect(410);
+    expect(await db.select().from(aiAccounts)).toHaveLength(0);
 
-    const one = await svc.selectForRun({ host, runId: randomUUID(), now: at(0) });
-    const two = await svc.selectForRun({ host, runId: randomUUID(), now: at(1) });
-    expect(new Set([one.account.id, two.account.id])).toEqual(new Set([first.id, second.id]));
-    const byId = new Map([[one.account.id, one], [two.account.id, two]]);
-    expect(byId.get(first.id)?.value).toBe(sub(1));
-    expect(byId.get(first.id)?.envKey).toBe("CLAUDE_CODE_OAUTH_TOKEN");
-    expect(byId.get(second.id)?.value).toBe(key(2));
-    expect(byId.get(second.id)?.envKey).toBe("ANTHROPIC_API_KEY");
-    expect(one.attribution).toMatchObject({ mode: "host_pool", hostId: host.id, hostName: "Runner" });
+    const existing = await account({ label: "Legacy", hostId: host.id });
+    const reserved = await request(app).put(`/api/instance/ai-accounts/${existing.id}/projects`).send({ projectIds: [] }).expect(410);
+    expect(reserved.body).toMatchObject({ code: "ai_account_route_moved", details: { replacements: ["PATCH /api/me/ai-accounts/{accountId}"] } });
+    expect(reserved.body.error).toContain("clearProjectRestriction");
 
-    await svc.markLimited({ accountId: first.id, until: at(120), reason: "provider_quota", runId: null });
-    await svc.markLimited({ accountId: first.id, until: at(30), reason: "provider_quota", runId: null });
-    const [rested] = await db.select().from(aiAccounts).where(eq(aiAccounts.id, first.id));
-    expect(rested!.exhaustedUntil?.toISOString()).toBe(at(120).toISOString());
-    for (let i = 0; i < 3; i += 1) {
-      expect((await svc.selectForRun({ host, runId: randomUUID(), now: at(2 + i) })).account.id).toBe(second.id);
-    }
-
-    await svc.markLimited({ accountId: second.id, until: at(60), reason: "credit_balance", runId: null });
-    const error = await svc.selectForRun({ host, runId: randomUUID(), now: at(10) }).catch((e: unknown) => e);
-    expect(isAiConnectionPoolExhausted(error)).toBe(true);
-    expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(60).toISOString());
-    expect(await svc.hasAvailableAccount(host.id, at(10))).toBe(false);
-    expect(await svc.hasAvailableAccount(host.id, at(61))).toBe(true);
+    // The account PATCH, clear-limit and DELETE routes belong to the account pool router now.
+    await request(app).patch(`/api/instance/ai-accounts/${existing.id}`).send({ label: "Renamed" }).expect(404);
+    await request(app).post(`/api/instance/ai-accounts/${existing.id}/clear-limit`).send({}).expect(404);
+    await request(app).delete(`/api/instance/ai-accounts/${existing.id}`).expect(404);
+    expect(await db.select().from(aiAccounts)).toEqual([expect.objectContaining({ id: existing.id, label: "Legacy" })]);
   });
 
-  it("reserves accounts for projects across companies and serves each project its own account", async () => {
+  it("is for instance admins only, lists accounts with their owner and origin, and never returns a credential", async () => {
     const svc = aiAccountHostService(db);
-    const otherCompanyId = randomUUID();
-    await db.insert(companies).values({ id: otherCompanyId, name: "Other company", issuePrefix: "OTH" }).onConflictDoNothing();
-    const [vpn] = await db.insert(projects).values({ companyId, name: "VPN Platform" }).returning();
-    const [arc] = await db.insert(projects).values({ companyId: otherCompanyId, name: "Arch AI" }).returning();
-    const host = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
-    const { account: m } = await svc.addAccount(host.id, { label: "M", credentialType: "subscription", value: sub(1) }, "admin");
-    const { account: y } = await svc.addAccount(host.id, { label: "Y", credentialType: "subscription", value: sub(2) }, "admin");
-    const { account: t } = await svc.addAccount(host.id, { label: "T", credentialType: "subscription", value: sub(3) }, "admin");
-    await svc.setAccountProjects(m.id, [vpn!.id]);
-    await svc.setAccountProjects(y.id, [arc!.id]);
-    await expect(svc.setAccountProjects(t.id, [randomUUID()])).rejects.toMatchObject({ status: 422 });
-    for (let i = 0; i < 3; i += 1) {
-      expect((await svc.selectForRun({ host, runId: randomUUID(), projectId: vpn!.id, now: at(i) })).account.id).toBe(m.id);
-      expect((await svc.selectForRun({ host, runId: randomUUID(), projectId: arc!.id, now: at(i) })).account.id).toBe(y.id);
-      expect((await svc.selectForRun({ host, runId: randomUUID(), projectId: null, now: at(i) })).account.id).toBe(t.id);
-    }
-    const listed = await svc.list();
-    const accountsById = new Map(listed.hosts[0]!.accounts.map((account) => [account.id, account]));
-    expect(accountsById.get(m.id)?.projects).toEqual([expect.objectContaining({ id: vpn!.id, name: "VPN Platform", companyName: "Hosts company", issuePrefix: "HST" })]);
-    expect(accountsById.get(t.id)?.projects).toEqual([]);
-    expect(listed.projects.map((project) => project.id)).toEqual(expect.arrayContaining([vpn!.id, arc!.id]));
-
-    await svc.markLimited({ accountId: m.id, until: at(120), reason: "provider_quota", runId: null });
-    const borrowed = await svc.selectForRun({ host, runId: randomUUID(), projectId: vpn!.id, now: at(5) });
-    expect(borrowed.account.id).toBe(t.id);
-    expect(borrowed.attribution.scope).toBe("shared");
-    await svc.updateHost(host.id, { overflowToOtherAccounts: false });
-    const refreshed = await svc.getHost(host.id);
-    const waiting = await svc.selectForRun({ host: refreshed, runId: randomUUID(), projectId: vpn!.id, now: at(6) }).catch((e: unknown) => e);
-    expect(isAiConnectionPoolExhausted(waiting)).toBe(true);
-    await svc.setAccountProjects(m.id, []);
-    expect((await svc.list()).hosts[0]!.accounts.find((account) => account.id === m.id)?.projects).toEqual([]);
+    await request(appFor(member)).get("/api/instance/ai-hosts").expect(403);
+    await request(appFor({ type: "agent", agentId, companyId })).get("/api/instance/ai-hosts").expect(403);
+    await request(appFor(member)).patch(`/api/instance/ai-hosts/${randomUUID()}`).send({ name: "x" }).expect(403);
+    // A plugin device comes only from its plugin's reports.
+    await request(appFor(admin)).post("/api/instance/ai-hosts").send({ name: "Hand-made", kind: "external" }).expect(400);
+    const host = await svc.createHost({ name: "Server", kind: "server" }, "admin");
+    await account({ label: "Owned", hostId: host.id, ownerUserId: null, createdByUserId: "admin", value: sub(7), emailHint: "someone.private@example.com" });
+    await account({ label: "Ownerless", hostId: host.id, ownerUserId: null, createdByUserId: null, credentialType: "api_key", value: key(8) });
+    await account({ label: "Pool", hostId: null });
+    const listed = await request(appFor(admin)).get("/api/instance/ai-hosts").expect(200);
+    expect(JSON.stringify(listed.body)).not.toContain(sub(7));
+    expect(JSON.stringify(listed.body)).not.toContain(key(8));
+    expect(listed.body.maxAccountsPerHost).toBe(3);
+    // Only accounts first added to a host are listed under it.
+    expect(listed.body.hosts[0].accounts).toEqual([
+      expect.objectContaining({ label: "Owned", origin: "legacy_host_pool", owner: { userId: "admin", name: "Ada Admin", email: "ada@example.com" } }),
+      expect.objectContaining({ label: "Ownerless", origin: "legacy_host_pool", owner: null, credentialType: "api_key" }),
+    ]);
+    // Only the owner sees an account's e-mail hint unmasked; instance admins see it masked, as on /api/instance/ai-accounts.
+    expect(listed.body.hosts[0].accounts[0].emailHint).toBe("so•••@example.com");
+    expect(listed.body.hosts[0].accounts[1].emailHint).toBeNull();
+    expect(JSON.stringify(listed.body)).not.toContain("someone.private");
   });
 
-  it("reports Paperclip's own use of each account per window and the last limit", async () => {
+  it("counts running runs and Paperclip's own use of each account from pool runs and legacy host-pool runs alike", async () => {
     const svc = aiAccountHostService(db);
     const host = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    const { account } = await svc.addAccount(host.id, { label: "S", credentialType: "api_key", value: key(7) }, "admin");
+    const legacy = await account({ label: "S", hostId: host.id, credentialType: "api_key", value: key(7) });
     const realNow = Date.now();
     const hoursAgo = (hours: number) => new Date(realNow - hours * 60 * 60 * 1000);
-    const runAt = async (when: Date, input: number, output: number, cents: number) => {
+    const runAt = async (when: Date, mode: "host_pool" | "pool_account", input: number, output: number, cents: number) => {
       const id = randomUUID();
       await db.insert(heartbeatRuns).values({
         id, companyId, agentId, invocationSource: "assignment", status: "succeeded", finishedAt: when,
-        contextSnapshot: { aiConnection: { mode: "host_pool", accountId: account.id, hostId: host.id } },
+        contextSnapshot: { aiConnection: { mode, accountId: legacy.id, hostId: host.id } },
       });
       await db.insert(costEvents).values({
         companyId, agentId, heartbeatRunId: id, provider: "anthropic", model: "claude-opus-5-5",
         inputTokens: input, cachedInputTokens: input * 10, outputTokens: output, costCents: cents, occurredAt: when,
       });
     };
-    await runAt(hoursAgo(1), 1000, 100, 50);
-    await runAt(hoursAgo(2), 2000, 200, 70);
-    await runAt(hoursAgo(30), 4000, 400, 90);
-    await runAt(hoursAgo(24 * 9), 8000, 800, 110);
-    await svc.markLimited({ accountId: account.id, until: at(60), reason: "credit_balance", runId: null });
+    await runAt(hoursAgo(1), "host_pool", 1000, 100, 50);
+    await runAt(hoursAgo(2), "pool_account", 2000, 200, 70);
+    await runAt(hoursAgo(30), "pool_account", 4000, 400, 90);
+    await runAt(hoursAgo(24 * 9), "host_pool", 8000, 800, 110);
+    for (const mode of ["host_pool", "pool_account", "company_pool"]) {
+      await db.insert(heartbeatRuns).values({
+        companyId, agentId, invocationSource: "assignment", status: "running",
+        contextSnapshot: { aiConnection: { mode, accountId: legacy.id } },
+      });
+    }
+    await db.update(aiAccounts).set({ exhaustedUntil: new Date(realNow + 60 * 60_000), limitReason: "credit_balance", lastLimitedAt: new Date(realNow) })
+      .where(eq(aiAccounts.id, legacy.id));
     const listed = (await svc.list()).hosts[0]!.accounts[0]!;
     expect(listed.usage.lastFiveHours).toEqual({ runs: 2, inputTokens: 3000, cachedInputTokens: 30000, outputTokens: 300, costCents: 120 });
     expect(listed.usage.lastSevenDays).toMatchObject({ runs: 3, inputTokens: 7000, outputTokens: 700, costCents: 210 });
+    expect(listed.runningRuns).toBe(2);
     expect(listed.lastLimitedAt).not.toBeNull();
     expect(listed.limitReason).toBe("credit_balance");
   });
 
-  it("takes a signed-out account out of the pool until it is set active again", async () => {
+  it("lets an environment return to a device already over its cap when that device gains no account", async () => {
     const svc = aiAccountHostService(db);
-    const host = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    const { account } = await svc.addAccount(host.id, { label: "S", credentialType: "subscription", value: sub(1) }, "admin");
-    await svc.markAuthFailed({ accountId: account.id, message: "Invalid bearer token" });
-    const error = await svc.selectForRun({ host, runId: randomUUID(), now }).catch((e: unknown) => e);
-    expect(error).toMatchObject({ status: 422, details: { code: "ai_account_host_unavailable" } });
-    await svc.updateAccount(account.id, { status: "active" });
-    expect((await svc.selectForRun({ host, runId: randomUUID(), now })).account.id).toBe(account.id);
+    const app = appFor(admin);
+    // Two SSH environments reach one machine, which Paperclip finds by its host.
+    const ssh = { host: "studio.example.com", port: 22, username: "runner" };
+    const [tunnel] = await db.insert(environments).values({ name: "F tunnel", driver: "ssh", config: ssh }).returning();
+    const [second] = await db.insert(environments).values({ name: "E1 tunnel", driver: "ssh", config: ssh }).returning();
+    const machine = (await deviceForEnvironment(db, tunnel!))!;
+    expect(machine.name).toBe("SSH · F tunnel");
+    // The machine already holds two accounts against a cap of one; the second environment's agent uses one of them.
+    await db.update(aiAccountHosts).set({ maxAccounts: 1 }).where(eq(aiAccountHosts.id, machine.id));
+    const first = await account({ label: "Max one" });
+    const other = await account({ label: "Max two" });
+    await boundAgent(companyA, tunnel!.id, first.id);
+    await boundAgent(companyA, tunnel!.id, other.id);
+    await boundAgent(companyA, second!.id, first.id);
+    const desk = await svc.createHost({ name: "Studio desk", kind: "ssh_host" }, "admin");
+
+    await request(app).put(`/api/instance/ai-hosts/${desk.id}/environments`).send({ environmentIds: [second!.id] }).expect(200);
+    // Back to the machine: it keeps its accounts and gains none, so the edit stands.
+    await request(app).put(`/api/instance/ai-hosts/${desk.id}/environments`).send({ environmentIds: [] }).expect(200);
+    expect(await mappedEnvironments(desk.id)).toEqual([]);
+
+    // A new account on the machine is still refused.
+    await request(app).put(`/api/instance/ai-hosts/${desk.id}/environments`).send({ environmentIds: [second!.id] }).expect(200);
+    await boundAgent(companyA, second!.id, (await account({ label: "Max three" })).id);
+    const refused = await request(app).put(`/api/instance/ai-hosts/${desk.id}/environments`).send({ environmentIds: [] }).expect(409);
+    expect(refused.body).toMatchObject({ code: "device_account_limit", details: { deviceId: machine.id, deviceName: "SSH · F tunnel", limit: 1, inUse: 3 } });
+    expect(await mappedEnvironments(desk.id)).toEqual([second!.id]);
   });
 
-  it("imports the server's own token without returning it", async () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", sub(9));
-    const svc = aiAccountHostService(db);
-    const host = await svc.createHost({ name: "Server", kind: "server" }, "admin");
-    const { account } = await svc.addAccount(host.id, { label: "S", credentialType: "subscription", importFrom: { kind: "server_env" } }, "admin");
-    expect(account.credentialHint).toBe(`…${sub(9).slice(-4)}`);
-    expect((await svc.selectForRun({ host, runId: randomUUID(), now })).value).toBe(sub(9));
-    vi.unstubAllEnvs();
-    vi.stubEnv("PAPERCLIP_HOME", home);
-    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "ai-hosts-fixture");
+  it("answers 404 for a malformed device id on every route that takes one", async () => {
+    const app = appFor(admin);
+    const patched = await request(app).patch("/api/instance/ai-hosts/not-a-uuid").send({ name: "x" });
+    expect(patched.status).toBe(404);
+    expect(patched.body).toEqual({ error: "Device not found" });
+    expect((await request(app).delete("/api/instance/ai-hosts/not-a-uuid")).status).toBe(404);
+    const mapped = await request(app).put("/api/instance/ai-hosts/not-a-uuid/environments").send({ environmentIds: [] });
+    expect(mapped.status).toBe(404);
+    expect(mapped.body).toEqual({ error: "Device not found" });
+    // Still for instance admins first.
+    expect((await request(appFor(member)).delete("/api/instance/ai-hosts/not-a-uuid")).status).toBe(403);
+  });
+
+  it("logs a device change only when something changed", async () => {
+    const app = appFor(admin);
+    const shared = await account({ label: "Max one" });
+    await boundAgent(companyA, sharedEnvId, shared.id);
+    const device = (await request(app).post("/api/instance/ai-hosts").send({ name: "Build box", kind: "ssh_host" }).expect(201)).body;
+    await request(app).put(`/api/instance/ai-hosts/${device.id}/environments`).send({ environmentIds: [sharedEnvId] }).expect(200);
+    await db.delete(activityLog);
+
+    await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({}).expect(200);
+    await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ name: "Build box", maxAccounts: 3 }).expect(200);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+
+    await request(app).patch(`/api/instance/ai-hosts/${device.id}`).send({ name: "Build box", maxAccounts: 2 }).expect(200);
+    expect((await db.select().from(activityLog)).map((row) => ({ companyId: row.companyId, details: row.details }))).toEqual([
+      { companyId: companyA, details: { deviceName: "Build box", changedKeys: ["maxAccounts"], maxAccounts: 2 } },
+    ]);
   });
 
   // Fork: P7 removed the host-pool failover. A legacy host-pool run that hits a
@@ -335,9 +463,9 @@ describe("host AI account pools (database)", () => {
     async function setup() {
       const svc = aiAccountHostService(db);
       const host = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
-      const { account: first } = await svc.addAccount(host.id, { label: "M", credentialType: "subscription", value: sub(1) }, "admin");
-      const { account: second } = await svc.addAccount(host.id, { label: "Y", credentialType: "api_key", value: key(2) }, "admin");
-      return { svc, host, first, second };
+      const first = await account({ label: "M", hostId: host.id, ownerUserId: null, createdByUserId: "admin" });
+      const second = await account({ label: "Y", hostId: host.id, ownerUserId: null, createdByUserId: "admin", credentialType: "api_key", value: key(2) });
+      return { host, first, second };
     }
     async function failedRun(input: { hostId: string; accountId: string; error?: string; errorCode?: string; retryNotBefore?: string; failovers?: number }) {
       const id = randomUUID();
@@ -403,42 +531,6 @@ describe("host AI account pools (database)", () => {
       expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true });
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
       expect(retries.map((retry) => retry.scheduledRetryReason)).toEqual(["ai_account_wait"]);
-    });
-  });
-
-  describe("routes", () => {
-    function appFor(actor: Record<string, unknown>) {
-      const app = express();
-      app.use(express.json());
-      app.use((req, _res, next) => {
-        (req as unknown as { actor: unknown }).actor = actor;
-        next();
-      });
-      app.use("/api", aiAccountHostRoutes(db));
-      app.use(errorHandler);
-      return app;
-    }
-    const admin = { type: "board", source: "session", userId: "admin", isInstanceAdmin: true, companyIds: [companyId] };
-    const member = { type: "board", source: "session", userId: "member", isInstanceAdmin: false, companyIds: [companyId] };
-
-    it("is for instance admins only and never returns a credential", async () => {
-      await request(appFor(member)).get("/api/instance/ai-hosts").expect(403);
-      await request(appFor({ type: "agent", agentId, companyId })).get("/api/instance/ai-hosts").expect(403);
-      const app = appFor(admin);
-      const host = (await request(app).post("/api/instance/ai-hosts").send({ name: "Server", kind: "server" }).expect(201)).body;
-      await request(app).put(`/api/instance/ai-hosts/${host.id}/environments`).send({ environmentIds: [localEnvId] }).expect(200);
-      const created = await request(app).post(`/api/instance/ai-hosts/${host.id}/accounts`)
-        .send({ label: "S", credentialType: "subscription", value: sub(5) }).expect(201);
-      expect(JSON.stringify(created.body)).not.toContain(sub(5));
-      const listed = await request(app).get("/api/instance/ai-hosts").expect(200);
-      expect(JSON.stringify(listed.body)).not.toContain(sub(5));
-      expect(listed.body.hosts[0].accounts[0]).toMatchObject({ label: "S", credentialType: "subscription", status: "active", poolEnabled: true });
-      expect(listed.body.maxAccountsPerHost).toBe(3);
-      await request(app).post(`/api/instance/ai-hosts/${host.id}/accounts`)
-        .send({ label: "bad", credentialType: "subscription" }).expect(400);
-      const logged = await db.select().from(activityLog);
-      expect(logged.map((row) => row.action)).toEqual(expect.arrayContaining(["ai_account_host.created", "ai_account.created"]));
-      expect(JSON.stringify(logged)).not.toContain(sub(5));
     });
   });
 });

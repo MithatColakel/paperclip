@@ -25,7 +25,8 @@ import { touchedAt, wakeResourceWaits } from "./wake.js";
  *   slot waits are re-evaluated from the database. When the run may proceed
  *   it is made due now and the caller promotes it; otherwise the answer is
  *   `still_unavailable` with the fresh wait (heartbeat answers 409
- *   `resource_still_unavailable`). Once per minute per issue (429).
+ *   `resource_still_unavailable`). Once per minute per issue (429), and
+ *   separately once per minute per issue for comments.
  * - `checkEnvironmentsNow`: the device page's "Check now": forced checks of
  *   the environments the company may use, in its context, then a wake of the
  *   company's waits on them. Once per minute per device.
@@ -117,7 +118,10 @@ export async function readScheduledRetryResourceWaits(
       && episode.kind === context.kind && episode.resourceKey === resourceKeyOf(context)
       ? episode
       : null;
-    const adopted = forResource(episodes.find((episode) => episode.currentRunId === run.id && !episode.resolvedAt));
+    // The run's own open episode is its wait, as the hold sees it, even after a
+    // device link moved it to the linked device since the context was written.
+    const adopted = episodes.find((episode) => episode.currentRunId === run.id && !episode.resolvedAt
+      && episode.companyId === run.companyId && episode.kind === context.kind);
     const owned = adopted ?? forResource(byId.get(context.episodeId));
     result.set(run.id, {
       ...context,
@@ -183,7 +187,9 @@ export function createCheckNow(runtime: {
       return { outcome: "not_waiting", runId: input.runId };
     }
     const { issueId } = chainOfRun(run);
-    const slot = await acquireCheckNowSlot(db, { companyId: run.companyId, key: issueId ? `issue:${issueId}` : `run:${run.id}`, now });
+    // A comment's check has a slot of its own, so it never spends the minute of "Check now".
+    const scope = issueId ? `issue:${issueId}` : `run:${run.id}`;
+    const slot = await acquireCheckNowSlot(db, { companyId: run.companyId, key: input.source === "comment" ? `comment:${scope}` : scope, now });
     if (!slot) return { outcome: "rate_limited", runId: run.id, retryAfterMs: RESOURCE_WAIT_TIMINGS.checkNowWindowMs };
 
     // The hold's own view of the wait: the run's episode, or its own context.

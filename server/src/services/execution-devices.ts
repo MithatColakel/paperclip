@@ -1261,7 +1261,12 @@ export async function linkTarget(
       await tx.update(aiAccountRunSlots).set({ deviceId: device.id }).where(eq(aiAccountRunSlots.deviceId, source.id));
       await tx.update(aiAccountHostEnvironments).set({ hostId: device.id }).where(eq(aiAccountHostEnvironments.hostId, source.id));
       await tx.update(resourceWaitEpisodes)
-        .set({ deviceId: device.id, updatedAt: now })
+        .set({
+          deviceId: device.id,
+          // A slot wait is keyed by its device: it stays the same episode on this one.
+          resourceKey: sql`case when ${resourceWaitEpisodes.kind} = 'device_slots' then ${`device:${device.id}`} else ${resourceWaitEpisodes.resourceKey} end`,
+          updatedAt: now,
+        })
         .where(and(eq(resourceWaitEpisodes.deviceId, source.id), isNull(resourceWaitEpisodes.resolvedAt)));
       await tx.delete(aiAccountHosts).where(eq(aiAccountHosts.id, source.id));
     }

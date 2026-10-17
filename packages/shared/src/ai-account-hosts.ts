@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { AiAccountOrigin, AiAccountOwnerRef } from "./ai-account-pool.js";
 
 /**
  * Fork: execution hosts (devices) and their Claude accounts. A host is a
@@ -99,6 +100,10 @@ export interface AiAccountSummary {
   lastSelectedAt: string | null;
   lastUsedAt: string | null;
   createdAt: string;
+  /** The effective owner; null for a legacy account without one. Absent from servers that predate it. */
+  owner?: AiAccountOwnerRef | null;
+  /** Absent from servers that predate it. */
+  origin?: AiAccountOrigin;
 }
 
 export interface AiAccountHostEnvironmentSummary {

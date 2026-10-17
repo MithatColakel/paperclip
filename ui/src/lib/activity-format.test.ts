@@ -172,6 +172,8 @@ describe("account pool and wait activity (fork)", () => {
     expect(formatActivityVerb("ai_account.binding_cleared", null)).toBe("cleared the Claude account of");
     expect(formatActivityVerb("ai_account.admin_disabled", { label: "Team Max" })).toBe("disabled Claude account Team Max");
     expect(formatActivityVerb("execution_device.linked", null)).toBe("linked an execution device");
+    expect(formatActivityVerb("execution_device.deleted", { deviceName: "Build box" })).toBe("removed an execution device");
+    expect(formatActivityVerb("execution_device.checked", { deviceName: "Build box", woken: 1 })).toBe("checked an execution device");
     expect(formatActivityVerb("company.execution_wait_settings_updated", null)).toBe("updated wait notices for");
   });
 

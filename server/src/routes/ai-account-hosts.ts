@@ -1,49 +1,70 @@
 import { Router, type Request } from "express";
-import { companies, type Db } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
 import {
   createAiAccountHostSchema,
-  createAiAccountSchema,
+  isEnvironmentAvailableToCompany,
+  isUuidLike,
   setAiAccountHostEnvironmentsSchema,
-  setAiAccountProjectsSchema,
   updateAiAccountHostSchema,
-  updateAiAccountSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { HttpError, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiAccountHostService } from "../services/ai-account-hosts.js";
-import { getActorInfo } from "./authz.js";
+import { assertInstanceAdmin, getActorInfo } from "./authz.js";
 
 /**
- * Fork: instance-level Claude accounts per execution host. Every route is
- * for instance admins only, because a host's accounts serve every company's
- * runs. Mutations are logged in every company, like instance settings.
+ * Fork: the legacy host routes, now instance-admin administration of
+ * execution devices (spec 12). Every route is for instance admins only, since
+ * one device serves every company's runs. A device change is logged only in
+ * the companies whose agents use the device. Accounts moved to the account
+ * pool routes: adding an account to a host or reserving it for projects
+ * answers 410, and the account PATCH, clear-limit and DELETE routes are
+ * served by the pool router under `/api/instance/ai-accounts/:accountId`.
  */
-function assertInstanceAdmin(req: Request) {
-  if (req.actor.type !== "board") throw forbidden("Board access required");
-  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
-  throw forbidden("Instance admin access required");
+
+/** The device fields a rename or limit change may touch, in `changedKeys` order. */
+const HOST_AUDIT_KEYS = ["maxAccounts", "name", "overflowToOtherAccounts"] as const;
+
+/** 410 `ai_account_route_moved`, naming the routes that replace a legacy one. */
+function routeMoved(message: string, replacements: string[]) {
+  return new HttpError(410, message, { code: "ai_account_route_moved", replacements });
 }
 
 export function aiAccountHostRoutes(db: Db) {
   const router = Router();
   const svc = aiAccountHostService(db);
 
-  async function audit(req: Request, action: string, entityType: string, entityId: string, details: Record<string, unknown>) {
+  /** One entry per company whose agents use the device (spec 12); no other company gets one. */
+  async function audit(
+    req: Request,
+    companyIds: readonly string[],
+    action: string,
+    deviceId: string,
+    details: (companyId: string) => Record<string, unknown>,
+  ) {
     const actor = getActorInfo(req);
-    const companyIds = (await db.select({ id: companies.id }).from(companies)).map((row) => row.id);
-    await Promise.all(companyIds.map((companyId) => logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action,
-      entityType,
-      entityId,
-      details,
-    })));
+    for (const companyId of companyIds) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action,
+        entityType: "execution_device",
+        entityId: deviceId,
+        details: details(companyId),
+      });
+    }
+  }
+
+  /** A malformed id is a 404, as on the device routes, never a query that fails to cast it. */
+  function hostIdParam(req: Request): string {
+    const hostId = req.params.hostId as string;
+    if (!isUuidLike(hostId)) throw notFound("Device not found");
+    return hostId;
   }
 
   router.get("/instance/ai-hosts", async (req, res) => {
@@ -54,75 +75,72 @@ export function aiAccountHostRoutes(db: Db) {
   router.post("/instance/ai-hosts", validate(createAiAccountHostSchema), async (req, res) => {
     assertInstanceAdmin(req);
     const host = await svc.createHost(req.body, req.actor.userId ?? null);
-    await audit(req, "ai_account_host.created", "ai_account_host", host.id, { name: host.name, kind: host.kind, maxAccounts: host.maxAccounts });
+    // Nothing to log: no agent uses a device before an environment is mapped to it.
     res.status(201).json(host);
   });
 
   router.patch("/instance/ai-hosts/:hostId", validate(updateAiAccountHostSchema), async (req, res) => {
     assertInstanceAdmin(req);
-    const host = await svc.updateHost(req.params.hostId as string, req.body);
-    await audit(req, "ai_account_host.updated", "ai_account_host", host.id, { changedKeys: Object.keys(req.body).sort(), name: host.name, maxAccounts: host.maxAccounts, overflowToOtherAccounts: host.overflowToOtherAccounts });
+    const previous = await svc.getHost(hostIdParam(req));
+    const host = await svc.updateHost(previous.id, req.body);
+    // Only what really changed: a request that changes nothing logs nothing.
+    const changedKeys = HOST_AUDIT_KEYS.filter((key) => previous[key] !== host[key]);
+    if (changedKeys.length > 0) {
+      await audit(req, await svc.companiesUsingDevices([host.id]), "execution_device.updated", host.id, () => ({
+        deviceName: host.name,
+        changedKeys,
+        maxAccounts: host.maxAccounts,
+        ...(previous.name !== host.name ? { previousName: previous.name } : {}),
+      }));
+    }
     res.json(host);
   });
 
   router.delete("/instance/ai-hosts/:hostId", async (req, res) => {
     assertInstanceAdmin(req);
-    const host = await svc.deleteHost(req.params.hostId as string);
-    await audit(req, "ai_account_host.deleted", "ai_account_host", host.id, { name: host.name });
+    const hostId = hostIdParam(req);
+    // Read before the delete: afterwards no agent reaches the device.
+    const companyIds = await svc.companiesUsingDevices([hostId]);
+    const host = await svc.deleteHost(hostId);
+    await audit(req, companyIds, "execution_device.deleted", host.id, () => ({ deviceName: host.name }));
     res.json({ ok: true });
   });
 
   router.put("/instance/ai-hosts/:hostId/environments", validate(setAiAccountHostEnvironmentsSchema), async (req, res) => {
     assertInstanceAdmin(req);
-    const result = await svc.setEnvironments(req.params.hostId as string, req.body.environmentIds);
-    await audit(req, "ai_account_host.environments_updated", "ai_account_host", result.host.id, {
-      name: result.host.name,
-      environments: result.environments.map((environment) => environment.name),
+    const hostId = hostIdParam(req);
+    // Companies that used the device before the edit, or use it after.
+    const before = await svc.companiesUsingDevices([hostId]);
+    const result = await svc.setEnvironments(hostId, req.body.environmentIds);
+    const after = await svc.companiesUsingDevices([hostId]);
+    await audit(req, [...new Set([...before, ...after])].sort(), "execution_device.updated", result.host.id, (companyId) => {
+      // Another company's own environments are counted, never named.
+      const visible = result.environments.filter((environment) => isEnvironmentAvailableToCompany(environment, companyId));
+      const otherEnvironments = result.environments.length - visible.length;
+      return {
+        deviceName: result.host.name,
+        changedKeys: ["environments"],
+        environments: visible.map((environment) => environment.name),
+        ...(otherEnvironments > 0 ? { otherEnvironments } : {}),
+      };
     });
-    res.json(result);
+    res.json({ host: result.host, environments: result.environments });
   });
 
-  router.post("/instance/ai-hosts/:hostId/accounts", validate(createAiAccountSchema), async (req, res) => {
-    assertInstanceAdmin(req);
-    const { host, account } = await svc.addAccount(req.params.hostId as string, req.body, req.actor.userId ?? null);
-    await audit(req, "ai_account.created", "ai_account", account.id, {
-      host: host.name,
-      label: account.label,
-      credentialType: account.credentialType,
-      source: req.body.importFrom?.kind ?? "pasted",
-    });
-    res.status(201).json(svc.summarizeAccount(account, 0));
+  router.post("/instance/ai-hosts/:hostId/accounts", () => {
+    throw routeMoved(
+      "Claude accounts now belong to the person who adds them. Add one with POST /api/me/ai-accounts, " +
+        "then assign it to an agent with PUT /api/agents/{agentId}/ai-account.",
+      ["POST /api/me/ai-accounts", "PUT /api/agents/{agentId}/ai-account"],
+    );
   });
 
-  router.patch("/instance/ai-accounts/:accountId", validate(updateAiAccountSchema), async (req, res) => {
-    assertInstanceAdmin(req);
-    const { account } = await svc.updateAccount(req.params.accountId as string, req.body);
-    await audit(req, "ai_account.updated", "ai_account", account.id, { label: account.label, changedKeys: Object.keys(req.body).sort(), poolEnabled: account.poolEnabled, status: account.status });
-    res.json(svc.summarizeAccount(account, 0));
-  });
-
-  router.put("/instance/ai-accounts/:accountId/projects", validate(setAiAccountProjectsSchema), async (req, res) => {
-    assertInstanceAdmin(req);
-    const result = await svc.setAccountProjects(req.params.accountId as string, req.body.projectIds);
-    await audit(req, "ai_account.projects_updated", "ai_account", result.account.id, {
-      label: result.account.label,
-      projects: result.projects.map((project) => `${project.issuePrefix}: ${project.name}`),
-    });
-    res.json({ accountId: result.account.id, projects: result.projects });
-  });
-
-  router.post("/instance/ai-accounts/:accountId/clear-limit", async (req, res) => {
-    assertInstanceAdmin(req);
-    const account = await svc.clearLimit(req.params.accountId as string);
-    await audit(req, "ai_account.limit_cleared", "ai_account", account.id, { label: account.label });
-    res.json(svc.summarizeAccount(account, 0));
-  });
-
-  router.delete("/instance/ai-accounts/:accountId", async (req, res) => {
-    assertInstanceAdmin(req);
-    const account = await svc.deleteAccount(req.params.accountId as string);
-    await audit(req, "ai_account.deleted", "ai_account", account.id, { label: account.label });
-    res.json({ ok: true });
+  router.put("/instance/ai-accounts/:accountId/projects", () => {
+    throw routeMoved(
+      "Project reservations are no longer edited here. A reserved account serves only the companies of its " +
+        "projects until its owner clears that with PATCH /api/me/ai-accounts/{accountId} and clearProjectRestriction.",
+      ["PATCH /api/me/ai-accounts/{accountId}"],
+    );
   });
 
   return router;

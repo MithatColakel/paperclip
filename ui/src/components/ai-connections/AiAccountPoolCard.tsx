@@ -1,31 +1,27 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Plus, X } from "lucide-react";
-import type { AiConnectionPoolMemberSummary, AiConnectionPoolSummary, AiConnectionPoolUsageWindowKey } from "@paperclipai/shared";
+import type { AiConnectionPoolMemberSummary, AiConnectionPoolSummary } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatDateTime } from "@/lib/utils";
 import { AI_CONNECTION_STATUS, aiMethodLabel } from "./model";
 
-const USAGE_LABELS: Record<AiConnectionPoolUsageWindowKey, string> = {
-  five_hour: "Session",
-  seven_day: "Week",
-  seven_day_opus: "Opus week",
-  seven_day_sonnet: "Sonnet week",
-};
-
+/**
+ * A limit a run met. Fork: Paperclip no longer reads usage, so a mark its
+ * retired usage probe left is no limit, and no reading is shown (P7).
+ */
 function limitedUntil(member: AiConnectionPoolMemberSummary, now: number) {
+  if (member.quotaSource === "usage_probe") return null;
   return member.exhaustedUntil && new Date(member.exhaustedUntil).getTime() > now ? member.exhaustedUntil : null;
 }
 
-function usageSummary(member: AiConnectionPoolMemberSummary) {
-  return member.usageWindows
-    .filter((window) => window.usedPercent != null)
-    .map((window) => `${USAGE_LABELS[window.key]} ${Math.round(window.usedPercent!)}%`)
-    .join(" · ");
-}
-
-/** Orders a company's shared Claude accounts; runs move down the list when an account hits its usage limit. */
+/**
+ * Fork: the legacy company pool of shared Claude accounts (spec 15.5). Each
+ * agent on it stays on the account it used last, and one that has used none
+ * starts on the top account. A limited account's tasks wait for its reset;
+ * Paperclip never moves them to another account.
+ */
 export function AiAccountPoolCard({ companyId }: { companyId: string }) {
   const client = useQueryClient();
   const queryKey = ["ai-connections", companyId, "pool", "anthropic"];
@@ -56,8 +52,9 @@ export function AiAccountPoolCard({ companyId }: { companyId: string }) {
       <div className="space-y-1">
         <h2 className="text-sm font-semibold">Claude account pool</h2>
         <p className="text-xs text-muted-foreground">
-          Agents set to “Company account pool” use these shared accounts from the top. When an account reaches its usage
-          limit, the task moves to the next account and the limited one returns after its reset.
+          Agents already on the company pool stay on the account they used last and wait for its reset when it reaches
+          its usage limit; an agent that has used none starts on the top account. Paperclip never moves a task to another
+          account, and the pool takes no new agents.
         </p>
       </div>
       {error && (
@@ -69,7 +66,6 @@ export function AiAccountPoolCard({ companyId }: { companyId: string }) {
         <ol className="divide-y divide-border rounded-md border border-border">
           {members.map((member, index) => {
             const until = limitedUntil(member, now);
-            const usage = usageSummary(member);
             return (
               <li key={member.connectionId} className="flex flex-wrap items-center gap-3 px-3 py-2">
                 <span className="text-xs font-mono text-muted-foreground">{index + 1}</span>
@@ -78,7 +74,6 @@ export function AiAccountPoolCard({ companyId }: { companyId: string }) {
                   <p className="truncate text-xs text-muted-foreground">
                     {aiMethodLabel(member.provider, member.method)}
                     {member.accountLabel ? ` · ${member.accountLabel}` : ""}
-                    {usage ? ` · ${usage}` : ""}
                   </p>
                 </div>
                 {until ? (

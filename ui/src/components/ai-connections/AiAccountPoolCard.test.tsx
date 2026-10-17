@@ -40,8 +40,8 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-async function mount() {
-  api.pool.mockResolvedValue(summary);
+async function mount(pool: AiConnectionPoolSummary = summary) {
+  api.pool.mockResolvedValue(pool);
   api.replacePool.mockResolvedValue(summary);
   const container = document.createElement("div");
   document.body.append(container);
@@ -65,14 +65,39 @@ async function click(label: string) {
 }
 
 describe("AiAccountPoolCard", () => {
-  it("shows pool order, usage limits and usage", async () => {
+  it("shows pool order and usage limits", async () => {
     await mount();
     const text = document.body.textContent ?? "";
     expect(text).toContain("Max one");
     expect(text).toContain("Usage limit until");
-    expect(text).toContain("Session 100%");
     expect(text).toContain("Available");
     expect(text.indexOf("Max one")).toBeLessThan(text.indexOf("Max two"));
+  });
+
+  // Fork: P7. Paperclip no longer reads usage; a stored reading is never shown, and a
+  // mark the retired usage probe left is no limit.
+  it("shows no usage reading, and no limit for a mark the usage probe left", async () => {
+    await mount({
+      ...summary,
+      members: [
+        summary.members[0]!,
+        { ...summary.members[1]!, exhaustedUntil: "2099-01-01T16:00:00.000Z", quotaReason: "usage_threshold", quotaSource: "usage_probe" },
+      ],
+    });
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("Session 100%");
+    expect(text).not.toMatch(/\d+%/);
+    expect(text.match(/Usage limit until/g)).toHaveLength(1);
+    expect(text).toContain("Available");
+  });
+
+  // Fork: P7. A limited account's tasks wait for its reset; nothing moves them to another account.
+  it("says an agent stays on its account and waits for the reset", async () => {
+    await mount();
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("stay on the account they used last and wait for its reset");
+    expect(text).toContain("Paperclip never moves a task to another account");
+    expect(text).not.toMatch(/moves to the next account/i);
   });
 
   it("reorders, adds accounts and clears a limit", async () => {

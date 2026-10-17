@@ -184,6 +184,7 @@ import {
   nativeRunFinalizations,
   projects,
   projectWorkspaces,
+  resourceWaitEpisodes,
   routineRevisions,
   routineRuns,
   routines,
@@ -16741,10 +16742,10 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // Raised today only when every account in a company AI pool is at its usage
-  // limit (`ai_connection_pool_exhausted`, with the earliest reset as the
-  // delay). A stored run row can also still carry `ai_connection_busy` from an
-  // earlier release.
+  // Raised today only when the company AI pool account an agent is pinned to
+  // is at its usage limit (`ai_connection_pool_exhausted`, with that account's
+  // reset as the delay). A stored run row can also still carry
+  // `ai_connection_busy` from an earlier release.
   async function finalizeAiConnectionBusyDeferral(
     run: typeof heartbeatRuns.$inferSelect,
     error: HttpError,
@@ -17015,7 +17016,9 @@ export function heartbeatService(
         ),
       )
       .orderBy(
-        // Fork: the task's own execution run first, so a mentioned agent's wait never shadows the assignee's.
+        // Fork: the task's open wait episode's current run first (the issue projection ranks it the same way).
+        sql`(${heartbeatRuns.id} = (select ${resourceWaitEpisodes.currentRunId} from ${resourceWaitEpisodes} where ${resourceWaitEpisodes.companyId} = ${companyId} and ${resourceWaitEpisodes.issueId} = ${issueId} and ${resourceWaitEpisodes.resolvedAt} is null)) desc nulls last`,
+        // Fork: then the task's own execution run, so a mentioned agent's wait never shadows the assignee's.
         sql`(${heartbeatRuns.id} = (select ${issues.executionRunId} from ${issues} where ${issues.id} = ${issueId} and ${issues.companyId} = ${companyId})) desc nulls last`,
         desc(heartbeatRuns.updatedAt),
         desc(heartbeatRuns.createdAt),
@@ -22554,7 +22557,8 @@ export function heartbeatService(
             const poolRetryAt = poolExhausted ? aiConnectionPoolRetryAt(error) : null;
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake, poolExhausted ? {
               delayMs: poolRetryAt ? Math.max(0, poolRetryAt.getTime() - Date.now()) : AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS,
-              waitMessage: `Every account in the company AI pool is at its usage limit. This task resumes${poolRetryAt ? ` at ${poolRetryAt.toISOString()}` : " when an account is available"}.`,
+              // Fork: the pool is pinned (P7); the run waits for its own account's reset.
+              waitMessage: `This agent's account in the company AI pool is at its usage limit. Paperclip never moves a task to another account; this task resumes${poolRetryAt ? ` at ${poolRetryAt.toISOString()}` : " when that account is available"}.`,
             } : undefined);
             return;
           }

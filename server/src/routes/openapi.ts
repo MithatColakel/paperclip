@@ -13,9 +13,19 @@ import {
   createAiAccountHostSchema,
   updateAiAccountHostSchema,
   setAiAccountHostEnvironmentsSchema,
-  createAiAccountSchema,
-  updateAiAccountSchema,
-  setAiAccountProjectsSchema,
+  // Fork: the Claude account pool, execution devices and waits.
+  AI_ACCOUNT_INCOMPATIBLE_REASONS,
+  createMyAiAccountSchema,
+  linkDeviceTargetSchema,
+  replaceAiAccountCredentialSchema,
+  setAgentAiAccountSchema,
+  updateExecutionDeviceSchema,
+  updateExecutionWaitSettingsSchema,
+  updateInstanceAiAccountSchema,
+  updateMyAiAccountSchema,
+  type AiAccountIncompatibleErrorDetails,
+  type AiAccountInUseErrorDetails,
+  type DeviceAccountLimitErrorDetails,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -757,6 +767,151 @@ const importRequestBody = (schema: z.ZodTypeAny) => ({
 
 const r = responses;
 
+// ─── Fork: Claude account pool error contract (spec 12) ──────────────────────
+//
+// The account pool, binding, device and wait routes answer coded errors as
+// `{ error, code, details }`: `code` repeats `details.code`, and `details` is
+// one of the shapes below. The shapes with a packages/shared type are checked
+// against it, so the document cannot drift from the server.
+
+const deviceAccountLimitDetailsSchema = z.object({
+  code: z.literal("device_account_limit"),
+  deviceId: z.string(),
+  deviceName: z.string(),
+  limit: z.number().int(),
+  inUse: z.number().int(),
+  accounts: z.array(z.string()),
+  otherCompaniesAccounts: z.number().int(),
+}) satisfies z.ZodType<DeviceAccountLimitErrorDetails>;
+
+const aiAccountIncompatibleDetailsSchema = z.object({
+  code: z.literal("ai_account_incompatible"),
+  reason: z.enum(AI_ACCOUNT_INCOMPATIBLE_REASONS),
+  deviceName: z.string().nullable().optional(),
+  environmentName: z.string().nullable().optional(),
+}) satisfies z.ZodType<AiAccountIncompatibleErrorDetails>;
+
+const aiAccountInUseDetailsSchema = z.object({
+  code: z.literal("ai_account_in_use"),
+  bindings: z.array(z.object({ agentId: z.string(), agentName: z.string(), companyId: z.string(), companyName: z.string() })),
+  otherCompanies: z.number().int(),
+}) satisfies z.ZodType<AiAccountInUseErrorDetails>;
+
+const aiAccountNotEligibleDetailsSchema = z.object({
+  code: z.literal("ai_account_not_eligible"),
+  reason: z.literal("reserved_elsewhere").optional(),
+});
+
+const resourceStillUnavailableDetailsSchema = z.object({
+  code: z.literal("resource_still_unavailable"),
+  resourceWait: z.record(z.string(), z.unknown()).nullable(),
+  checkedAt: z.string().datetime(),
+});
+
+const checkNowRateLimitedDetailsSchema = z.object({
+  code: z.literal("check_now_rate_limited"),
+  retryAfterMs: z.number().int(),
+});
+
+const aiAccountRouteMovedDetailsSchema = z.object({
+  code: z.literal("ai_account_route_moved"),
+  replacements: z.array(z.string()),
+});
+
+/** One coded error: its code, and its `details` shape when it carries more than the code. */
+type CodedErrorVariant = readonly [code: string, details?: z.ZodTypeAny];
+
+function codedError(description: string, ...variants: [CodedErrorVariant, ...CodedErrorVariant[]]): OpenApiResponse {
+  const codes = variants.map(([code]) => code);
+  const details = variants.map(([code, schema]) => schema ?? z.object({ code: z.literal(code) }));
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: z.object({
+          error: z.string(),
+          code: z.enum(codes).optional(),
+          details: (details.length === 1 ? details[0]! : z.union(details)).optional(),
+        }),
+      },
+    },
+  };
+}
+
+/**
+ * A coded error on an upstream route, which answers the same status with
+ * codes of its own too: there `code` is any string and `details` any object.
+ * The fork's codes are listed in `x-paperclip-error-codes`, and the `details`
+ * each one carries in `x-paperclip-error-details`.
+ */
+function upstreamCodedError(description: string, ...variants: [CodedErrorVariant, ...CodedErrorVariant[]]): OpenApiResponse {
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: z.object({
+          error: z.string(),
+          code: z.string().optional(),
+          details: z.record(z.string(), z.unknown()).optional(),
+        }),
+      },
+    },
+    "x-paperclip-error-codes": variants.map(([code]) => code),
+    "x-paperclip-error-details": Object.fromEntries(
+      variants.flatMap(([code, schema]) => (schema ? [[code, zodToOpenApiSchema(schema)]] : [])),
+    ),
+  };
+}
+
+/** Refusals of the account pool's placement rules (spec 5.6) when an agent moves to another environment. */
+const aiAccountPlacementResponses: Record<string, OpenApiResponse> = {
+  403: upstreamCodedError(
+    "Forbidden. `ai_account_binding_forbidden`: the agent uses a Claude account from the pool, and the caller is the agent itself, or neither that account's owner nor a company admin. Other refusals carry their own codes.",
+    ["ai_account_binding_forbidden"],
+  ),
+  409: upstreamCodedError(
+    "Conflict. `placement_conflict`: the agent's environment changed meanwhile. `device_account_limit`: a device of the new placement has no room for the agent's Claude account. Other conflicts carry their own codes.",
+    ["placement_conflict"],
+    ["device_account_limit", deviceAccountLimitDetailsSchema],
+  ),
+  422: upstreamCodedError(
+    "Unprocessable. `ai_account_incompatible`: a device of the new placement is unknown, or does not accept the agent's Claude account. Other refusals carry their own codes.",
+    ["ai_account_incompatible", aiAccountIncompatibleDetailsSchema],
+  ),
+};
+
+/** A new or changed AI connection binding that the account pool retires (spec 4.1, 15.5). */
+const retiredAiConnectionBindingResponses: Record<string, OpenApiResponse> = {
+  422: upstreamCodedError(
+    "Unprocessable. `ai_connection_company_pool_retired`: a new or changed company pool binding. `ai_connection_router_unsupported`: a connection router for a Claude agent. Other refusals carry their own codes.",
+    ["ai_connection_company_pool_retired"],
+    ["ai_connection_router_unsupported"],
+  ),
+};
+
+/** An agent save: both of the above. */
+const agentSaveAiAccountPoolResponses: Record<string, OpenApiResponse> = {
+  ...aiAccountPlacementResponses,
+  422: upstreamCodedError(
+    "Unprocessable. `ai_account_incompatible`: a device of the new placement is unknown, or does not accept the agent's Claude account. `ai_connection_company_pool_retired` and `ai_connection_router_unsupported`: a retired AI connection binding. Other refusals carry their own codes.",
+    ["ai_account_incompatible", aiAccountIncompatibleDetailsSchema],
+    ["ai_connection_company_pool_retired"],
+    ["ai_connection_router_unsupported"],
+  ),
+};
+
+/** "Check now" on a task that waits for a device, a Claude account or an account slot (spec 7.5). */
+const resourceWaitCheckNowResponses: Record<string, OpenApiResponse> = {
+  409: codedError(
+    "Conflict. `resource_still_unavailable`: the forced check found the resource still unavailable; `details.resourceWait` is the fresh wait.",
+    ["resource_still_unavailable", resourceStillUnavailableDetailsSchema],
+  ),
+  429: codedError(
+    "Too many requests. `check_now_rate_limited`: once a minute; `details.retryAfterMs` says when the next check may run.",
+    ["check_now_rate_limited", checkNowRateLimitedDetailsSchema],
+  ),
+};
+
 const externalObjectSummariesBodySchema = z
   .object({
     issueIds: z.array(z.string().guid()).max(1000),
@@ -1329,6 +1484,9 @@ const PUBLIC_OPERATIONS = new Set([
   "POST /mcp/gateways/{gatewayPublicId}",
   "GET /api/tool-gateway/gateways/{gatewayId}/mcp",
   "POST /api/tool-gateway/gateways/{gatewayId}/mcp",
+  // Fork: retired account routes; every caller gets the same 410.
+  "POST /api/instance/ai-hosts/{hostId}/accounts",
+  "PUT /api/instance/ai-accounts/{accountId}/projects",
 ]);
 
 const BOARD_ONLY_PREFIXES = [
@@ -1370,16 +1528,23 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/pool",
   "PUT /api/companies/{companyId}/ai-connections/pool",
   "POST /api/companies/{companyId}/ai-connections/pool/{connectionId}/clear-limit",
-  "GET /api/instance/ai-hosts",
-  "POST /api/instance/ai-hosts",
-  "PATCH /api/instance/ai-hosts/{hostId}",
-  "DELETE /api/instance/ai-hosts/{hostId}",
-  "PUT /api/instance/ai-hosts/{hostId}/environments",
-  "POST /api/instance/ai-hosts/{hostId}/accounts",
-  "PATCH /api/instance/ai-accounts/{accountId}",
-  "PUT /api/instance/ai-accounts/{accountId}/projects",
-  "POST /api/instance/ai-accounts/{accountId}/clear-limit",
-  "DELETE /api/instance/ai-accounts/{accountId}",
+  // Fork: the Claude account pool and execution devices. Agents read only their own binding.
+  "GET /api/me/ai-accounts",
+  "POST /api/me/ai-accounts",
+  "PATCH /api/me/ai-accounts/{accountId}",
+  "PUT /api/me/ai-accounts/{accountId}/credential",
+  "POST /api/me/ai-accounts/{accountId}/clear-limit",
+  "DELETE /api/me/ai-accounts/{accountId}",
+  "GET /api/companies/{companyId}/ai-accounts",
+  "GET /api/companies/{companyId}/ai-account-bindings",
+  "PUT /api/agents/{agentId}/ai-account",
+  "DELETE /api/agents/{agentId}/ai-account",
+  "POST /api/agents/{agentId}/ai-account/review",
+  "GET /api/companies/{companyId}/devices",
+  "GET /api/companies/{companyId}/devices/{deviceId}",
+  "POST /api/companies/{companyId}/devices/{deviceId}/check-now",
+  "GET /api/companies/{companyId}/execution-wait-settings",
+  "PUT /api/companies/{companyId}/execution-wait-settings",
 
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
@@ -1611,6 +1776,21 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
   "PUT /api/admin/users/{userId}/company-access",
+  // Fork: execution devices and Claude accounts across the instance.
+  "GET /api/instance/ai-hosts",
+  "POST /api/instance/ai-hosts",
+  "PATCH /api/instance/ai-hosts/{hostId}",
+  "DELETE /api/instance/ai-hosts/{hostId}",
+  "PUT /api/instance/ai-hosts/{hostId}/environments",
+  "GET /api/instance/ai-accounts",
+  "PATCH /api/instance/ai-accounts/{accountId}",
+  "POST /api/instance/ai-accounts/{accountId}/clear-limit",
+  "DELETE /api/instance/ai-accounts/{accountId}",
+  "GET /api/instance/ai-accounts/migration",
+  "POST /api/instance/ai-accounts/migration/run",
+  "GET /api/instance/devices",
+  "PATCH /api/instance/devices/{deviceId}",
+  "POST /api/instance/devices/{deviceId}/link-target",
 ]);
 
 const CREATED_OPERATIONS = new Set([
@@ -3246,7 +3426,8 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createAgentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // Fork: the account pool's retired AI connection bindings.
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, ...retiredAiConnectionBindingResponses },
 });
 
 registry.registerPath({
@@ -3258,7 +3439,8 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createAgentHireSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // Fork: the account pool's retired AI connection bindings.
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, ...retiredAiConnectionBindingResponses },
 });
 
 registry.registerPath({
@@ -3489,6 +3671,8 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+    // Fork: the account pool's placement rules and retired AI connection bindings.
+    ...agentSaveAiAccountPoolResponses,
   },
 });
 
@@ -3643,7 +3827,8 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Roll back to a config revision",
   request: { params: z.object({ id: z.string(), revisionId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  // Fork: the account pool's placement rules.
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, ...aiAccountPlacementResponses },
 });
 
 registry.registerPath({
@@ -5228,7 +5413,8 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(resolveApprovalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // Fork: the account pool's placement rules for a hire's environment.
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, ...aiAccountPlacementResponses },
 });
 
 registry.registerPath({
@@ -10148,6 +10334,8 @@ registerCurrentRoute({
   path: "/api/issues/{id}/scheduled-retry/retry-now",
   tags: ["issues"],
   summary: "Retry a scheduled issue run now",
+  // Fork: a run waiting for a device, a Claude account or a slot gets a forced check first.
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, ...resourceWaitCheckNowResponses },
 });
 
 registerCurrentRoute({
@@ -10525,92 +10713,593 @@ registerCurrentRoute({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
-// --- Host Claude account pools (fork) ----------------------------------------
+// --- Claude account pool, execution devices and waits (fork) ----------------
+//
+// Spec 12: routes/ai-account-pool.ts, ai-account-pool-migration.ts,
+// execution-devices.ts and the legacy ai-account-hosts.ts. Success bodies are
+// named after their packages/shared types. No response carries a credential
+// value. Coded errors follow the account pool error contract above.
 
-registerCurrentRoute({
+/** A JSON success body of the named packages/shared type. */
+const sharedBody = (type: string, status = "Success") => ({
+  description: `${status}: \`${type}\``,
+  content: { "application/json": { schema: z.record(z.string(), z.unknown()) } },
+});
+
+const because = (response: OpenApiResponse, reason: string): OpenApiResponse => ({
+  ...response,
+  description: `${response.description as string}: ${reason}`,
+});
+
+const aiAccountDuplicateResponse = (reason: string) =>
+  codedError(`Conflict. \`ai_account_duplicate\`: ${reason}`, ["ai_account_duplicate"]);
+
+const aiAccountBindingForbiddenResponse = (reason: string) =>
+  codedError(`Forbidden. \`ai_account_binding_forbidden\`: ${reason}`, ["ai_account_binding_forbidden"]);
+
+const aiAccountInUseResponse = codedError(
+  "Conflict. `ai_account_in_use`: agents still use the account. `bindings` names those the caller may see; other companies are a count.",
+  ["ai_account_in_use", aiAccountInUseDetailsSchema],
+);
+
+const deviceAccountLimitResponse = (reason: string) =>
+  codedError(`Conflict. \`device_account_limit\`: ${reason}`, ["device_account_limit", deviceAccountLimitDetailsSchema]);
+
+const aiAccountRouteMovedResponse = codedError(
+  "Gone. `ai_account_route_moved`: `details.replacements` names the routes that replace this one.",
+  ["ai_account_route_moved", aiAccountRouteMovedDetailsSchema],
+);
+
+/** `release=true` frees the agents that use the account; their runs then wait until another one is chosen. */
+const aiAccountReleaseQuery = z.object({ release: z.enum(["true"]).optional() });
+
+function registerForkRoute(input: {
+  method: string;
+  path: string;
+  tags: string[];
+  summary: string;
+  description: string;
+  query?: z.ZodTypeAny;
+  body?: z.ZodTypeAny;
+  responses: Record<string, OpenApiResponse>;
+}) {
+  const params = paramsSchemaFromPath(input.path);
+  registry.registerPath({
+    method: input.method,
+    path: input.path,
+    tags: input.tags,
+    summary: input.summary,
+    description: input.description,
+    request: {
+      ...(params ? { params } : {}),
+      ...(input.query ? { query: input.query } : {}),
+      ...(input.body ? { body: jsonBody(input.body) } : {}),
+    },
+    responses: input.responses,
+  });
+}
+
+// My accounts
+
+registerForkRoute({
   method: "get",
-  path: "/api/instance/ai-hosts",
+  path: "/api/me/ai-accounts",
   tags: ["ai-accounts"],
-  summary: "List execution hosts with their Claude accounts, environments, usage and projects (instance admin)",
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "List my Claude accounts",
+  description:
+    "Board users only; agents get 403. The caller's own pool accounts. `usedBy` names the agents of the caller's " +
+    "companies that use each account; other companies are a count.",
+  responses: { 200: sharedBody("MyAiAccountsResponse"), 401: r.unauthorized, 403: r.forbidden },
 });
 
-registerCurrentRoute({
+registerForkRoute({
   method: "post",
-  path: "/api/instance/ai-hosts",
+  path: "/api/me/ai-accounts",
   tags: ["ai-accounts"],
-  summary: "Create an execution host for Claude accounts (instance admin)",
-  body: createAiAccountHostSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Add a Claude account that I own",
+  description:
+    "Board users only. Exactly one source: a pasted `value`; `importFrom: { kind: 'ai_connection', companyId, " +
+    "connectionId }`, the caller's own personal grant of a saved Claude connection; or `importFrom: { kind: " +
+    "'server_env' }`, the server's environment token, for instance admins only. The caller owns the account, which is " +
+    "usable only in companies where its owner is an active member, so a caller with no company gets 422. The token is " +
+    "stored encrypted and is never returned or logged.",
+  body: createMyAiAccountSchema,
+  responses: {
+    201: sharedBody("MyAiAccount", "Created"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: because(r.forbidden, "an agent, a `server_env` import by a user who is not an instance admin, or a connection that is not the caller's own"),
+    409: aiAccountDuplicateResponse("the credential is already in Paperclip, or the caller already has an account with this e-mail hint."),
+    422: because(r.unprocessable, "the caller is an active member of no company, or the value does not fit the credential type"),
+  },
 });
 
-registerCurrentRoute({
+registerForkRoute({
   method: "patch",
-  path: "/api/instance/ai-hosts/{hostId}",
+  path: "/api/me/ai-accounts/{accountId}",
   tags: ["ai-accounts"],
-  summary: "Rename a host, change its account limit or overflow rule (instance admin)",
-  body: updateAiAccountHostSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Edit, withdraw or resume my Claude account",
+  description:
+    "The owner only: another user's account, or a malformed id, answers 404. `status: 'disabled'` withdraws the " +
+    "account for every company and `'active'` resumes it; a signed-out account answers 422 to both, because only a new " +
+    "token brings it back. `clearProjectRestriction: true` removes the project reservation that limits it to some " +
+    "companies. Resuming and clearing the reservation wake the account's waits.",
+  body: updateMyAiAccountSchema,
+  responses: {
+    200: sharedBody("MyAiAccount"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: aiAccountDuplicateResponse("the owner already has an account with this e-mail hint."),
+    422: because(r.unprocessable, "the account is signed out"),
+  },
 });
 
-registerCurrentRoute({
-  method: "delete",
-  path: "/api/instance/ai-hosts/{hostId}",
-  tags: ["ai-accounts"],
-  summary: "Remove a host and its accounts (instance admin)",
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
-});
-
-registerCurrentRoute({
+registerForkRoute({
   method: "put",
-  path: "/api/instance/ai-hosts/{hostId}/environments",
+  path: "/api/me/ai-accounts/{accountId}/credential",
   tags: ["ai-accounts"],
-  summary: "Replace the environments that run on a host (instance admin)",
-  body: setAiAccountHostEnvironmentsSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Replace the token of my Claude account",
+  description:
+    "The owner only (404 otherwise). The new value must be of the account's credential type (422). The account is " +
+    "active again: its limit, strikes and sign-in suspicion are cleared, and its waits are woken. The token is never " +
+    "returned or logged.",
+  body: replaceAiAccountCredentialSchema,
+  responses: {
+    200: sharedBody("MyAiAccount"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: aiAccountDuplicateResponse("the credential is already in Paperclip."),
+    422: because(r.unprocessable, "the value is of another credential type"),
+  },
 });
 
-registerCurrentRoute({
+registerForkRoute({
   method: "post",
-  path: "/api/instance/ai-hosts/{hostId}/accounts",
+  path: "/api/me/ai-accounts/{accountId}/clear-limit",
   tags: ["ai-accounts"],
-  summary: "Add a Claude setup token or API key to a host; at most three per host (instance admin)",
-  body: createAiAccountSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Clear the usage limit of my Claude account",
+  description:
+    "The owner only (404 otherwise), after checking the account: its reset time, strikes, limit episode, probe claim " +
+    "and an unconfirmed sign-in failure are cleared, and its waits are woken.",
+  responses: { 200: sharedBody("MyAiAccount"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
-registerCurrentRoute({
+registerForkRoute({
+  method: "delete",
+  path: "/api/me/ai-accounts/{accountId}",
+  tags: ["ai-accounts"],
+  summary: "Remove my Claude account",
+  description:
+    "The owner only (404 otherwise). While agents use the account this answers 409 `ai_account_in_use`, unless " +
+    "`release=true`: their bindings then keep pool mode without an account, and their runs wait until another account " +
+    "is chosen.",
+  query: aiAccountReleaseQuery,
+  responses: { 204: r.noContent, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: aiAccountInUseResponse },
+});
+
+// Company accounts and agent bindings
+
+registerForkRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-accounts",
+  tags: ["ai-accounts"],
+  summary: "List the Claude accounts available in a company",
+  description:
+    "Board users with access to the company; agents get 403. The accounts eligible in the company (their owner is an " +
+    "active member, and they are neither withdrawn nor reserved for another company's projects), each with `canBind` " +
+    "for the caller. With `agentId`, each also carries `selectable`, `reason`, `warning` and `onAgentDevice` for that " +
+    "agent; an agent of another company answers 404.",
+  query: z.object({ agentId: z.string().uuid().optional() }),
+  responses: { 200: sharedBody("CompanyAiAccountsResponse"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-account-bindings",
+  tags: ["ai-accounts"],
+  summary: "List the Claude account bindings of a company's agents",
+  description:
+    "Board users with access to the company; agents get 403. Every non-terminated Claude agent, plus agents on other " +
+    "adapters that still hold a binding (`supported: false`), so that it can be removed.",
+  responses: { 200: sharedBody("CompanyAiAccountBindingsResponse"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/agents/{agentId}/ai-account",
+  tags: ["ai-accounts", "agents"],
+  summary: "Get an agent's Claude account binding",
+  description:
+    "Board users with access to the agent's company, and the agent itself; another agent gets 403, and an agent outside " +
+    "the caller's companies answers 404. The binding with the agent's candidate devices; for board users also the " +
+    "company's accounts with this agent's `selectable`, `reason` and `warning`.",
+  responses: { 200: sharedBody("AgentAiAccountBindingDetail"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "put",
+  path: "/api/agents/{agentId}/ai-account",
+  tags: ["ai-accounts", "agents"],
+  summary: "Bind an agent to a Claude account, or to its device's own login",
+  description:
+    "The account's owner or a company admin (spec 5.1); agents never change bindings. Checked in one transaction under " +
+    "the bindings lock: the account is eligible in the agent's company, the agent is a Claude agent, every candidate " +
+    "environment reaches a known device that accepts the credential type, and no device exceeds its account limit. The " +
+    "binding applies from the agent's next run; running runs keep their account (`appliesFrom: 'next_run'`, " +
+    "`runningRunIds`, `warnings`).",
+  body: setAgentAiAccountSchema,
+  responses: {
+    200: sharedBody("SetAgentAiAccountResponse"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: aiAccountBindingForbiddenResponse("an agent, a caller who may not bind this account, or an instance admin outside the agent's company."),
+    404: r.notFound,
+    409: deviceAccountLimitResponse("a device would exceed its account limit. A terminated agent answers 409 without a code."),
+    422: codedError(
+      "Unprocessable. `ai_account_not_eligible`: the account is not available in the agent's company; only a reservation " +
+        "is named. `ai_account_incompatible`: see `details.reason`.",
+      ["ai_account_not_eligible", aiAccountNotEligibleDetailsSchema],
+      ["ai_account_incompatible", aiAccountIncompatibleDetailsSchema],
+    ),
+  },
+});
+
+registerForkRoute({
+  method: "delete",
+  path: "/api/agents/{agentId}/ai-account",
+  tags: ["ai-accounts", "agents"],
+  summary: "Remove an agent's Claude account binding",
+  description:
+    "A company admin, or the owner of the agent's current account. From its next run the agent uses its AI connection " +
+    "or its device's own login again, and its waits are woken.",
+  responses: {
+    204: r.noContent,
+    401: r.unauthorized,
+    403: aiAccountBindingForbiddenResponse("an agent, or a caller who is neither a company admin nor the owner of the agent's account."),
+    404: r.notFound,
+  },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/agents/{agentId}/ai-account/review",
+  tags: ["ai-accounts", "agents"],
+  summary: "Confirm an agent's migrated Claude account binding",
+  description: "Company admins only. Sets `reviewedAt` on a binding the backfill made; an agent without a binding answers 404.",
+  responses: {
+    200: sharedBody("AgentAiAccountBindingSummary"),
+    401: r.unauthorized,
+    403: aiAccountBindingForbiddenResponse("the caller is not a company admin."),
+    404: r.notFound,
+  },
+});
+
+// Instance accounts and the binding backfill
+
+registerForkRoute({
+  method: "get",
+  path: "/api/instance/ai-accounts",
+  tags: ["ai-accounts"],
+  summary: "List every Claude account (instance admin)",
+  description:
+    "Every pool account, masked, legacy accounts and accounts without an owner included, with the companies whose " +
+    "agents use it.",
+  responses: { 200: sharedBody("InstanceAiAccountsResponse"), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerForkRoute({
   method: "patch",
   path: "/api/instance/ai-accounts/{accountId}",
   tags: ["ai-accounts"],
-  summary: "Rename an account, switch it in or out of the pool, or set it active again (instance admin)",
-  body: updateAiAccountSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Disable, re-enable or transfer a Claude account (instance admin)",
+  description:
+    "`adminDisabled: true` withdraws the account for every company. It is separate from the owner's own pause, so " +
+    "re-enabling never resumes an account its owner withdrew. `reason` records why. `ownerUserId` transfers the " +
+    "account to another existing user; the transfer is logged in the old and the new owner's companies and wakes the " +
+    "account's waits, while its limit and sign-in state stay.",
+  body: updateInstanceAiAccountSchema,
+  responses: {
+    200: sharedBody("InstanceAiAccountSummary"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: aiAccountDuplicateResponse("the new owner already has an account with this e-mail hint."),
+    422: codedError("Unprocessable. `ai_account_owner_unknown`: no user has this id.", ["ai_account_owner_unknown"]),
+  },
 });
 
-registerCurrentRoute({
-  method: "put",
-  path: "/api/instance/ai-accounts/{accountId}/projects",
-  tags: ["ai-accounts"],
-  summary: "Reserve an account for projects; an empty list makes it shared (instance admin)",
-  body: setAiAccountProjectsSchema,
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
-});
-
-registerCurrentRoute({
+registerForkRoute({
   method: "post",
   path: "/api/instance/ai-accounts/{accountId}/clear-limit",
   tags: ["ai-accounts"],
-  summary: "Make a usage-limited host account available again (instance admin)",
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Clear the usage limit of a Claude account (instance admin)",
+  description:
+    "As the owner's clear-limit: the reset time, strikes, limit episode, probe claim and an unconfirmed sign-in failure " +
+    "are cleared, and the account's waits are woken.",
+  responses: { 200: sharedBody("InstanceAiAccountSummary"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
-registerCurrentRoute({
+registerForkRoute({
   method: "delete",
   path: "/api/instance/ai-accounts/{accountId}",
   tags: ["ai-accounts"],
-  summary: "Remove an account from its host (instance admin)",
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+  summary: "Remove a Claude account (instance admin)",
+  description:
+    "While agents use the account this answers 409 `ai_account_in_use`, naming every binding, unless `release=true`: " +
+    "the bindings then keep pool mode without an account, and their runs wait until another account is chosen.",
+  query: aiAccountReleaseQuery,
+  responses: { 204: r.noContent, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: aiAccountInUseResponse },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/instance/ai-accounts/migration",
+  tags: ["ai-accounts"],
+  summary: "Get the Claude account binding backfill report (instance admin)",
+  description:
+    "The boot backfill (`ai-account-bindings-v1`): `status` (`pending`, with a null `summary`, before it ever ran), " +
+    "attempts, last error, the bound, unassigned and unbound agents and the over-limit devices, plus a fresh go/no-go " +
+    "preview of the Claude agents that ran on a legacy device pool in the last 7 days. Each entry's `plan` is `use`, " +
+    "`wait`, `none` (its runs get no pool account and use the device's own login; `reason` says why) or `refuse`, and " +
+    "`companyName` names its company. `go` is true when every entry plans `use`.",
+  responses: { 200: sharedBody("AiAccountMigrationReport"), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/instance/ai-accounts/migration/run",
+  tags: ["ai-accounts"],
+  summary: "Re-run the Claude account binding backfill (instance admin)",
+  description:
+    "An idempotent re-run, logged as the calling admin: it adds only the bindings an earlier run could not make. It " +
+    "takes no body and answers 200 with the report, also when the run failed (`status: 'failed'`, `lastError`).",
+  responses: { 200: sharedBody("AiAccountMigrationReport"), 401: r.unauthorized, 403: r.forbidden },
+});
+
+// Execution devices and wait notices
+
+registerForkRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/devices",
+  tags: ["execution-devices"],
+  summary: "List the execution devices a company sees",
+  description:
+    "Board users with access to the company; agents get 403. A device is visible when the company's agents' candidate " +
+    "environments reach it, or its managing plugin lists the company as served. Other companies' accounts are a count, " +
+    "and an owner is shown for display only.",
+  responses: { 200: sharedBody("CompanyExecutionDevicesResponse"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/devices/{deviceId}",
+  tags: ["execution-devices"],
+  summary: "Get an execution device with the company's waits on it",
+  description:
+    "Board users with access to the company. `waits` lists the company's tasks that wait for the device. A device the " +
+    "company cannot see, an unknown id and a malformed id all answer 404.",
+  responses: { 200: sharedBody("ExecutionDeviceDetail"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/devices/{deviceId}/check-now",
+  tags: ["execution-devices"],
+  summary: "Check an execution device now",
+  description:
+    "Active non-viewer members and company admins; viewers get 403. A forced availability check of the device's " +
+    "environments available to the company, in the company's context, then a wake that starts the company's waits " +
+    "there; each is still re-checked before it runs. Once a minute per device and company. A device the company cannot " +
+    "see answers 404. Logged as `execution_device.checked`.",
+  responses: {
+    200: sharedBody("ExecutionDeviceCheckNowResponse"),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    429: {
+      ...resourceWaitCheckNowResponses[429]!,
+      headers: { "Retry-After": { description: "Seconds until the next check may run", schema: { type: "integer" } } },
+    },
+  },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/execution-wait-settings",
+  tags: ["execution-devices"],
+  summary: "Get a company's wait notice settings",
+  description:
+    "Board users with access to the company. A null `notifyAfterHours` uses `instanceDefaultHours`; 0 never notifies " +
+    "of device waits.",
+  responses: { 200: sharedBody("ExecutionWaitSettings"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "put",
+  path: "/api/companies/{companyId}/execution-wait-settings",
+  tags: ["execution-devices"],
+  summary: "Change a company's wait notice settings",
+  description:
+    "Company admins only. A partial update: keys left out keep their value, and an empty body changes nothing. Logged " +
+    "as `company.execution_wait_settings_updated`. Answers with the full settings.",
+  body: updateExecutionWaitSettingsSchema,
+  responses: { 200: sharedBody("ExecutionWaitSettings"), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/instance/devices",
+  tags: ["execution-devices"],
+  summary: "List every execution device (instance admin)",
+  description:
+    "Every device with its keys, environments, owner, account limit, over-limit state, duplicate hints, and accounts " +
+    "with labels.",
+  responses: { 200: sharedBody("InstanceExecutionDevicesResponse"), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerForkRoute({
+  method: "patch",
+  path: "/api/instance/devices/{deviceId}",
+  tags: ["execution-devices"],
+  summary: "Rename an execution device or change its account limit (instance admin)",
+  description:
+    "A changed limit re-checks the device's over-limit flag, and a higher one wakes its slot waits. Logged as " +
+    "`execution_device.updated` in the companies whose agents use the device.",
+  body: updateExecutionDeviceSchema,
+  responses: {
+    200: sharedBody("InstanceExecutionDeviceSummary"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: deviceAccountLimitResponse(
+      "the new limit is lower than the current one and below the distinct pool accounts bound to agents that can run " +
+        "on the device; every account is named. Raising a limit is never refused, also on a device over its limit. A " +
+        "name another device has answers 409 without a code.",
+    ),
+  },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/instance/devices/{deviceId}/link-target",
+  tags: ["execution-devices"],
+  summary: "Link an execution device to a plugin-reported target (instance admin)",
+  description:
+    "One machine reached two ways becomes one device: the target key, provider and managing plugin are written onto " +
+    "this device, a machine reached over SSH, and a device the plugin reported for the target earlier is merged into " +
+    "it; its run slots, explicit environment mappings and open waits move here. Logged as `execution_device.linked`; a " +
+    "merge that leaves the device over its limit also records the over-limit notice.",
+  body: linkDeviceTargetSchema,
+  responses: {
+    200: sharedBody("InstanceExecutionDeviceSummary"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: because(r.notFound, "an unknown device, or a plugin that is not installed or does not provide `provider`"),
+    409: because(
+      r.conflict,
+      "the device cannot take a target or has another one, several installed plugins provide `provider`, or the target is linked to another machine",
+    ),
+  },
+});
+
+// Legacy host routes: device administration (instance admins)
+
+registerForkRoute({
+  method: "get",
+  path: "/api/instance/ai-hosts",
+  tags: ["ai-accounts"],
+  summary: "List execution devices with their mapped environments and legacy accounts (instance admin)",
+  description:
+    "Devices with their explicitly mapped environments and the accounts first added to them under the per-device " +
+    "pools, each with its `owner`, `origin` and masked `emailHint`, plus the active environments without an explicit " +
+    "mapping (they may still reach a device Paperclip derives for them). Accounts are managed through " +
+    "`/api/me/ai-accounts` and `/api/instance/ai-accounts`.",
+  responses: { 200: sharedBody("AiAccountHostsResponse"), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/instance/ai-hosts",
+  tags: ["ai-accounts"],
+  summary: "Add an execution device (instance admin)",
+  description:
+    "Any kind but `external`: a plugin device comes only from its environment driver plugin's reports. Adding a " +
+    "device logs nothing: no agent uses it before an environment is mapped to it.",
+  body: createAiAccountHostSchema,
+  responses: {
+    201: r.ok(),
+    400: because(r.badRequest, "including kind `external`"),
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: because(r.conflict, "a device with this name already exists"),
+  },
+});
+
+registerForkRoute({
+  method: "patch",
+  path: "/api/instance/ai-hosts/{hostId}",
+  tags: ["ai-accounts"],
+  summary: "Rename a device or change its account limit (instance admin)",
+  description:
+    "A changed limit re-checks the device's over-limit flag and wakes its waits. Logged as `execution_device.updated` " +
+    "in the companies whose agents use the device; a request that changes nothing logs nothing. A malformed id " +
+    "answers 404.",
+  body: updateAiAccountHostSchema,
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: deviceAccountLimitResponse(
+      "the new limit is below the distinct pool accounts bound to agents that can run on the device. A name another " +
+        "device has answers 409 without a code.",
+    ),
+  },
+});
+
+registerForkRoute({
+  method: "delete",
+  path: "/api/instance/ai-hosts/{hostId}",
+  tags: ["ai-accounts"],
+  summary: "Remove a device; accounts added to it stay (instance admin)",
+  description:
+    "Never refused for the account limit. Afterwards every device's over-limit flag is re-checked, and the waits on " +
+    "the environments that were mapped to it are woken. Logged as `execution_device.deleted` in the companies that " +
+    "used the device. A malformed id answers 404.",
+  responses: { 200: r.ok(z.object({ ok: z.literal(true) })), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "put",
+  path: "/api/instance/ai-hosts/{hostId}/environments",
+  tags: ["ai-accounts"],
+  summary: "Replace the environments mapped to a device (instance admin)",
+  description:
+    "An environment listed here moves off any other device. Each environment's driver must suit the device kind: the " +
+    "server takes `local`, an SSH host `ssh`, a computer `ssh` and `sandbox`, a plugin device `sandbox`. The edit is one locked " +
+    "transaction and writes nothing when it is refused. Logged as `execution_device.updated` in the companies that " +
+    "used the device before or after; other companies' environments are a count. Answers `{ host, environments }`. " +
+    "A malformed id answers 404.",
+  body: setAiAccountHostEnvironmentsSchema,
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: deviceAccountLimitResponse("a device the edit touches would end over its account limit with an account it did not have."),
+    422: because(r.unprocessable, "a driver the device kind does not take"),
+  },
+});
+
+registerForkRoute({
+  method: "post",
+  path: "/api/instance/ai-hosts/{hostId}/accounts",
+  tags: ["ai-accounts"],
+  summary: "Retired: add a Claude account to a device",
+  description:
+    "Answers 410 to every caller, whatever the body. Claude accounts belong to the person who adds them: add one with " +
+    "`POST /api/me/ai-accounts`, then assign it with `PUT /api/agents/{agentId}/ai-account`.",
+  responses: { 410: aiAccountRouteMovedResponse },
+});
+
+registerForkRoute({
+  method: "put",
+  path: "/api/instance/ai-accounts/{accountId}/projects",
+  tags: ["ai-accounts"],
+  summary: "Retired: reserve a Claude account for projects",
+  description:
+    "Answers 410 to every caller. A reserved account serves only the companies of its projects until its owner clears " +
+    "that with `PATCH /api/me/ai-accounts/{accountId}` and `clearProjectRestriction: true`.",
+  responses: { 410: aiAccountRouteMovedResponse },
 });
 
 // --- Tool access -------------------------------------------------------------

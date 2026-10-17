@@ -1837,6 +1837,10 @@ describeEmbeddedPostgres("resource waits (database)", () => {
       expect(refused.action).toBe("refuse");
       expect(refused.action === "refuse" && refused.refusal.message).toContain(`move ${worker.name} to another device`);
       expect(refused.action === "refuse" && refused.refusal.resultJson).toMatchObject({ configurationIncomplete: { reason: "environment_refused" } });
+      // The blocked-task notice can name the environment; the fingerprint stays as it was.
+      expect(refused.action === "refuse" && refused.refusal.resultJson).toMatchObject({
+        configurationIncomplete: { environmentName: env.name, fingerprint: `environment_refused:${env.id}` },
+      });
     });
 
     it("ends a waiting run's episode as refused when its environment was retired", async () => {
@@ -2063,8 +2067,10 @@ describeEmbeddedPostgres("resource waits (database)", () => {
         check: { state: "unavailable" },
         details: { code: "resource_still_unavailable", resourceWait: { reason: "unreachable", since: waitingRow.episode.since.toISOString() } },
       });
-      // A comment only re-evaluates, and the minute's slot is taken anyway.
-      expect((await waits(deps).checkRunNow({ runId: waitingRow.run.id, source: "comment", now: seconds(now, 10) })).outcome).toBe("rate_limited");
+      // A comment checks too, with a once-a-minute slot of its own: Check now's minute does not hold it back.
+      expect((await waits(deps).checkRunNow({ runId: waitingRow.run.id, source: "comment", now: seconds(now, 10) })).outcome).toBe("still_unavailable");
+      expect((await waits(deps).checkRunNow({ runId: waitingRow.run.id, source: "comment", now: seconds(now, 20) })).outcome).toBe("rate_limited");
+      expect((await waits(deps).checkRunNow({ runId: waitingRow.run.id, source: "retry_now", now: seconds(now, 30) })).outcome).toBe("rate_limited");
     });
 
     it("with the kill switch set only wakes environment waits", async () => {

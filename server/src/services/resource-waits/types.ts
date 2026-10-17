@@ -168,6 +168,9 @@ export class ConfigurationRefusal extends Error {
     agentId?: string | null;
     environmentId?: string | null;
     deviceId?: string | null;
+    /** Display names for the blocked-task notice; never part of the fingerprint. */
+    deviceName?: string | null;
+    environmentName?: string | null;
   }) {
     super(input.message);
     this.name = "ConfigurationRefusal";
@@ -179,6 +182,8 @@ export class ConfigurationRefusal extends Error {
         ...(input.agentId ? { agentId: input.agentId } : {}),
         ...(input.environmentId ? { environmentId: input.environmentId } : {}),
         ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+        ...(input.deviceName ? { deviceName: input.deviceName } : {}),
+        ...(input.environmentName ? { environmentName: input.environmentName } : {}),
         fingerprint: `${input.reason}:${input.environmentId ?? input.agentId ?? "run"}`,
       },
     };

@@ -27,6 +27,8 @@ import type {
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+// Fork: a resource-wait alert is a decision source while its wait lasts.
+import { resourceWaitAttentionInputs } from "./attention-resource-waits.js";
 import {
   authorizationService,
   type AuthorizationActor,
@@ -280,10 +282,14 @@ async function sourceIssueId(
         .then((rows) => rows[0] ?? null);
       return { exists: Boolean(row), issueId: null };
     }
-    // Fork: resource-wait alerts are derived on read from open wait episodes
-    // and are not kept in decision queues.
-    case "resource_wait_alert":
-      return { exists: false, issueId: null };
+    // Fork: resource-wait alerts are derived on read from open wait episodes,
+    // keyed by their dedup key. One exists while its wait lasts, so triage and
+    // queues work on it; once the wait ends it fails closed.
+    case "resource_wait_alert": {
+      const item = (await resourceWaitAttentionInputs(db, companyId, { prefix: "" }))
+        .find((entry) => entry.subject.id === sourceId);
+      return { exists: Boolean(item), issueId: item?.relatedIssue?.id ?? null };
+    }
   }
 }
 

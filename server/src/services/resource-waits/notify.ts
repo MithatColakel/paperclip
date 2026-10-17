@@ -374,14 +374,15 @@ async function loadFacts(db: Db, episode: ResourceWaitEpisodeRow, deploymentMode
   };
 }
 
-interface ResourceEpisodeFacts {
+export interface ResourceEpisodeFacts {
   episode: Pick<ResourceWaitEpisodeRow, "kind" | "reason" | "scope" | "since">;
   limitEpisodeStartedAt: Date | null;
   overLimitAt: Date | null;
   unavailableSince: Date | null;
 }
 
-function resourceEpisodeKeyOf(facts: ResourceEpisodeFacts): string {
+/** The resource episode key from facts already read (the inbox reads them in its own query). */
+export function resourceEpisodeKeyOf(facts: ResourceEpisodeFacts): string {
   const { episode } = facts;
   const since = episode.since.toISOString();
   if (episode.reason === "usage_limit" || episode.reason === "credit_balance") {

@@ -82,6 +82,7 @@ import {
 } from "./execution-devices.js";
 import { effectiveAccountOwner, evaluateAccountPlan } from "./resource-waits/account-plan.js";
 import { wakeResourceWaits, type ResourceWaitWakeFilter } from "./resource-waits/wake.js";
+import { noteDeviceOverLimit } from "./attention-resource-waits.js";
 
 /**
  * Fork: the user-owned Claude account pool (spec 5, 12 and 14).
@@ -679,6 +680,8 @@ export async function recheckDeviceLimits(
   const results = await markOverLimitIfNeeded(db, opts.deviceIds ?? null, { now: opts.now });
   for (const result of results) {
     if (result.change !== "flagged") continue;
+    // The immediate admin notice (spec 5.6): an inbox item in each affected company while the flag stays.
+    await noteDeviceOverLimit(db, result, opts.now);
     await Promise.all(result.companyIds.map((companyId) => logActivity(db, {
       companyId,
       actorType: "system",

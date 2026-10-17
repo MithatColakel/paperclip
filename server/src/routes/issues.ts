@@ -9,6 +9,8 @@ import { deliverConversationComments, isConversation } from "../services/agent-c
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
+// Fork: a comment never supersedes a device, Claude account or account-slot wait (spec 7.6).
+import { isResourceWaitRetryReason } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
@@ -4153,6 +4155,29 @@ export function issueRoutes(
       );
       throw err;
     }
+  }
+
+  /**
+   * Fork: a person's comment on a task that waits for a device, a Claude
+   * account or an account slot (spec 7.5, 7.6). The task keeps its status and
+   * its waiting run, the comment's wake joins that run, and the resource is
+   * checked in the background: a forced check of a device outage, a database
+   * re-check otherwise. A resource that is still down, or a check made less
+   * than a minute ago, is no error for a comment.
+   */
+  function checkResourceWaitAfterComment(
+    issue: { id: string; companyId: string },
+    retry: { runId: string; status: string; scheduledRetryReason: string | null } | null,
+  ) {
+    if (!retry || retry.status !== "scheduled_retry" || !isResourceWaitRetryReason(retry.scheduledRetryReason)) return;
+    void heartbeat
+      .checkResourceWaitNow({ runId: retry.runId, companyId: issue.companyId, source: "comment" })
+      .catch((err) =>
+        logger.warn(
+          { err, issueId: issue.id, runId: retry.runId },
+          "failed to check the resource a waiting task waits for after a comment",
+        ),
+      );
   }
 
   async function classifySourceRecoveryRevalidation(input: {
@@ -13004,7 +13029,9 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId;
+        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId &&
+        // Fork: a resource wait keeps the task's status and its waiting run (spec 7.6).
+        !isResourceWaitRetryReason(scheduledRetryForHumanComment.scheduledRetryReason);
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: !!commentBody,
@@ -14965,6 +14992,7 @@ export function issueRoutes(
         }
       })();
 
+      if (comment) checkResourceWaitAfterComment(issue, scheduledRetryForHumanComment);
       await queueTaskWatchdogEvaluation(issue, actor.runId);
       const changes = issueResponse.changes ?? {};
       if (prefersMinimalIssueUpdateResponse(req)) {
@@ -17444,7 +17472,9 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId;
+        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId &&
+        // Fork: a resource wait keeps the task's status and its waiting run (spec 7.6).
+        !isResourceWaitRetryReason(scheduledRetryForHumanComment.scheduledRetryReason);
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: true,
@@ -18331,6 +18361,7 @@ export function issueRoutes(
         }
       })();
 
+      checkResourceWaitAfterComment(currentIssue, scheduledRetryForHumanComment);
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
       res.status(201).json(comment);
     },

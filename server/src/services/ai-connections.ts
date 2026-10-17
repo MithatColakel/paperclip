@@ -19,7 +19,6 @@ import {
 } from "@paperclipai/db";
 import {
   AI_CONNECTION_CAPABILITIES,
-  AI_CONNECTION_POOL_USAGE_PROBE_TTL_MS,
   aiConnectionMetadataSchema,
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
@@ -32,14 +31,9 @@ import {
   type CreateAiConnection,
   type AiConnectionLoginIntent,
 } from "@paperclipai/shared";
-import { fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
 import { forbidden, notFound, unprocessable } from "../errors.js";
-import {
-  aiConnectionPoolService,
-  claudeUsageToPoolWindows,
-  usageBlockedUntil,
-  type AiConnectionPoolMember,
-} from "./ai-connection-pool.js";
+import { aiConnectionPoolService } from "./ai-connection-pool.js";
+import { lastUsedPoolConnectionId } from "./ai-connection-pool-pin.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
@@ -257,7 +251,7 @@ export function aiConnectionService(db: Db) {
     binding: AiConnectionBinding;
     /** company_pool: re-validate only this account (the second read of one preparation). */
     pinnedGrantId?: string;
-    /** company_pool: read provider usage before choosing a subscription (default true). */
+    /** company_pool: ignored. Fork: usage readings never drive the choice (P7). */
     probeUsage?: boolean;
     now?: Date;
   };
@@ -322,86 +316,49 @@ export function aiConnectionService(db: Db) {
       });
     return checkRow(input, row);
   }
+  /**
+   * Fork: a `company_pool` binding is pinned (spec 15.5, P7). A run uses the
+   * member this agent used last, or the pool's first member while it has used
+   * none that is still in the pool. A limited member makes the run wait for
+   * that member's own reset (`ai_connection_pool_exhausted`), and a member
+   * this agent cannot use fails the run: the pool never moves a task to
+   * another account, and usage readings never drive the choice.
+   */
   async function selectFromPool(
     input: SelectInput,
     binding: Extract<AiConnectionBinding, { mode: "company_pool" }>,
   ) {
     const now = input.now ?? new Date();
-    const pool = aiConnectionPoolService(db);
-    const members = await pool.members(input.companyId, binding.provider);
+    const members = await aiConnectionPoolService(db).members(input.companyId, binding.provider);
     if (!members.length)
       throw unprocessable("Add this company's shared accounts to its AI account pool", {
         code: "ai_connection_pool_empty",
       });
-    const accounts = await rows(input.companyId);
-    let limitedUntil: Date | null = null;
-    let lastError: unknown = null;
-    const noteLimit = (until: Date) => {
-      if (!limitedUntil || until.getTime() < limitedUntil.getTime()) limitedUntil = until;
-    };
-    for (const member of members) {
-      if (input.pinnedGrantId && member.grantId !== input.pinnedGrantId) continue;
-      if (member.exhaustedUntil && member.exhaustedUntil.getTime() > now.getTime()) {
-        noteLimit(member.exhaustedUntil);
-        continue;
-      }
-      const row = accounts.find((r) => r.grant.id === member.grantId && r.connection.id === member.connectionId);
-      if (!row) continue;
-      let selected: Awaited<ReturnType<typeof checkRow>>;
-      try {
-        selected = await checkRow(input, row);
-      } catch (error) {
-        // An account this agent cannot use is skipped like a limited one; the pool moves on.
-        lastError = error;
-        continue;
-      }
-      if (input.probeUsage !== false && binding.provider === "anthropic" && selected.attribution.method === "subscription") {
-        const blockedUntil = await probeClaudeUsage(selected, member, input.model, now);
-        if (blockedUntil) {
-          noteLimit(blockedUntil);
-          continue;
-        }
-      }
-      return { ...selected, attribution: { ...selected.attribution, poolPriority: member.priority } };
+    let member: (typeof members)[number] | undefined;
+    if (input.pinnedGrantId) {
+      // The second read of one preparation re-validates the account it already chose.
+      member = members.find((candidate) => candidate.grantId === input.pinnedGrantId);
+    } else {
+      const lastUsed = await lastUsedPoolConnectionId(db, { companyId: input.companyId, agentId: input.agentId, provider: binding.provider });
+      member = members.find((candidate) => candidate.connectionId === lastUsed) ?? members[0];
     }
-    if (limitedUntil)
-      throw unprocessable("Every account in this company's AI account pool is at its usage limit", {
+    if (!member)
+      throw unprocessable("No account in this company's AI account pool can serve this agent", {
+        code: "ai_connection_unavailable",
+      });
+    // A mark the retired usage probe left is no limit: only a limit a run met holds the run (P7).
+    if (member.exhaustedUntil && member.exhaustedUntil.getTime() > now.getTime() && member.quotaSource !== "usage_probe")
+      throw unprocessable("This agent's account in the company AI account pool is at its usage limit", {
         code: "ai_connection_pool_exhausted",
-        retryAt: (limitedUntil as Date).toISOString(),
+        retryAt: member.exhaustedUntil.toISOString(),
       });
-    throw lastError ?? unprocessable("No account in this company's AI account pool can serve this agent", {
-      code: "ai_connection_unavailable",
-    });
-  }
-  /** Reads the account's usage at most once per TTL; an unreadable usage never blocks the account. */
-  async function probeClaudeUsage(
-    selected: Awaited<ReturnType<typeof checkRow>>,
-    member: AiConnectionPoolMember,
-    model: unknown,
-    now: Date,
-  ): Promise<Date | null> {
-    const pool = aiConnectionPoolService(db);
-    const fresh = member.usageCheckedAt &&
-      now.getTime() - member.usageCheckedAt.getTime() < AI_CONNECTION_POOL_USAGE_PROBE_TTL_MS;
-    let windows = member.usageWindows;
-    if (!fresh) {
-      try {
-        windows = claudeUsageToPoolWindows(await fetchClaudeQuota(await credential(selected)));
-      } catch {
-        windows = [];
-      }
-      await pool.recordUsage(selected.connection.companyId, selected.connection.id, windows, now);
-    }
-    const blockedUntil = usageBlockedUntil(windows, model, now);
-    if (blockedUntil && !fresh)
-      await pool.markExhausted({
-        companyId: selected.connection.companyId,
-        connectionId: selected.connection.id,
-        until: blockedUntil,
-        reason: "usage_threshold",
-        source: "usage_probe",
+    const row = (await rows(input.companyId)).find((r) => r.grant.id === member.grantId && r.connection.id === member.connectionId);
+    if (!row)
+      throw unprocessable("The selected AI connection is unavailable", {
+        code: "ai_connection_missing",
       });
-    return blockedUntil;
+    const selected = await checkRow(input, row);
+    return { ...selected, attribution: { ...selected.attribution, poolPriority: member.priority } };
   }
   async function checkRow(input: SelectInput, row: AccountRow) {
     const { companyId, userId, agentId, binding } = input;

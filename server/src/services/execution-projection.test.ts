@@ -213,6 +213,90 @@ describe("execution truth projection", () => {
       nextAction: "Reconcile the email delivery.",
     });
   });
+  describe("resource waits (fork, spec 7.7)", () => {
+    const wait = (values: Record<string, unknown>) => ({
+      version: 1,
+      episodeId: "episode-1",
+      kind: "environment",
+      reason: "offline",
+      scope: "target",
+      environmentId: "environment-1",
+      environmentName: "Studio",
+      deviceId: "device-1",
+      deviceName: "Build box",
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+      ...values,
+    });
+    const lane = (scheduledRetryReason: string, resourceWait: Record<string, unknown> | null, values: Partial<Run> = {}) =>
+      projectExecution(run({
+        runtimeMode: "legacy",
+        status: "scheduled_retry",
+        scheduledRetryReason,
+        scheduledRetryAt: new Date(now.getTime() + 600_000),
+        scheduledRetryAttempt: 7,
+        contextSnapshot: { failureRetriesBeforeResourceWait: 1, ...(resourceWait ? { resourceWait } : {}) },
+        ...values,
+      }), undefined, [], undefined, now);
+
+    it("names the device a task waits for, without counting waits as failed attempts", () => {
+      expect(lane("environment_wait", wait({}))).toMatchObject({
+        phase: "retry_scheduled",
+        label: "Waiting for device",
+        attempt: 2,
+        recoveryOwner: null,
+        nextAction: expect.stringContaining("Waiting for device Build box (offline)"),
+      });
+      expect(lane("environment_wait", wait({ reason: "not_allowed", scope: "admission" })).nextAction)
+        .toContain("This project is not enabled for this company on device Build box");
+      // The driver's own message names its fix.
+      expect(lane("environment_wait", wait({ reason: "not_serving", scope: "admission", message: "Ask the owner to share this computer" })).nextAction)
+        .toBe("Ask the owner to share this computer. The task then starts automatically.");
+      expect(lane("environment_wait", wait({ reason: "stopped", scope: "admission" })).nextAction).toContain("stopped");
+    });
+
+    it("says what an account wait needs and when a limit resets", () => {
+      const account = { kind: "ai_account", scope: "account", environmentId: null, environmentName: null, deviceId: null, deviceName: null, accountId: "account-1", accountLabel: "Max-2" };
+      const provider = lane("ai_account_wait", wait({ ...account, reason: "usage_limit", resumeAt: "2026-09-08T18:00:00.000Z", resumeAtSource: "provider" }));
+      expect(provider).toMatchObject({ phase: "retry_scheduled", label: "Waiting for usage limit reset", recoveryOwner: null });
+      expect(provider.nextAction).toBe("Claude account Max-2 reached its usage limit. The task resumes automatically when it resets at 2026-09-08 18:00 UTC. Paperclip never moves a task to another account.");
+      expect(lane("ai_account_wait", wait({ ...account, reason: "usage_limit", resumeAt: "2026-09-08T18:00:00.000Z", resumeAtSource: "estimated" })).nextAction)
+        .toContain("at 2026-09-08 18:00 UTC (estimated)");
+      expect(lane("ai_account_wait", wait({ ...account, reason: "credit_balance" })).label).toBe("Waiting for API credit");
+      expect(lane("ai_account_wait", wait({ ...account, reason: "auth_unconfirmed" })).label).toBe("Checking Claude account sign-in");
+      const signedOut = lane("ai_account_wait", wait({ ...account, reason: "signed_out" }));
+      expect(signedOut).toMatchObject({ label: "Waiting for a Claude account" });
+      expect(signedOut.nextAction).toContain("Claude account Max-2 is signed out. Its owner must replace the token");
+      // A hidden label never shows up: the context of another company's account carries none.
+      expect(lane("ai_account_wait", wait({ ...account, accountLabel: null, reason: "withdrawn" })).nextAction)
+        .toContain("The agent's Claude account is switched off");
+      expect(lane("ai_account_wait", wait({ ...account, accountId: null, accountLabel: null, reason: "unassigned" })).nextAction)
+        .toContain("No Claude account is chosen for the agent");
+    });
+
+    it("labels slot waits, and keeps the lane label without a readable wait", () => {
+      expect(lane("device_slot_wait", wait({ kind: "device_slots", reason: "slots_full", scope: "device" }))).toMatchObject({
+        label: "Waiting for an account slot",
+        nextAction: expect.stringContaining("Device Build box already runs its maximum of Claude accounts"),
+      });
+      expect(lane("environment_wait", null)).toMatchObject({ label: "Waiting for device", nextAction: expect.stringContaining("its execution device") });
+      expect(lane("ai_account_wait", { version: 2 }).label).toBe("Waiting for a Claude account");
+      expect(lane("device_slot_wait", null).nextAction).toContain("Its device already runs");
+    });
+
+    it("shows a deferral as waited, never as a failed or cancelled run", () => {
+      for (const errorCode of ["environment_unavailable", "ai_account_unavailable", "device_slots_full"]) {
+        expect(projectExecution(run({ runtimeMode: "legacy", status: "cancelled", errorCode }), undefined, [], undefined, now))
+          .toMatchObject({ phase: "completed", label: "Waited", recoveryOwner: null, nextAction: expect.stringContaining("started no provider work") });
+      }
+      // Other cancellations, and a lane successor cancelled by a pause, stay cancelled.
+      expect(projectExecution(run({ runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned" }), undefined, [], undefined, now).label).toBe("Cancelled");
+      expect(projectExecution(run({ runtimeMode: "legacy", status: "cancelled", scheduledRetryReason: "environment_wait" }), undefined, [], undefined, now).label).toBe("Cancelled");
+    });
+  });
   it("bounds recovery checking and surfaces its next action if verification never finishes", () => {
     const c = coordinator({
       phase: "terminal_failure",

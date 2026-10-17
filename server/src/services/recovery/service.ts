@@ -467,6 +467,24 @@ function readConfigurationIncompleteFingerprint(
   );
 }
 
+/**
+ * Fork: the recovery next action of a device or Claude account refusal (spec
+ * 7.1), matching the fix its blocked-task notice names
+ * (recovery/resource-wait-refusal-notice.ts). Null for every other reason.
+ */
+export function resourceWaitRefusalNextAction(reason: unknown): string | null {
+  switch (reason) {
+    case "environment_refused":
+      return "Board operator: move the agent to another environment, or ask the owner of the device named in the run failure to check it, then explicitly retry the original owner or reassign.";
+    case "ai_connection_incompatible":
+      return "Board operator: remove the routing override or authentication setting named in the run failure (in the run's environment variables or the project's settings, such as .claude/settings.json), then explicitly retry the original owner or reassign.";
+    case "ai_connection_changed":
+      return "Board operator: start a new execution of the task, which uses the agent's current AI account (a suspended run never continues on another account), or reassign.";
+    default:
+      return null;
+  }
+}
+
 export type { RunOutputSilenceSummary, WatchdogDecisionActor };
 
 function readNonEmptyString(value: unknown): string | null {
@@ -2636,7 +2654,9 @@ export function recoveryService(
                               ?.pluginStatus,
                           ) ?? "error",
                         )}, then explicitly retry the original owner or reassign.`
-                      : "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
+                      // Fork: device and Claude account refusals name their own fix.
+                      : resourceWaitRefusalNextAction(readConfigurationIncompletePayload(input.latestRun)?.reason)
+                        ?? "Board operator: bind the missing secret(s) named in the run failure, then explicitly retry the original owner or reassign."
                     : recoveryCause === "execution_review_participant_recovery"
                       ? "Board operator: repair the failed review participant path, restore a live reviewer, explicitly reassign, or record an intentional resolution."
                       : "Board operator: inspect the evidence, repair the runtime if appropriate, then explicitly retry the original owner, reassign, or intentionally resolve the task.",

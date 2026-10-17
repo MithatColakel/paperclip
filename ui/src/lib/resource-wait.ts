@@ -617,6 +617,8 @@ const POOL_ACTIVITY_VERBS: Record<string, string> = {
   "resource_wait.resolved": "resumed after waiting on",
   "execution_device.updated": "updated an execution device",
   "execution_device.linked": "linked an execution device",
+  "execution_device.deleted": "removed an execution device",
+  "execution_device.checked": "checked an execution device",
   "execution_device.over_limit": "flagged an execution device over its account limit",
   "company.execution_wait_settings_updated": "updated wait notices for",
 };

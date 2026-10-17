@@ -49,6 +49,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
+import { resourceWaitAttentionInputs } from "./attention-resource-waits.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1863,6 +1864,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           },
         }));
       }
+
+      // Fork: tasks waiting for a device, a Claude account or an account slot (spec 8).
+      for (const input of await resourceWaitAttentionInputs(db, companyId, { prefix, now })) add(createItem(input));
 
       const deduped = new Map<string, AttentionItem>();
       for (const item of collected) {

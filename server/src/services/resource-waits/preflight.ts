@@ -158,6 +158,8 @@ export function createPreflight(runtime: PreflightRuntime) {
           agentId: input.run.agentId,
           environmentId: environment.id,
           deviceId: device?.id ?? null,
+          deviceName: device?.name ?? null,
+          environmentName: environment.name,
         }),
       };
     }
@@ -215,6 +217,8 @@ export function createPreflight(runtime: PreflightRuntime) {
         agentId: ctx.run.agentId,
         environmentId: environment.id,
         deviceId: device?.id ?? null,
+        deviceName: classification.targetLabel ?? device?.name ?? null,
+        environmentName: environment.name,
       });
     }
     const message = classification.source === "envelope" ? driverMessageOf(environment, classification.message) : null;

@@ -6,9 +6,17 @@ import {
   nativeRunFinalizations,
   type Db,
 } from "@paperclipai/db";
-import type { ExecutionProjection } from "@paperclipai/shared";
+import {
+  isResourceWaitErrorCode,
+  isResourceWaitRetryReason,
+  readResourceWaitContext,
+  type ExecutionProjection,
+  type ResourceWaitContext,
+  type ResourceWaitErrorCode,
+} from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { resourceWaitReasonLabel } from "./resource-waits/notify.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
@@ -28,10 +36,13 @@ const executionRunColumns = {
   scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
   startedAt: heartbeatRuns.startedAt,
   status: heartbeatRuns.status,
+  // Fork: plus the failure count saved before a resource wait and the wait itself (spec 7.7).
   contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
     'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
     'failureRetriesBeforeAiConnectionWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeAiConnectionWait',
-    'failureRetriesBeforeWorkspaceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeWorkspaceWait')`,
+    'failureRetriesBeforeWorkspaceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeWorkspaceWait',
+    'failureRetriesBeforeResourceWait', ${heartbeatRuns.contextSnapshot}->'failureRetriesBeforeResourceWait',
+    'resourceWait', ${heartbeatRuns.contextSnapshot}->'resourceWait')`,
 };
 type Run = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof executionRunColumns>;
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
@@ -42,6 +53,88 @@ type Recovery = Pick<
   Partial<
     Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence">
   >;
+
+// Fork: device, Claude account and account-slot waits (spec 7.7). A lane
+// successor says what it waits for and what, if anything, a person can fix;
+// its cancelled deferral shows as "Waited", never as a failed run.
+const RESOURCE_WAIT_DEFERRAL_ACTIONS: Readonly<Record<ResourceWaitErrorCode, string>> = {
+  environment_unavailable: "This run waited for its execution device and started no provider work. The task continues in its next run.",
+  ai_account_unavailable: "This run waited for its Claude account and started no provider work. The task continues in its next run.",
+  device_slots_full: "This run waited for a Claude account slot on its device and started no provider work. The task continues in its next run.",
+};
+
+function utcTime(value: string | null): string | null {
+  const time = value ? Date.parse(value) : NaN;
+  return Number.isFinite(time) ? `${new Date(time).toISOString().slice(0, 16).replace("T", " ")} UTC` : null;
+}
+
+function environmentWaitProjection(wait: ResourceWaitContext | null) {
+  const device = wait?.deviceName ?? wait?.environmentName ?? null;
+  const subject = device ? `device ${device}` : "its execution device";
+  const starts = "The task starts automatically when it is available; Paperclip never moves it to another device.";
+  // The driver's own message names the fix it needs (never set for SSH or Local).
+  const driverFix = wait?.message ? `${/[.!?]$/.test(wait.message) ? wait.message : `${wait.message}.`} The task then starts automatically.` : null;
+  switch (wait?.reason) {
+    case "not_allowed":
+      return { label: "Waiting for device", nextAction: driverFix ?? `This project is not enabled for this company on ${subject}. Enable it there, or move the agent to another device. The task then starts automatically.` };
+    case "not_serving":
+      return { label: "Waiting for device", nextAction: driverFix ?? `${device ? `Device ${device}` : "Its execution device"} does not serve this company. Add its owner to this company, or move the agent to another device. The task then starts automatically.` };
+    case "stopped":
+      return { label: "Waiting for device", nextAction: `Work for this company is stopped on ${subject}. The task starts automatically when it is resumed.` };
+    default:
+      return { label: "Waiting for device", nextAction: `Waiting for ${subject}${wait ? ` (${resourceWaitReasonLabel(wait.reason)})` : ""}. ${starts}` };
+  }
+}
+
+function accountWaitProjection(wait: ResourceWaitContext | null) {
+  const named = wait?.accountLabel ? `Claude account ${wait.accountLabel}` : null;
+  const account = named ?? "The agent's Claude account";
+  const resets = utcTime(wait?.resumeAt ?? null);
+  const at = resets ? ` at ${resets}${wait?.resumeAtSource === "provider" ? "" : " (estimated)"}` : "";
+  const never = "Paperclip never moves a task to another account.";
+  switch (wait?.reason) {
+    case "usage_limit":
+      return { label: "Waiting for usage limit reset", nextAction: `${account} reached its usage limit. The task resumes automatically when it resets${at}. ${never}` };
+    case "credit_balance":
+      return { label: "Waiting for API credit", nextAction: `${account} has no API credit left. Add credit, then the owner can clear the limit; the task resumes automatically${at}. ${never}` };
+    case "auth_unconfirmed":
+      return { label: "Checking Claude account sign-in", nextAction: `${account} failed to sign in once. Paperclip checks it again shortly; the task resumes automatically. ${never}` };
+    case "signed_out":
+      return { label: "Waiting for a Claude account", nextAction: `${account} is signed out. Its owner must replace the token, or choose another account for the agent. The task then starts automatically.` };
+    case "withdrawn":
+      return { label: "Waiting for a Claude account", nextAction: `${account} is switched off. Turn it back on, or choose another account for the agent. The task then starts automatically.` };
+    case "unassigned":
+      return { label: "Waiting for a Claude account", nextAction: "No Claude account is chosen for the agent. Choose one, or switch the agent to its device's own login. The task then starts automatically." };
+    case "owner_not_member":
+      return { label: "Waiting for a Claude account", nextAction: "The agent's Claude account is no longer available in this company. Choose another account, or add its owner back to this company. The task then starts automatically." };
+    case "reserved_elsewhere":
+      return { label: "Waiting for a Claude account", nextAction: `${account} is reserved for other projects. Its owner can clear the reservation, or choose another account for the agent. The task then starts automatically.` };
+    case "device_unknown":
+      return { label: "Waiting for a Claude account", nextAction: "Paperclip cannot tell which device the agent runs on. Pin the agent to an environment, or ask an instance admin to map the environment to a device. The task then starts automatically." };
+    case "credential_type_unsupported":
+      return { label: "Waiting for a Claude account", nextAction: `${wait?.deviceName ? `Device ${wait.deviceName}` : "The agent's device"} does not accept this account's credential type. Choose another account, or move the agent to another device. The task then starts automatically.` };
+    default:
+      return { label: "Waiting for a Claude account", nextAction: `Waiting for ${named ?? "the agent's Claude account"}. The task starts automatically when it is available. ${never}` };
+  }
+}
+
+/** The projection of a resource-wait lane successor or its deferral; null for every other run. */
+function resourceWaitProjection(run: Run): { phase: ExecutionProjection["phase"]; label: string; nextAction: string } | null {
+  if (run.status === "cancelled" && isResourceWaitErrorCode(run.errorCode)) {
+    return { phase: "completed", label: "Waited", nextAction: RESOURCE_WAIT_DEFERRAL_ACTIONS[run.errorCode] };
+  }
+  const lane = run.scheduledRetryReason;
+  if (run.status !== "scheduled_retry" || !isResourceWaitRetryReason(lane)) return null;
+  const wait = readResourceWaitContext(run.contextSnapshot?.resourceWait);
+  if (lane === "environment_wait") return { phase: "retry_scheduled", ...environmentWaitProjection(wait) };
+  if (lane === "ai_account_wait") return { phase: "retry_scheduled", ...accountWaitProjection(wait) };
+  const device = wait?.deviceName ?? null;
+  return {
+    phase: "retry_scheduled",
+    label: "Waiting for an account slot",
+    nextAction: `${device ? `Device ${device}` : "Its device"} already runs its maximum of Claude accounts. The task starts automatically when a slot there is free; to avoid the wait, choose an account already running there for the agent.`,
+  };
+}
 
 /** Batched reads; list consumers do not perform per-task polling. */
 export async function executionProjectionsForRuns(
@@ -245,6 +338,12 @@ export function projectExecution(
   if (run.status === "scheduled_retry" && run.scheduledRetryReason === "workspace_busy") {
     projection.nextAction = "Waiting for the live workspace holder to finish; the scheduled check will revalidate ownership.";
     return set("retry_scheduled", "Waiting for workspace");
+  }
+  // Fork: device, Claude account and account-slot waits, and their deferrals.
+  const resourceWait = resourceWaitProjection(run);
+  if (resourceWait) {
+    projection.nextAction = resourceWait.nextAction;
+    return set(resourceWait.phase, resourceWait.label);
   }
   // Cleanup can fail before a finalization coordinator exists. The missing
   // row must not turn a quarantined native session into an ordinary Retry.

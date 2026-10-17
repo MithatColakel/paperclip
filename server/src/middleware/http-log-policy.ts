@@ -41,6 +41,12 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
   /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/,
   /^\/api\/mcp(?:\/|$)/,
   /^\/api\/chat-endpoints\/[^/]+\/setup(?:-secret)?(?:\/|$)/,
+  // Fork: Claude account pool routes take credential values (spec 12). The
+  // retired add-account route answers 410, but older clients still post a
+  // token to it. Routes match without case, so these do too.
+  /^\/api\/me\/ai-accounts(?:\/|$)/i,
+  /^\/api\/instance\/ai-accounts(?:\/|$)/i,
+  /^\/api\/instance\/ai-hosts\/[^/]+\/accounts(?:\/|$)/i,
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
 

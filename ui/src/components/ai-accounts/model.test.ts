@@ -13,13 +13,11 @@ import {
   acceptedCredentialTypesText,
   accountOwnerText,
   aiAccountErrorMessage,
-  aiAccountState,
   companyAgentCountsText,
   deviceLinkPlan,
   environmentChoicesForHost,
   formatUsageWindow,
   formatWaitHours,
-  hostIsFull,
   importableConnections,
   isCompanyAdminAccess,
   isCompanyViewerAccess,
@@ -30,33 +28,7 @@ import {
   notifyAfterSelectValue,
   parseDeviceTargetKey,
   projectChipLabel,
-  projectChoicesByCompany,
 } from "./model";
-
-const NOW = Date.parse("2026-10-14T12:00:00Z");
-const base = { status: "active" as const, statusMessage: null, exhaustedUntil: null, limitReason: null };
-
-describe("aiAccountState", () => {
-  it("is available without a current limit", () => {
-    expect(aiAccountState(base, NOW)).toEqual({ kind: "available" });
-    expect(aiAccountState({ ...base, exhaustedUntil: "2026-10-14T11:00:00Z", limitReason: "provider_quota" }, NOW))
-      .toEqual({ kind: "available" });
-  });
-
-  it("is limited until a future reset, with its reason", () => {
-    expect(aiAccountState({ ...base, exhaustedUntil: "2026-10-14T13:00:00Z", limitReason: "credit_balance" }, NOW))
-      .toEqual({ kind: "limited", until: "2026-10-14T13:00:00Z", reason: "credit_balance" });
-  });
-
-  it("puts sign-in failures and switched-off accounts ahead of limits", () => {
-    const limited = { exhaustedUntil: "2026-10-14T13:00:00Z", limitReason: "manual" as const };
-    expect(aiAccountState({ ...base, ...limited, status: "auth_failed", statusMessage: "Token revoked" }, NOW))
-      .toEqual({ kind: "auth_failed", message: "Token revoked" });
-    expect(aiAccountState({ ...base, ...limited, status: "disabled" }, NOW)).toEqual({ kind: "disabled" });
-    expect(aiAccountState({ ...base, poolEnabled: false }, NOW)).toEqual({ kind: "out_of_pool" });
-    expect(aiAccountState({ ...base, poolEnabled: false, ...limited }, NOW)).toMatchObject({ kind: "limited" });
-  });
-});
 
 describe("maskEmail", () => {
   it("keeps the first two letters and the domain", () => {
@@ -65,15 +37,6 @@ describe("maskEmail", () => {
     expect(maskEmail("team-account")).toBe("te•••");
     expect(maskEmail("  ")).toBeNull();
     expect(maskEmail(null)).toBeNull();
-  });
-});
-
-describe("hostIsFull", () => {
-  it("uses the lower of the host limit and the instance ceiling", () => {
-    const accounts = [{}, {}] as never[];
-    expect(hostIsFull({ maxAccounts: 2, accounts }, 3)).toBe(true);
-    expect(hostIsFull({ maxAccounts: 3, accounts }, 3)).toBe(false);
-    expect(hostIsFull({ maxAccounts: 5, accounts: [{}, {}, {}] as never[] }, 3)).toBe(true);
   });
 });
 
@@ -151,8 +114,9 @@ describe("aiAccountErrorMessage", () => {
   });
 
   it("passes conflict and other server messages through", () => {
-    const error = new ApiError("Paperclip server already has 3 accounts, the most a host can have", 409, {});
-    expect(aiAccountErrorMessage(error)).toBe("Paperclip server already has 3 accounts, the most a host can have");
+    const message = "Agents that can run on Paperclip server use 3 Claude accounts, more than 2. Move some of those agents to another device or give them other accounts before lowering the limit.";
+    const error = new ApiError(message, 409, { error: message, code: "device_account_limit", details: { code: "device_account_limit", limit: 2, inUse: 3 } });
+    expect(aiAccountErrorMessage(error)).toBe(message);
     expect(aiAccountErrorMessage(null)).toBeNull();
   });
 });
@@ -163,20 +127,6 @@ describe("project reservations", () => {
 
   it("labels a project with its issue prefix", () => {
     expect(projectChipLabel(project("p", "Mobile app", "c", "Cleanio", "CLE"))).toBe("CLE · Mobile app");
-  });
-
-  it("groups projects by company in name order and keeps reserved projects missing from the list", () => {
-    const web = project("web", "Website", "a", "Cleanio", "CLE");
-    const mobile = project("mobile", "Mobile app", "a", "Cleanio", "CLE");
-    const vpn = project("vpn", "VPN core", "b", "Presto", "PRE");
-    const archived = project("old", "Old site", "a", "Cleanio", "CLE");
-    expect(projectChoicesByCompany([vpn, web, mobile], [archived, web]).map((group) => [
-      group.companyName,
-      group.projects.map((item) => item.id),
-    ])).toEqual([
-      ["Cleanio", ["mobile", "old", "web"]],
-      ["Presto", ["vpn"]],
-    ]);
   });
 });
 

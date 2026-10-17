@@ -33,7 +33,9 @@ export type AttentionSubjectKind =
   | "recovery_action"
   | "run"
   | "budget_incident"
-  | "agent";
+  | "agent"
+  // Fork: a derived resource wait item; its id is the item's dedup key.
+  | "resource_wait";
 
 export type AttentionSeverity = "critical" | "high" | "medium" | "low";
 

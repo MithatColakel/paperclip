@@ -106,12 +106,15 @@ describe("company AI account pool", () => {
     expect(isAiConnectionCompatible(binding, "codex_local")).toBe(false);
   });
 
-  it("uses accounts in pool order and skips a usage-limited one until its reset", async () => {
+  // Fork: P7. The pool is pinned (spec 15.5); ai-connection-pool-pinned.test.ts covers the pin itself.
+  it("uses the first account and waits for its reset instead of moving down the list", async () => {
     const service = aiConnectionService(db);
     const pool = aiConnectionPoolService(db);
     expect((await service.select({ ...input, now })).attribution).toMatchObject({ connectionId: accounts.first.connectionId, mode: "company_pool", poolPriority: 0 });
     await pool.markExhausted({ companyId, connectionId: accounts.first.connectionId, until: at(60), reason: "provider_quota", source: "run_failure" });
-    expect((await service.select({ ...input, now })).attribution).toMatchObject({ connectionId: accounts.second.connectionId, poolPriority: 1 });
+    const error = await service.select({ ...input, now }).catch((e: unknown) => e);
+    expect(isAiConnectionPoolExhausted(error)).toBe(true);
+    expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(60).toISOString());
     expect((await service.select({ ...input, now: at(61) })).attribution.connectionId).toBe(accounts.first.connectionId);
   });
 
@@ -123,54 +126,42 @@ describe("company AI account pool", () => {
     expect(state.exhaustedUntil?.toISOString()).toBe(at(300).toISOString());
   });
 
-  it("reports the earliest reset when every account is limited", async () => {
+  it("reports its own account's reset when every account is limited, not the earliest one", async () => {
     const pool = aiConnectionPoolService(db);
     await pool.markExhausted({ companyId, connectionId: accounts.first.connectionId, until: at(120), reason: "provider_quota", source: "run_failure" });
     await pool.markExhausted({ companyId, connectionId: accounts.second.connectionId, until: at(30), reason: "provider_quota", source: "run_failure" });
     await pool.markExhausted({ companyId, connectionId: accounts.api.connectionId, until: at(90), reason: "provider_quota", source: "run_failure" });
     const error = await aiConnectionService(db).select({ ...input, now }).catch((e: unknown) => e);
     expect(isAiConnectionPoolExhausted(error)).toBe(true);
-    expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(30).toISOString());
+    expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(120).toISOString());
     expect(await pool.hasAvailableMember(companyId, "anthropic", now)).toBe(false);
     expect(await pool.hasAvailableMember(companyId, "anthropic", at(31))).toBe(true);
+    await expect(aiConnectionService(db).select({ ...input, now: at(31) })).rejects.toMatchObject({ details: { code: "ai_connection_pool_exhausted" } });
   });
 
-  it("skips a subscription near its usage limit before a run starts and caches the reading", async () => {
-    fetchClaudeQuota.mockImplementation(async (token: string) => token === "token-first"
-      ? [
-          { label: "Current session", usedPercent: 97, resetsAt: at(45).toISOString(), valueLabel: null, detail: null },
-          { label: "Current week (all models)", usedPercent: 40, resetsAt: at(5000).toISOString(), valueLabel: null, detail: null },
-        ]
-      : [{ label: "Current session", usedPercent: 10, resetsAt: at(200).toISOString(), valueLabel: null, detail: null }]);
-    const service = aiConnectionService(db);
-    expect((await service.select({ ...input, now })).attribution.connectionId).toBe(accounts.second.connectionId);
-    const [state] = await db.select().from(aiConnectionQuotaStates).where(eq(aiConnectionQuotaStates.connectionId, accounts.first.connectionId));
-    expect(state).toMatchObject({ reason: "usage_threshold", source: "usage_probe" });
-    expect(state.exhaustedUntil?.toISOString()).toBe(at(45).toISOString());
-    expect(fetchClaudeQuota).toHaveBeenCalledTimes(2);
-    await service.select({ ...input, now: at(1) });
-    expect(fetchClaudeQuota).toHaveBeenCalledTimes(2);
-  });
-
-  it("never blocks an account whose usage cannot be read, and never probes API keys", async () => {
-    fetchClaudeQuota.mockRejectedValue(new Error("usage endpoint down"));
+  it("never reads provider usage before a run, for subscriptions or API keys", async () => {
+    fetchClaudeQuota.mockResolvedValue([
+      { label: "Current session", usedPercent: 97, resetsAt: at(45).toISOString(), valueLabel: null, detail: null },
+    ]);
     const service = aiConnectionService(db);
     expect((await service.select({ ...input, now })).attribution.connectionId).toBe(accounts.first.connectionId);
     await setPool("api");
-    fetchClaudeQuota.mockClear();
     expect((await service.select({ ...input, now: at(10) })).attribution).toMatchObject({ connectionId: accounts.api.connectionId, method: "api_key" });
     expect(fetchClaudeQuota).not.toHaveBeenCalled();
+    expect(await db.select().from(aiConnectionQuotaStates)).toHaveLength(0);
   });
 
-  it("injects only the selected pool account into the run", async () => {
-    await aiConnectionPoolService(db).markExhausted({ companyId, connectionId: accounts.first.connectionId, until: at(60 * 24 * 365), reason: "provider_quota", source: "run_failure" });
-    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: userId, adapterType: "claude_local", binding, config: { model: "claude-opus-5-5", env: { CLAUDE_CODE_OAUTH_TOKEN: "ambient" } } });
+  it("injects only the selected pool account into the run, and none while it is limited", async () => {
+    const prepare = () => prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: userId, adapterType: "claude_local", binding, config: { model: "claude-opus-5-5", env: { CLAUDE_CODE_OAUTH_TOKEN: "ambient" } } });
+    const runtime = await prepare();
     try {
-      expect(runtime.attribution).toMatchObject({ connectionId: accounts.second.connectionId, mode: "company_pool", poolPriority: 1 });
-      expect((runtime.config.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN).toBe("token-second");
+      expect(runtime.attribution).toMatchObject({ connectionId: accounts.first.connectionId, mode: "company_pool", poolPriority: 0 });
+      expect((runtime.config.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN).toBe("token-first");
     } finally {
       await runtime.cleanup();
     }
+    await aiConnectionPoolService(db).markExhausted({ companyId, connectionId: accounts.first.connectionId, until: at(60 * 24 * 365), reason: "provider_quota", source: "run_failure" });
+    expect(isAiConnectionPoolExhausted(await prepare().catch((e: unknown) => e))).toBe(true);
   });
 
   it("keeps every pool inside its own company", async () => {

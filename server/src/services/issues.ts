@@ -76,6 +76,7 @@ import {
   labels,
   projectWorkspaces,
   projects,
+  resourceWaitEpisodes,
   toolConnections,
   workspaceOperations,
 } from "@paperclipai/db";
@@ -94,6 +95,7 @@ import type {
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
+  ScheduledRetryResourceWait,
   SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
@@ -128,6 +130,8 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+// Fork: what a device, Claude account or account-slot wait waits for, and since when.
+import { readScheduledRetryResourceWaits } from "./resource-waits/check-now.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { readChatControlChronology } from "./chat-control-chronology.js";
 import { authorizeChatConversationForBoundRun } from "./native-runtime/chat-attachment-reuse.js";
@@ -1866,6 +1870,8 @@ type IssueScheduledRetryRow = {
   retryExhaustedReason?: string | null;
   error?: string | null;
   errorCode?: string | null;
+  /** Fork: set when the retry waits for a device, a Claude account or device account slots. */
+  resourceWait?: ScheduledRetryResourceWait | null;
 };
 type IssueWithLabels = IssueRow & {
   labels: IssueLabelRow[];
@@ -6724,6 +6730,8 @@ export function issueService(db: Db) {
   ): Promise<Map<string, IssueScheduledRetryRow>> {
     const uniqueIssueIds = [...new Set(issueIds)];
     if (uniqueIssueIds.length === 0) return new Map();
+    // Fork: bounds the execution-run rank below to the listed issues' primary keys.
+    const issueUuids = uniqueIssueIds.filter((id) => isUuidLike(id) && id === id.trim());
 
     const contextIssueId = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
     const rows = await dbOrTx
@@ -6739,6 +6747,7 @@ export function issueService(db: Db) {
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
+        resourceWaitContext: sql<unknown>`${heartbeatRuns.contextSnapshot} -> 'resourceWait'`,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -6760,6 +6769,13 @@ export function issueService(db: Db) {
           when 'queued' then 1
           else 2
         end`,
+        // Fork: the task's open wait episode's current run, then its execution run, ranked
+        // as heartbeat's getIssueRetryRun ranks them, so the banner and Check now act on
+        // the same wait. Text comparisons: a malformed context issue id never throws. The
+        // issue lookup is bounded by the listed ids' primary keys, so it never scans the
+        // company's issues once per candidate run.
+        sql`(${heartbeatRuns.id} = (select ${resourceWaitEpisodes.currentRunId} from ${resourceWaitEpisodes} where ${resourceWaitEpisodes.companyId} = ${companyId} and ${resourceWaitEpisodes.issueId}::text = ${contextIssueId} and ${resourceWaitEpisodes.resolvedAt} is null)) desc nulls last`,
+        sql`(${heartbeatRuns.id} = (select ${issues.executionRunId} from ${issues} where ${issues.companyId} = ${companyId} and ${inArray(issues.id, issueUuids)} and ${issues.id}::text = ${contextIssueId})) desc nulls last`,
         asc(heartbeatRuns.scheduledRetryAt),
         asc(heartbeatRuns.createdAt),
         asc(heartbeatRuns.id),
@@ -6775,7 +6791,24 @@ export function issueService(db: Db) {
         status !== "running"
       )
         continue;
-      currentByIssueId.set(row.issueId, { ...row, status });
+      const { resourceWaitContext: _resourceWaitContext, ...current } = row;
+      currentByIssueId.set(row.issueId, { ...current, status });
+    }
+    // Fork: a device, account or slot wait also says what it waits for and since when.
+    const resourceWaits = await readScheduledRetryResourceWaits(
+      dbOrTx as Db,
+      rows
+        .filter((row) => currentByIssueId.get(row.issueId)?.runId === row.runId)
+        .map((row) => ({
+          id: row.runId,
+          companyId,
+          scheduledRetryReason: row.scheduledRetryReason,
+          contextSnapshot: { resourceWait: row.resourceWaitContext },
+        })),
+    );
+    for (const [issueId, current] of currentByIssueId) {
+      const resourceWait = resourceWaits.get(current.runId);
+      if (resourceWait) currentByIssueId.set(issueId, { ...current, resourceWait });
     }
     return currentByIssueId;
   }

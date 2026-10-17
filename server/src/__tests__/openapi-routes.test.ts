@@ -53,6 +53,9 @@ const apiPrefixes: Record<string, string> = {
   "instance-database-backups.ts": "/api",
   "instance-settings.ts": "/api",
   "ai-account-hosts.ts": "/api",
+  "ai-account-pool.ts": "/api",
+  "ai-account-pool-migration.ts": "/api",
+  "execution-devices.ts": "/api",
   "issues.ts": "/api",
   "issue-tree-control.ts": "/api",
   "llms.ts": "/api",
@@ -767,6 +770,116 @@ describe("openapi routes", () => {
       extraInSpec: [],
       excludedRoutes: [...explicitOpenApiOperationCoverageExclusions].sort(),
     });
+  });
+
+  it("documents the Claude account pool, device and wait routes with their error codes", () => {
+    const { spec } = loadSpecRoutes();
+    const board = [{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }];
+    const codesOf = (response: { content: Record<string, { schema: { properties: { code: { enum: string[] } } } }> }) =>
+      response.content["application/json"].schema.properties.code.enum;
+
+    for (const [method, path] of [
+      ["get", "/api/me/ai-accounts"],
+      ["post", "/api/me/ai-accounts"],
+      ["put", "/api/me/ai-accounts/{accountId}/credential"],
+      ["get", "/api/companies/{companyId}/ai-accounts"],
+      ["put", "/api/agents/{agentId}/ai-account"],
+      ["get", "/api/companies/{companyId}/devices"],
+      ["post", "/api/companies/{companyId}/devices/{deviceId}/check-now"],
+      ["put", "/api/companies/{companyId}/execution-wait-settings"],
+    ] as const) {
+      expect(spec.paths[path][method].security, `${method} ${path}`).toEqual(board);
+      expect(spec.paths[path][method]["x-paperclip-authorization"], `${method} ${path}`).toEqual({ actor: "board" });
+    }
+    // An agent reads its own binding.
+    expect(spec.paths["/api/agents/{agentId}/ai-account"].get["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    for (const [method, path] of [
+      ["patch", "/api/instance/ai-accounts/{accountId}"],
+      ["post", "/api/instance/ai-accounts/migration/run"],
+      ["patch", "/api/instance/devices/{deviceId}"],
+      ["put", "/api/instance/ai-hosts/{hostId}/environments"],
+    ] as const) {
+      expect(spec.paths[path][method]["x-paperclip-authorization"], `${method} ${path}`).toEqual({ actor: "board", instanceAdmin: true });
+    }
+
+    const created = spec.paths["/api/me/ai-accounts"].post;
+    expect(created.responses["201"]).toBeDefined();
+    expect(created.requestBody.content["application/json"].schema.properties).toMatchObject({
+      credentialType: { type: "string", enum: ["subscription", "api_key"] },
+      importFrom: { oneOf: expect.any(Array) },
+    });
+    expect(codesOf(created.responses["409"])).toEqual(["ai_account_duplicate"]);
+
+    const bind = spec.paths["/api/agents/{agentId}/ai-account"].put;
+    expect(codesOf(bind.responses["403"])).toEqual(["ai_account_binding_forbidden"]);
+    expect(codesOf(bind.responses["409"])).toEqual(["device_account_limit"]);
+    expect(codesOf(bind.responses["422"])).toEqual(["ai_account_not_eligible", "ai_account_incompatible"]);
+    expect(bind.responses["409"].content["application/json"].schema.properties.details.properties).toMatchObject({
+      limit: { type: "integer" },
+      accounts: { type: "array" },
+      otherCompaniesAccounts: { type: "integer" },
+    });
+    expect(codesOf(spec.paths["/api/me/ai-accounts/{accountId}"].delete.responses["409"])).toEqual(["ai_account_in_use"]);
+    expect(spec.paths["/api/me/ai-accounts/{accountId}"].delete.parameters).toContainEqual({
+      name: "release", in: "query", required: false, schema: { type: "string", enum: ["true"] },
+    });
+    expect(codesOf(spec.paths["/api/instance/ai-accounts/{accountId}"].patch.responses["422"])).toEqual(["ai_account_owner_unknown"]);
+
+    // The retired routes answer every caller with 410 and take no body.
+    for (const [method, path] of [
+      ["post", "/api/instance/ai-hosts/{hostId}/accounts"],
+      ["put", "/api/instance/ai-accounts/{accountId}/projects"],
+    ] as const) {
+      const operation = spec.paths[path][method];
+      expect(operation.requestBody, `${method} ${path}`).toBeUndefined();
+      expect(operation.security).toEqual([]);
+      expect(Object.keys(operation.responses)).toEqual(["410"]);
+      expect(codesOf(operation.responses["410"])).toEqual(["ai_account_route_moved"]);
+      expect(operation.responses["410"].content["application/json"].schema.properties.details.properties.replacements).toMatchObject({ type: "array" });
+    }
+
+    // The legacy list's other environments are those without an explicit mapping; most still reach a derived device.
+    const hosts = spec.paths["/api/instance/ai-hosts"].get;
+    expect(hosts.description).toContain("active environments without an explicit mapping");
+    expect(hosts.description).not.toContain("mapped to no device");
+
+    const checkNow = spec.paths["/api/companies/{companyId}/devices/{deviceId}/check-now"].post;
+    expect(codesOf(checkNow.responses["429"])).toEqual(["check_now_rate_limited"]);
+    expect(checkNow.responses["429"].headers["Retry-After"]).toBeDefined();
+    const retryNow = spec.paths["/api/issues/{id}/scheduled-retry/retry-now"].post;
+    expect(codesOf(retryNow.responses["409"])).toEqual(["resource_still_unavailable"]);
+    expect(codesOf(retryNow.responses["429"])).toEqual(["check_now_rate_limited"]);
+
+    // Saves that move an agent are refused under the account pool's placement rules. Those
+    // upstream routes answer the same statuses with codes of their own too, so `code` and
+    // `details` stay open there and the fork's codes are listed beside them.
+    type UpstreamCoded = {
+      content: Record<string, { schema: { properties: Record<string, unknown> } }>;
+      "x-paperclip-error-codes": string[];
+      "x-paperclip-error-details": Record<string, { properties: Record<string, unknown> }>;
+    };
+    const forkCodesOf = (response: UpstreamCoded) => {
+      const schema = response.content["application/json"].schema;
+      expect(schema.properties.code).toEqual({ type: "string" });
+      expect(schema.properties.details).toEqual({ type: "object", additionalProperties: {} });
+      return response["x-paperclip-error-codes"];
+    };
+    const save = spec.paths["/api/agents/{id}"].patch;
+    expect(forkCodesOf(save.responses["403"])).toEqual(["ai_account_binding_forbidden"]);
+    expect(forkCodesOf(save.responses["409"])).toEqual(["placement_conflict", "device_account_limit"]);
+    expect(save.responses["409"]["x-paperclip-error-details"].device_account_limit.properties).toMatchObject({
+      limit: { type: "integer" },
+      accounts: { type: "array" },
+    });
+    expect(forkCodesOf(save.responses["422"])).toEqual(["ai_account_incompatible", "ai_connection_company_pool_retired", "ai_connection_router_unsupported"]);
+    expect(forkCodesOf(spec.paths["/api/approvals/{id}/approve"].post.responses["409"])).toContain("device_account_limit");
+    expect(forkCodesOf(spec.paths["/api/agents/{id}/config-revisions/{revisionId}/rollback"].post.responses["422"])).toEqual(["ai_account_incompatible"]);
+    for (const path of ["/api/companies/{companyId}/agents", "/api/companies/{companyId}/agent-hires"] as const) {
+      expect(forkCodesOf(spec.paths[path].post.responses["422"]), path).toEqual([
+        "ai_connection_company_pool_retired",
+        "ai_connection_router_unsupported",
+      ]);
+    }
   });
 
   it("documents board-only repository discovery and selection", () => {

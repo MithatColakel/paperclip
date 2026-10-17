@@ -31,6 +31,8 @@ import { logger } from "../middleware/logger.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { credentialRefForAccount } from "../services/ai-account-credentials.js";
 import { aiAccountPoolService } from "../services/ai-account-pool.js";
+import { aiConnectionPoolService } from "../services/ai-connection-pool.js";
+import { aiConnectionService } from "../services/ai-connections.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 // claude_local is the adapter pool accounts serve; its execute is the mock.
@@ -834,6 +836,49 @@ describeEmbeddedPostgres("heartbeat Claude account pool (integration)", () => {
       expect(finished).toMatchObject({ status: "failed", errorCode: "claude_auth_required" });
       await expectFinalized(finished, worker, task.id);
       expect(logLines.some((line) => line.includes("failed to handle a pool sign-in failure"))).toBe(true);
+    }, 60_000);
+  });
+
+  // Fork: spec 15.5 and P7. A legacy company-pool agent is pinned to one pool
+  // account; when that account is limited, its run waits for that reset.
+  describe("a legacy company-pool agent", () => {
+    it("waits for the reset of its own pool account, and says so", async () => {
+      const companyId = await company();
+      const ownerId = await owner(companyId);
+      const connections = aiConnectionService(db);
+      const shared = (name: string) => connections.save(
+        companyId,
+        ownerId,
+        { provider: "anthropic", method: "subscription", ownership: "shared", name, loginSessionId: "fixture", allAgents: true, agentIds: [] },
+        `sk-ant-oat01-${randomUUID().replaceAll("-", "")}`,
+      );
+      const first = await shared("Max one");
+      const second = await shared("Max two");
+      await aiConnectionPoolService(db).replace(companyId, ownerId, { provider: "anthropic", members: [first, second] });
+      const reset = new Date(Date.now() + 2 * HOUR);
+      await aiConnectionPoolService(db).markExhausted({ companyId, connectionId: first.connectionId, until: reset, reason: "provider_quota", source: "run_failure" });
+      const worker = await agent(companyId, {
+        runtimeConfig: {
+          heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+          aiConnection: { provider: "anthropic", method: "subscription", mode: "company_pool" },
+        },
+      });
+      // The pool's accounts serve on behalf of the task's responsible user, a member here.
+      const task = await issue(companyId, worker.id, { responsibleUserId: ownerId });
+      heartbeat = heartbeatService(db);
+
+      const run = await assign(worker.id, task.id);
+      expect(await finishedRun(run.id)).toMatchObject({ status: "cancelled" });
+      const successor = await successorOf(run.id);
+      expect(successor).toMatchObject({ status: "scheduled_retry" });
+      expect(Math.abs(successor.scheduledRetryAt!.getTime() - reset.getTime())).toBeLessThan(60_000);
+      const messages = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id))).map((event) => event.message);
+      expect(messages).toContain(
+        `This agent's account in the company AI pool is at its usage limit. Paperclip never moves a task to another account; this task resumes at ${reset.toISOString()}.`,
+      );
+      expect(messages.join("\n")).not.toContain("Every account");
+      // No provider work ran, on this account or the pool's other one.
+      expect(invocations).toHaveLength(0);
     }, 60_000);
   });
 });
