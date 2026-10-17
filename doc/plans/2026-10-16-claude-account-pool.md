@@ -228,8 +228,9 @@ into one device; hostname aliases and matching labels flag likely duplicates.
 
 ## Existing data
 
-1. **Before deploy:** run the read-only report script, restore a fresh dump into
-   a throwaway database, and run the rehearsal script
+1. **Before deploy:** run the read-only report script, copy production with a
+   read-only `pg_dump` into a throwaway database (not a built-in backup: its
+   format keeps no CHECK constraints, which `0309` alters), and run the rehearsal script
    (`server/dist/scripts/ai-account-pool-rehearsal.js --snapshot`) from the new
    image against it. It applies the migrations and the binding backfill to the
    copy and prints the report and the go/no-go (exit 0 go, 2 no-go, 1 error or

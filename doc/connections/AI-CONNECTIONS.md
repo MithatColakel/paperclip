@@ -510,11 +510,14 @@ It works on the schema before and after the upgrade.
 
 **Snapshot rehearsal.** The rehearsal script runs the new image's migrations and
 binding backfill on a restored copy of the database and prints the report with
-its go/no-go. Restore a fresh dump (the 45-day and 7-day windows count back from
-the time of the run) into a throwaway Postgres database whose name contains
-`rehearsal` or `snapshot`; on a cluster forked from a backup, copy the database
-under such a name first (`CREATE DATABASE paperclip_snapshot TEMPLATE
-<database>`). Then run, from `/app` in the new image:
+its go/no-go. Copy production with a fresh read-only `pg_dump` (the 45-day and
+7-day windows count back from the time of the run) into a throwaway Postgres
+database whose name contains `rehearsal` or `snapshot`; on a cluster forked from
+a backup, copy the database under such a name first (`CREATE DATABASE
+paperclip_snapshot TEMPLATE <database>`). Do not use one of Paperclip's built-in
+backups: their format keeps no CHECK constraints, and `0309` drops the check on
+`ai_account_hosts.kind`, so the rehearsal would stop there although production
+has the constraint. Then run, from `/app` in the new image:
 
 ```sh
 PAPERCLIP_REHEARSAL_DATABASE_URL='postgres://<user>:<password>@<host>:<port>/paperclip_rehearsal' \

@@ -17,8 +17,9 @@
 -- company, so section 8 can be ignored for its accounts.
 --
 -- Two checks are not SQL:
--- - The binding backfill dry run (spec 15.3): the rehearsal script. Restore
---   the latest dump into a throwaway database whose name contains
+-- - The binding backfill dry run (spec 15.3): the rehearsal script. Copy
+--   production with a read-only pg_dump (not a built-in backup, whose format
+--   keeps no CHECK constraints) into a throwaway database whose name contains
 --   "rehearsal" or "snapshot", then run, from /app in the new image:
 --
 --     PAPERCLIP_REHEARSAL_DATABASE_URL=postgres://<user>:<password>@<host>:<port>/<name> PAPERCLIP_DEPLOYMENT_MODE=<production's mode> node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/scripts/ai-account-pool-rehearsal.js --snapshot > ai-account-pool-rehearsal.json
