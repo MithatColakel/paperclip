@@ -212,6 +212,8 @@ export function environmentRunOrchestrator(
     persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
     adapterType: string | null;
+    /** Fork: the run's project, for driver plugins that opt in (spec 9.2). */
+    projectId?: string | null;
   }): Promise<EnvironmentRuntimeLeaseRecord> {
     try {
       return await environmentRuntime.acquireRunLease(input);
@@ -274,6 +276,8 @@ export function environmentRunOrchestrator(
     agentId: string;
     persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
+    /** Fork: the run's project (null without one), sent only to driver plugins that opt in (spec 9.2). */
+    projectId?: string | null;
   }): Promise<EnvironmentAcquisitionResult> {
     // Step 1: Resolve environment
     const selectedEnvironment = await resolveEnvironment({
@@ -296,6 +300,7 @@ export function environmentRunOrchestrator(
       persistedExecutionWorkspace: input.persistedExecutionWorkspace,
       executionWorkspaceSettings: input.executionWorkspaceSettings,
       adapterType: input.adapterType ?? null,
+      projectId: input.projectId,
     });
 
     // Step 3: Log lease acquisition activity

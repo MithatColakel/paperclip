@@ -226,6 +226,28 @@ describe("pool run environment matchers", () => {
     expect(findPoolRunSettingsConflicts("not settings")).toEqual([]);
   });
 
+  it("reports every credential carrier a settings env block names, whatever its value", () => {
+    // The CLI applies the block itself, so it would put back a carrier the pool run deleted.
+    for (const value of ["/run/socket", "", null, false, 0]) {
+      for (const key of POOL_RUN_REMOVED_ENV_KEYS) {
+        expect(findPoolRunSettingsConflicts({ env: { [key]: value } }), `${key}=${String(value)}`).toEqual([`env.${key}`]);
+      }
+    }
+    // Helper keys, then routing overrides in key order, then carriers in their list's order; values never appear.
+    expect(findPoolRunSettingsConflicts({
+      apiKeyHelper: "/usr/local/bin/key",
+      env: {
+        ANTHROPIC_UNIX_SOCKET: "/run/claude.sock",
+        HTTPS_PROXY: "http://127.0.0.1:8080",
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+        ANTHROPIC_MODEL: "claude-opus",
+      },
+    })).toEqual(["apiKeyHelper", "env.HTTPS_PROXY", "env.CLAUDE_SECURESTORAGE_CONFIG_DIR", "env.ANTHROPIC_UNIX_SOCKET"]);
+    // Only the env block counts: a carrier name elsewhere in the file is no conflict.
+    expect(findPoolRunSettingsConflicts({ CLAUDE_SECURESTORAGE_CONFIG_DIR: "", permissions: { allow: ["ANTHROPIC_UNIX_SOCKET"] } })).toEqual([]);
+    expect(findPoolRunSettingsConflicts({ env: { KEEP: "1", ANTHROPIC_MODEL: "claude-opus" } })).toEqual([]);
+  });
+
   it("lists the credential carriers to delete", () => {
     expect(POOL_RUN_REMOVED_ENV_KEYS).toHaveLength(10);
     expect(POOL_RUN_REMOVED_ENV_KEYS).toContain("CLAUDE_SECURESTORAGE_CONFIG_DIR");

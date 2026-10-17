@@ -1,6 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
 import {
-  type Db,
   aiAccountProjects,
   aiAccounts,
   companyMemberships,
@@ -18,6 +17,7 @@ import {
   type ExecutionDeviceRow,
 } from "../execution-devices.js";
 import type { RunEnvironmentRow } from "./run-environment.js";
+import type { ResourceWaitDb } from "./types.js";
 
 /**
  * Fork: planCredential rows 1–9 (spec 4.2) evaluated from the database only.
@@ -57,7 +57,7 @@ export function effectiveAccountOwner(account: Pick<AccountRow, "ownerUserId" | 
 }
 
 export async function isActiveUserMember(
-  db: Db,
+  db: ResourceWaitDb,
   companyId: string,
   userId: string | null,
   deploymentMode?: DeploymentMode,
@@ -78,7 +78,7 @@ export async function isActiveUserMember(
 }
 
 /** Row 3: the account is reserved for projects and the company owns none of them. */
-async function isReservedElsewhere(db: Db, accountId: string, companyId: string): Promise<boolean> {
+async function isReservedElsewhere(db: ResourceWaitDb, accountId: string, companyId: string): Promise<boolean> {
   const reserved = await db
     .select({ projectId: aiAccountProjects.projectId })
     .from(aiAccountProjects)
@@ -94,7 +94,7 @@ async function isReservedElsewhere(db: Db, accountId: string, companyId: string)
 
 /** Rows 7–8 for one environment. Null when both pass. */
 async function placementFailure(
-  db: Db,
+  db: ResourceWaitDb,
   environment: RunEnvironmentRow,
   account: AccountRow,
   now: Date,
@@ -119,7 +119,7 @@ async function placementFailure(
  * `device_unknown`. Without it the device is looked up read-only.
  */
 export async function evaluateAccountPlan(
-  db: Db,
+  db: ResourceWaitDb,
   input: {
     companyId: string;
     accountId: string | null;

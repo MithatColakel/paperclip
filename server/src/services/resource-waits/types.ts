@@ -311,6 +311,8 @@ export interface ResourceWaitWakeupOptions {
   requestedByActorType: "system";
   requestedByActorId: null;
   contextSnapshot: Record<string, unknown>;
+  /** False: the wake gets its own run instead of joining one already queued, waiting or running. */
+  allowRunCoalescing?: boolean;
 }
 
 export interface ResourceWaitIssueNotice {

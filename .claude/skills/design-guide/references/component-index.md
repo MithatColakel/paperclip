@@ -13,6 +13,7 @@ Complete inventory of all UI components. Update this file when adding new reusab
 5. [Property Panel Components](#property-panel-components)
 6. [Agent Configuration](#agent-configuration)
 7. [Utilities & Hooks](#utilities--hooks)
+8. [Claude Accounts and Devices](#claude-accounts-and-devices)
 
 ---
 
@@ -321,3 +322,124 @@ import { cn } from "@/lib/utils";
 
 **File:** `ui/src/lib/groupBy.ts`
 **Usage:** Generic array grouping utility.
+
+---
+
+## Claude Accounts and Devices
+
+Fork components of the Claude account pool and the waiting UI. A Claude agent uses one Claude account from its owner's pool, or its device's own login; Paperclip never moves a task to another account. A task whose device, account or device account slot is unavailable waits and starts on its own. The /design-guide page shows each one with sample data in its states (`ai-account-pool/AccountPoolDesignExamples.tsx`).
+
+### AgentClaudeAccountCard
+
+**File:** `ai-account-pool/AgentClaudeAccountCard.tsx`
+**Props:** `agent: Pick<Agent, "id" | "name" | "companyId" | "adapterType">`, `className?`, `now?: Date`
+**Usage:** The agent page's Claude account section. Shows the selection in an `AccountSelect` (options, reasons and `canBindAny` come with `GET /api/agents/:id/ai-account`), the account's owner, type and state, the agent's devices with their availability, the wait its tasks are in or would hit, the migrated-assignment review, and the product rule. A change saves at once and applies from the next run; refusals show inline, never as a toast.
+
+```tsx
+<AgentClaudeAccountCard agent={agent} />
+```
+
+Renders nothing for another adapter, unless a selection is left over from when the agent ran Claude; it then offers Remove. The same file exports `AgentClaudeAccountOverviewRows` (the overview's Device and Claude account rows) and `AiConnectionOverrideNote`.
+
+States on /design-guide: an account at its usage limit, a migrated agent without an account (the review banner), the device's own login, and read-only for a member who neither owns the account nor is a company admin.
+
+### AccountSelect
+
+**File:** `ai-account-pool/AccountSelect.tsx`
+**Props:** `options: readonly CompanyAiAccountOption[]` (one agent's options, with `selectable`, `reason`, `warning` and `onAgentDevice`), `canBindAny: boolean`, `value: AccountSelectValue`, `onChange: (selection: SetAgentAiAccount) => void`, `includeDeviceLogin?`, `canSetDeviceLogin?` (defaults to `canBindAny`), `disabled?`, `loading?`, `placeholder?`, `aria-label?`, `disablePortal?`, `className?`, `now?: Date`
+**Usage:** Picks an agent's Claude account, or its device's own login. Accounts already on the agent's device come first (they take no new slot). Each option shows its state; an option the caller cannot choose stays visible, disabled, with the reason and its fix: another member's account for a caller who is not a company admin, a device at its limit of Claude accounts, a signed-out account. A limited account stays selectable, with a note that its tasks wait for the reset. `onChange` receives the body for `PUT /api/agents/:id/ai-account`; the server stays authoritative.
+
+```tsx
+<AccountSelect
+  options={binding.options}
+  canBindAny={canBindAny}
+  value={accountSelectValueFromBinding(binding)}
+  onChange={(selection) => save.mutate(selection)}
+  includeDeviceLogin
+  canSetDeviceLogin={canChooseDeviceLogin({ canBindAny, binding })}
+/>
+```
+
+A company admin may choose any eligible account; everyone else only their own, and may switch an agent to the device's own login only while it uses one of their own accounts (`canChooseDeviceLogin`, decision D4).
+
+### AiAccountStateBadge
+
+**File:** `ai-account-pool/AccountSelect.tsx`
+**Props:** `display: AiAccountStateDisplay` (from `aiAccountStateDisplay(account, now)` in `ui/src/lib/ai-account-pool.ts`), `className?`
+**Usage:** A pool account's state: `Active`, `Limited until 18:00` (` (estimated)` for an estimated reset), `Signed out`, `Paused by owner`, `Disabled by admin`. Tones come from `POOL_BADGE_TONE_CLASS`.
+
+```tsx
+<AiAccountStateBadge display={aiAccountStateDisplay(account, now)} />
+```
+
+### ResourceWaitBanner
+
+**File:** `ResourceWaitBanner.tsx`
+**Props:** `issueId: string`, `scheduledRetry: IssueScheduledRetry | null | undefined`, `className?`
+**Usage:** The waiting card of a task whose run waits for an execution device, a Claude account or a device account slot (`scheduledRetry.resourceWait`). It says what the task waits for and names the fix when a person has to act (warning tone; info when the wait ends on its own). It names whose run waits, with a link to the run, because that may be another agent's run than the assignee's. It ends with `ResourceWaitCheckNowButton`. A wait that joined another one may have no start time of its own (`since: null`); the copy then leaves the time out. Renders nothing unless the retry is a waiting resource-wait lane.
+
+```tsx
+<ResourceWaitBanner issueId={issue.id} scheduledRetry={issue.scheduledRetry} />
+```
+
+### ResourceWaitCheckNowButton
+
+**File:** `ResourceWaitBanner.tsx`
+**Props:** `issueId: string`, `className?`
+**Usage:** "Check now" on a waiting task. It calls the existing retry-now route, which re-checks the resource first. The answer shows in place, never as a toast: `Available. Starting now.`, `Still unavailable (checked just now)` for a 409 `resource_still_unavailable`, a one-minute note for a 429, or the error.
+
+```tsx
+<ResourceWaitCheckNowButton issueId={issue.id} />
+```
+
+### ResourceWaitChip
+
+**File:** `ResourceWaitBanner.tsx`
+**Props:** `scheduledRetry: IssueScheduledRetry | null | undefined`, `selected?: boolean`
+**Usage:** The task-row chip of a waiting task, e.g. `Waiting for device: Build box` or `Waiting for limit reset: 18:00 (estimated)`, with the banner's title and detail as its tooltip. `selected` mutes it inside a selected row.
+
+```tsx
+<ResourceWaitChip scheduledRetry={issue.scheduledRetry} selected={selected} />
+```
+
+### ResourceWaitPropertyValue
+
+**File:** `ResourceWaitBanner.tsx`
+**Props:** `scheduledRetry: IssueScheduledRetry | null | undefined`
+**Usage:** The value of the properties panel's "Waiting" row, e.g. `device Build box (offline since 13:02)`.
+
+```tsx
+<ResourceWaitPropertyValue scheduledRetry={issue.scheduledRetry} />
+```
+
+### ResourceWaitLedgerEntry
+
+**File:** `ResourceWaitBanner.tsx`
+**Props:** `runs: readonly ResourceWaitLedgerRunLike[]` (newest first, a group from `collapseResourceWaitRuns`), `agentName: string`, `timestamp: string`
+**Usage:** One run-ledger entry for consecutive wait runs of one agent and reason, `Waiting: device offline` or `Waited: device offline`, with the attempt count, the duration and links to the first five runs, instead of a column of cancellations.
+
+```tsx
+<ResourceWaitLedgerEntry runs={group.runs} agentName={agentName} timestamp={group.timestamp} />
+```
+
+### RunResourceWaitBadge
+
+**File:** `ai-account-pool/RunResourceWaitBadge.tsx`
+**Props:** `run: ResourceWaitRunLike`, `className?`
+**Usage:** A run row's badge for a resource wait: `Waited` for a deferral (no provider work started), `Waiting` for its successor, `Resumed` once the successor ran. Renders nothing for other runs. Never shows a wait as a failure or a retry.
+
+```tsx
+<RunResourceWaitBadge run={run} />
+```
+
+### DeviceLinkDialog
+
+**File:** `ai-accounts/DeviceLinkDialog.tsx`
+**Props:** `request: DeviceLinkRequest | null` (`{ deviceId, hint }` from a device's duplicate hints), `onClose: () => void`
+**Usage:** Instance admins link one machine reached two ways (an SSH environment and an environment driver plugin) into one device, so both share one limit of Claude accounts. Opens while `request` is set; reads the instance device list, explains the merge, and says when a pair cannot be linked.
+
+```tsx
+<DeviceLinkDialog request={linkRequest} onClose={() => setLinkRequest(null)} />
+```
+
+Used by the company Devices page and the instance Devices & Claude accounts page.

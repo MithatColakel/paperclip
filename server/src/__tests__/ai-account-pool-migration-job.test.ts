@@ -693,12 +693,14 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
         summary: null,
         goNoGo: {
           go: false,
+          // Before the job ran, their runs would use the device's own login, which is no go.
           agents: [ready, waiting].map((row) => ({
             agentId: row.id,
             agentName: row.name,
             companyId,
-            plan: "refuse",
-            reason: "no Claude account is assigned, so its runs would use the device's own login",
+            companyName: "Acme",
+            plan: "none",
+            reason: "no Claude account is assigned",
           })),
         },
       });
@@ -715,8 +717,8 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
       expect(run.body.goNoGo).toEqual({
         go: false,
         agents: [
-          { agentId: ready.id, agentName: "Ready", companyId, plan: "use", reason: null },
-          { agentId: waiting.id, agentName: "Waiting", companyId, plan: "wait", reason: "unassigned" },
+          { agentId: ready.id, agentName: "Ready", companyId, companyName: "Acme", plan: "use", reason: null },
+          { agentId: waiting.id, agentName: "Waiting", companyId, companyName: "Acme", plan: "wait", reason: "unassigned" },
         ],
       });
       // The re-run's bindings are audited in each agent's company, by the admin who ran it.
@@ -780,8 +782,8 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
       expect(await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" })).toEqual({
         go: false,
         agents: [
-          { agentId: unassigned.id, agentName: "Unassigned", companyId, plan: "refuse", reason: "no Claude account is assigned, so its runs would use the device's own login" },
-          { agentId: bound.id, agentName: "Bound", companyId, plan: "wait", reason: "unassigned" },
+          { agentId: unassigned.id, agentName: "Unassigned", companyId, companyName: "Acme", plan: "none", reason: "no Claude account is assigned" },
+          { agentId: bound.id, agentName: "Bound", companyId, companyName: "Acme", plan: "wait", reason: "unassigned" },
         ],
       });
       await db.insert(aiAccountAgentBindings).values({ agentId: unassigned.id, companyId, mode: "pool_account", accountId: used.id, source: "manual" });
@@ -790,6 +792,26 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
         go: true,
         agents: [{ agentId: unassigned.id, plan: "use" }, { agentId: bound.id, plan: "use" }],
       });
+    });
+
+    it("lists an agent set to its device's own login as none, never as go, and names every agent's company", async () => {
+      const { companyId, server } = await serverWorld();
+      const used = await account("owner", { hostId: server.id, label: "Used" });
+      const own = await agent(companyId, { name: "Own login", createdAt: daysAgo(6) });
+      await hostPoolRuns(own, used, server, "shared", 1, { days: 1 });
+      await db.insert(aiAccountAgentBindings).values({ agentId: own.id, companyId, mode: "device_login", accountId: null, source: "manual" });
+      // An agent of another company, unbound: its entry carries its own company's name.
+      const otherCompanyId = await company("Beta");
+      const elsewhere = await agent(otherCompanyId, { name: "Elsewhere", createdAt: daysAgo(5) });
+      await hostPoolRuns(elsewhere, used, server, "shared", 1, { days: 1 });
+
+      const goNoGo = await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" });
+      expect(goNoGo.go).toBe(false);
+      expect(goNoGo.agents).toHaveLength(2);
+      expect(goNoGo.agents).toEqual(expect.arrayContaining([
+        { agentId: own.id, agentName: "Own login", companyId, companyName: "Acme", plan: "none", reason: "set explicitly in its Claude account selection" },
+        { agentId: elsewhere.id, agentName: "Elsewhere", companyId: otherCompanyId, companyName: "Beta", plan: "none", reason: "no Claude account is assigned" },
+      ]));
     });
   });
 

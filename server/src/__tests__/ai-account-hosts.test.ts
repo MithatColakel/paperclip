@@ -328,7 +328,10 @@ describe("host AI account pools (database)", () => {
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "ai-hosts-fixture");
   });
 
-  describe("usage-limit failover", () => {
+  // Fork: P7 removed the host-pool failover. A legacy host-pool run that hits a
+  // limit marks its own account and waits for that account's reset in the
+  // account lane (spec 4.6); nothing moves it to the host's other account.
+  describe("usage-limit wait", () => {
     async function setup() {
       const svc = aiAccountHostService(db);
       const host = await svc.createHost({ name: "Runner", kind: "ssh_host" }, "admin");
@@ -355,24 +358,28 @@ describe("host AI account pools (database)", () => {
         contextSnapshot: {
           wakeReason: "issue_assigned",
           aiConnection: { mode: "host_pool", provider: "anthropic", method: "subscription", accountId: input.accountId, accountName: "M", hostId: input.hostId, hostName: "Runner" },
+          // A task that moved between accounts before the failover was removed.
           ...(input.failovers ? { aiConnectionFailovers: input.failovers } : {}),
         },
       });
       return id;
     }
 
-    it("rests the account until its reset and retries at once on the host's other account", async () => {
-      const { svc, host, first, second } = await setup();
+    it("rests the account until its reset and waits for it instead of moving to the host's other account", async () => {
+      const { host, first, second } = await setup();
       const reset = new Date(Date.now() + 3 * 60 * 60_000).toISOString();
       const runId = await failedRun({ hostId: host.id, accountId: first.id, retryNotBefore: reset });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(runId)).toBe(true);
+      expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true, via: "pool_account" });
       const [rested] = await db.select().from(aiAccounts).where(eq(aiAccounts.id, first.id));
-      expect(rested).toMatchObject({ limitReason: "provider_quota", limitRunId: runId });
+      expect(rested).toMatchObject({ limitReason: "provider_quota", limitRunId: runId, limitSource: "provider", limitStrikes: 1 });
       expect(rested!.exhaustedUntil?.toISOString()).toBe(reset);
       const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
-      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "ai_connection_failover" });
-      expect(retry!.contextSnapshot).toMatchObject({ aiConnectionFailovers: 1 });
-      expect((await svc.selectForRun({ host, runId: randomUUID() })).account.id).toBe(second.id);
+      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "ai_account_wait" });
+      expect(retry!.contextSnapshot).toMatchObject({ resourceWait: { kind: "ai_account", reason: "usage_limit", accountId: first.id } });
+      expect(retry!.contextSnapshot).not.toHaveProperty("aiConnectionFailovers");
+      // The host's other account is untouched.
+      const [other] = await db.select().from(aiAccounts).where(eq(aiAccounts.id, second.id));
+      expect(other).toMatchObject({ exhaustedUntil: null, limitStrikes: 0 });
       const logged = await db.select().from(activityLog).where(eq(activityLog.action, "ai_account.limit_reached"));
       expect(logged).toHaveLength(1);
       expect(logged[0]).toMatchObject({ companyId, entityId: first.id, runId });
@@ -382,7 +389,7 @@ describe("host AI account pools (database)", () => {
       const { host, second } = await setup();
       const before = Date.now();
       const runId = await failedRun({ hostId: host.id, accountId: second.id, error: "Credit balance is too low to access the Anthropic API" });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(runId)).toBe(true);
+      expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true, reason: "credit_balance" });
       const [rested] = await db.select().from(aiAccounts).where(eq(aiAccounts.id, second.id));
       expect(rested!.limitReason).toBe("credit_balance");
       const hours = (rested!.exhaustedUntil!.getTime() - before) / 3_600_000;
@@ -390,11 +397,12 @@ describe("host AI account pools (database)", () => {
       expect(hours).toBeLessThanOrEqual(24.1);
     });
 
-    it("stops moving after twice the host's account count", async () => {
+    it("waits on its own account however often the task moved before", async () => {
       const { host, first } = await setup();
       const runId = await failedRun({ hostId: host.id, accountId: first.id, failovers: 4 });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(runId)).toBe(false);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+      expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true });
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+      expect(retries.map((retry) => retry.scheduledRetryReason)).toEqual(["ai_account_wait"]);
     });
   });
 

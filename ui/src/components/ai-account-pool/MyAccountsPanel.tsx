@@ -115,7 +115,8 @@ function accountStateNote(account: MyAiAccount, now?: Date): { text: string; ton
  * Fork: the signed-in user's own Claude accounts on the Claude accounts page.
  * Each card shows the state, where the account is used and Paperclip's own
  * usage, with the owner's actions: edit, replace the token, pause or resume,
- * clear a limit or the project reservation, and remove.
+ * clear a limit or the project reservation, and remove. A signed-out account
+ * offers no pause: replacing its token or removing it are its fixes.
  */
 export function MyAccountsPanel({ accounts, now }: { accounts: readonly MyAiAccount[]; now?: Date }) {
   return (
@@ -175,7 +176,8 @@ function MyAccountCard({ account, now }: { account: MyAiAccount; now?: Date }) {
               Clear limit
             </Button>
           )}
-          {account.status === "disabled" ? (
+          {/* A signed-out account is neither paused nor resumed: a new token or removal is its fix. */}
+          {account.status === "auth_failed" ? null : account.status === "disabled" ? (
             <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => run({ type: "status", status: "active" })}>
               Resume
             </Button>

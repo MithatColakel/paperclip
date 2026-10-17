@@ -1,5 +1,7 @@
 import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+// Fork: negotiated projectId and typed "environment unavailable" refusals (spec 9.1, 9.2).
+import { ENVIRONMENT_PROJECT_ID_FEATURE, readEnvironmentUnavailableError } from "@paperclipai/plugin-sdk";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -445,6 +447,12 @@ export interface EnvironmentDriverAcquireInput {
   executionWorkspaceMode: ExecutionWorkspace["mode"] | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
   /**
+   * Fork: the run's project (null for a run without one). Undefined for leases
+   * that serve no run's project (probes, device logins); a driver plugin gets
+   * the key only when its worker opts in (spec 9.2).
+   */
+  projectId?: string | null;
+  /**
    * The harness/adapter type for this run (the agent's adapter). Drivers that
    * materialize a per-run sandbox use it to select the runtime image so a single
    * environment can serve mixed harnesses; null falls back to the environment's
@@ -796,6 +804,18 @@ function transientSandboxResumeFailure(error: unknown): boolean {
   }
   const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
   return /\b(timeout|timed out|rate limit|temporar|network|connection reset|service unavailable)\b/.test(message);
+}
+
+// Fork: a run lease names its project only to a worker that advertises
+// ENVIRONMENT_PROJECT_ID_FEATURE (spec 9.2); otherwise the key is absent.
+function negotiatedProjectIdParam(
+  workerManager: Pick<PluginWorkerManager, "getWorker"> | null | undefined,
+  pluginId: string,
+  projectId: string | null | undefined,
+): { projectId?: string | null } {
+  if (projectId === undefined || typeof workerManager?.getWorker !== "function") return {};
+  const advertised = workerManager.getWorker(pluginId)?.supportedMethods ?? [];
+  return advertised.includes(ENVIRONMENT_PROJECT_ID_FEATURE) ? { projectId } : {};
 }
 
 function getLeaseDriverKey(
@@ -2056,6 +2076,7 @@ function createSandboxEnvironmentDriver(
                     companyId: input.companyId,
                     environmentId: input.environment.id,
                     issueId: input.issueId,
+                    ...negotiatedProjectIdParam(pluginWorkerManager, pluginProvider.resolved.plugin.id, input.projectId),
                     config: workerConfig,
                     providerLeaseId: reusableLease.providerLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
@@ -2068,6 +2089,8 @@ function createSandboxEnvironmentDriver(
                 break;
               } catch (error) {
                 if (
+                  // Fork: a typed "environment unavailable" answer is final for this attempt (spec 7.8).
+                  readEnvironmentUnavailableError(error) ||
                   !transientSandboxResumeFailure(error) ||
                   Date.now() + retryDelayMs * 1.25 >= resumeDeadline
                 ) throw error;
@@ -2133,6 +2156,7 @@ function createSandboxEnvironmentDriver(
                 companyId: input.companyId,
                 environmentId: input.environment.id,
                 issueId: input.issueId,
+                ...negotiatedProjectIdParam(pluginWorkerManager, pluginProvider.resolved.plugin.id, input.projectId),
                 config: workerConfig,
                 // Plugin SDK requires a string; ad-hoc test leases use a fresh
                 // UUID so providers that validate or persist the runId still see
@@ -3629,6 +3653,7 @@ function createPluginEnvironmentDriver(
         companyId: input.companyId,
         environmentId: input.environment.id,
         issueId: input.issueId,
+        ...negotiatedProjectIdParam(workerManager, plugin.id, input.projectId),
         config: parsed.config.driverConfig,
         runId: input.heartbeatRunId ?? randomUUID(),
         workspaceMode: input.executionWorkspaceMode ?? undefined,
@@ -3935,6 +3960,8 @@ export function environmentRuntimeService(
       executionWorkspaceSettings?: IssueExecutionWorkspaceSettings | null;
       /** The agent's adapter type for this run (mixed-harness environments). */
       adapterType?: string | null;
+      /** Fork: the run's project, for driver plugins that opt in (spec 9.2). */
+      projectId?: string | null;
       /**
        * Force applying the active custom-image template even for ad-hoc (no
        * issue/run) invocations. Operator `Test` probes set this so the runtime
@@ -3972,6 +3999,7 @@ export function environmentRuntimeService(
         executionWorkspaceMode: leaseContext.executionWorkspaceMode,
         executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
         adapterType: input.adapterType ?? null,
+        projectId: input.projectId,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
         requestedExpiresAt: input.requestedExpiresAt ?? null,
         assertCompanyBinding: input.assertCompanyBinding,

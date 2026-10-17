@@ -33,6 +33,7 @@ const {
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
   routineServiceMock,
+  runDeferredAiAccountMigrationMock,
 } = vi.hoisted(() => {
   const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
@@ -87,8 +88,14 @@ const {
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
+    // Fork: the resource-wait sweep (spec 7.4).
+    sweepResourceWaits: vi.fn(async () => ({ skipped: false })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
+  // Fork: the Claude account binding backfill (spec 15.3).
+  const runDeferredAiAccountMigrationMock = vi.fn(async (): Promise<
+    { status: "skipped"; reason: "completed" } | { status: "failed"; error: string }
+  > => ({ status: "skipped", reason: "completed" }));
   const issueThreadInteractionServiceMock = {
     sweepSupersededPendingRequestConfirmations: vi.fn(async () => ({ expired: 0 })),
     sweepMergedPullRequestConfirmations: vi.fn(async () => ({
@@ -164,6 +171,7 @@ const {
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
     routineServiceMock,
+    runDeferredAiAccountMigrationMock,
   };
 });
 
@@ -356,6 +364,10 @@ vi.mock("../services/index.js", () => ({
 }));
 
 vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }) }));
+
+vi.mock("../services/ai-account-pool-migration.js", () => ({
+  runDeferredAiAccountMigration: runDeferredAiAccountMigrationMock,
+}));
 
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
@@ -604,6 +616,49 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // Fork: spec 15.3 and 7.4.
+  it("runs the Claude account binding backfill once before the scheduler, and sweeps resource waits on each tick", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    // Not narrowed to null: the mock below assigns it.
+    let intervalCallback = null as (() => void) | null;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+      intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      expect(runDeferredAiAccountMigrationMock).toHaveBeenCalledExactlyOnceWith(
+        createDbMock.mock.results[0]?.value,
+        { deploymentMode: "authenticated" },
+      );
+      // The first runs after a deploy read the migrated bindings.
+      expect(runDeferredAiAccountMigrationMock.mock.invocationCallOrder[0]).toBeLessThan(
+        createAppMock.mock.invocationCallOrder[0]!,
+      );
+      expect(runDeferredAiAccountMigrationMock.mock.invocationCallOrder[0]).toBeLessThan(
+        heartbeatServiceMock.reapOrphanedRuns.mock.invocationCallOrder[0]!,
+      );
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepResourceWaits).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2));
+      expect(runDeferredAiAccountMigrationMock).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("keeps booting when the Claude account binding backfill fails", async () => {
+    runDeferredAiAccountMigrationMock.mockResolvedValueOnce({ status: "failed", error: "fixture failure" });
+    await expect(startServer()).resolves.toBeDefined();
+    expect(runDeferredAiAccountMigrationMock).toHaveBeenCalledTimes(1);
+    expect(createAppMock).toHaveBeenCalledTimes(1);
+  });
+
   it("reconciles native replacements at startup and on the execution-control interval", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
     let executionControlTick: (() => void) | undefined;
@@ -662,6 +717,8 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+      // Fork: resource waits are swept only while heartbeat scheduling runs.
+      expect(heartbeatServiceMock.sweepResourceWaits).not.toHaveBeenCalled();
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
       expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);

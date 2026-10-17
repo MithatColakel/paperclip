@@ -7,6 +7,8 @@ import {
   type NoticeMetadataRow,
   type NoticeMetadataSection,
 } from "./notice-format.js";
+// Fork: blocked-task notices for resource-wait refusals.
+import { resourceWaitRefusalNoticeSeed } from "./resource-wait-refusal-notice.js";
 
 // Short human-readable body plus the presentation header for one recovery
 // family. The escalation path merges in the metadata rows only it knows
@@ -121,6 +123,9 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
+  // Fork: a run refused instead of waiting (a removed or refusing device, a routing override, a changed account) names its fix.
+  const refusalNotice = resourceWaitRefusalNoticeSeed(configurationIncomplete);
+  if (refusalNotice) return refusalNotice;
   if (readNonEmptyStringField(configurationIncomplete, "reason") === SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON) {
     const pluginKey = readNonEmptyStringField(configurationIncomplete, "pluginKey") ?? "the sandbox provider plugin";
     const pluginStatus = readNonEmptyStringField(configurationIncomplete, "pluginStatus") ?? "not ready";

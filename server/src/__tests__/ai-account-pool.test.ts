@@ -554,11 +554,79 @@ describeEmbeddedPostgres("account pool service (database)", () => {
       ];
       for (const [change, run] of changes) {
         const waiting = await waitingRun(target, { reason: "usage_limit", accountId: created.id });
+        // Ahead of the clock, so only `updated_at + 1 microsecond` (two writes in one clock tick) can move it.
+        await db.update(aiAccounts).set({ updatedAt: new Date(Date.now() + 60 * 60_000) }).where(eq(aiAccounts.id, created.id));
         const before = await updatedAtOf();
         await run();
         expect(await dueAtOf(waiting.id), change).toBeLessThanOrEqual(Date.now());
         expect(await updatedAtOf() > before, change).toBe(true);
       }
+    });
+
+    it("resets the probe and two-strike state on every limit clear and a new token, but keeps it through a transfer", async () => {
+      const companyId = await company();
+      await user("owner");
+      await user("admin");
+      await user("heir");
+      await member(companyId, "owner");
+      await member(companyId, "heir");
+      const owner = board("owner", [[companyId, "operator"]]);
+      const admin = board("admin", [], { isInstanceAdmin: true });
+      const created = await pool.create(ctx(owner), { label: "Strikes", credentialType: "subscription", value: sub(`s-${tag()}`) });
+      const [probe] = await db.insert(heartbeatRuns).values({ companyId, agentId: (await agent(companyId)).id, status: "queued" }).returning();
+      // Two estimated limits in a row, one waiting run released as the probe, and one unconfirmed sign-in failure.
+      // updated_at is ahead of the clock, so only `updated_at + 1 microsecond` (two writes in one clock tick) can move it.
+      const struck = {
+        updatedAt: new Date(Date.now() + 60 * 60_000),
+        exhaustedUntil: new Date(Date.now() + 60 * 60_000),
+        limitReason: "provider_quota" as const,
+        limitRunId: probe!.id,
+        limitSource: "estimated" as const,
+        limitStrikes: 2,
+        limitEpisodeStartedAt: new Date(Date.now() - 30 * 60_000),
+        limitProbeRunId: probe!.id,
+        authSuspectAt: new Date(Date.now() - 5 * 60_000),
+        authSuspectRunId: probe!.id,
+      };
+      const reset = {
+        exhaustedUntil: null,
+        limitReason: null,
+        limitRunId: null,
+        limitSource: null,
+        limitStrikes: 0,
+        limitEpisodeStartedAt: null,
+        limitProbeRunId: null,
+        authSuspectAt: null,
+        authSuspectRunId: null,
+      };
+      const rowOf = async () => (await db.select().from(aiAccounts).where(eq(aiAccounts.id, created.id)))[0]!;
+      // The exact database text the lost-wake guard compares (microseconds).
+      const updatedAtOf = async () => (await readWakeEpochs(db, { accountId: created.id })).accountUpdatedAt!;
+      const paths: Array<[string, () => Promise<unknown>]> = [
+        ["owner clears the limit", () => pool.clearLimit(ctx(owner), created.id)],
+        ["admin clears the limit", () => pool.adminClearLimit(ctx(admin), created.id)],
+        ["owner replaces the token", () => pool.replaceCredential(ctx(owner), created.id, { value: sub(`s2-${tag()}`) })],
+      ];
+      for (const [path, run] of paths) {
+        await db.update(aiAccounts).set(struck).where(eq(aiAccounts.id, created.id));
+        const before = await updatedAtOf();
+        await run();
+        expect(await rowOf(), path).toMatchObject(reset);
+        expect(await updatedAtOf() > before, path).toBe(true);
+      }
+
+      // A transfer moves the account, not its credential: the limit, the probe and the suspicion stay.
+      await db.update(aiAccounts).set(struck).where(eq(aiAccounts.id, created.id));
+      const before = await updatedAtOf();
+      await pool.transferOwner(ctx(admin), created.id, "heir");
+      expect(await rowOf()).toMatchObject({
+        ownerUserId: "heir",
+        limitSource: "estimated",
+        limitStrikes: 2,
+        limitProbeRunId: probe!.id,
+        authSuspectRunId: probe!.id,
+      });
+      expect(await updatedAtOf() > before).toBe(true);
     });
 
     it("refuses to pause a signed-out account, so a later resume cannot bring back the rejected token", async () => {

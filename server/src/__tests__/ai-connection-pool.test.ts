@@ -223,7 +223,10 @@ describe("company AI account pool", () => {
     expect(actions).toEqual(expect.arrayContaining(["ai_connection.pool_updated", "ai_connection.pool_limit_cleared"]));
   });
 
-  describe("usage-limit failover", () => {
+  // Fork: P7 removed the usage-limit failover. A limited member is marked until
+  // its reset and the task waits in the company-pool lane for that reset;
+  // nothing moves it to another account.
+  describe("usage-limit wait", () => {
     async function failedPoolRun(input: { connectionId: string; failovers?: number; errorCode?: string; retryNotBefore?: string | null }) {
       const id = randomUUID();
       await db.insert(heartbeatRuns).values({
@@ -243,44 +246,50 @@ describe("company AI account pool", () => {
         contextSnapshot: {
           wakeReason: "issue_assigned",
           aiConnection: { connectionId: input.connectionId, provider: "anthropic", mode: "company_pool", poolPriority: 0 },
+          // A task that moved between accounts before the failover was removed.
           ...(input.failovers ? { aiConnectionFailovers: input.failovers } : {}),
         },
       });
       return id;
     }
 
-    it("marks the account limited until its reset and retries at once without spending the failure budget", async () => {
+    it("marks the account limited until its reset and waits for that reset without spending the failure budget", async () => {
       const reset = new Date(Date.now() + 3 * 60 * 60_000).toISOString();
       const runId = await failedPoolRun({ connectionId: accounts.first.connectionId, retryNotBefore: reset });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(runId)).toBe(true);
+      expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true, via: "company_pool" });
       const [state] = await db.select().from(aiConnectionQuotaStates).where(eq(aiConnectionQuotaStates.connectionId, accounts.first.connectionId));
       expect(state).toMatchObject({ reason: "provider_quota", source: "run_failure", lastRunId: runId });
       expect(state.exhaustedUntil?.toISOString()).toBe(reset);
       const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
-      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "ai_connection_failover" });
-      expect(retry.scheduledRetryAt!.getTime()).toBeLessThanOrEqual(Date.now());
-      expect(retry.contextSnapshot).toMatchObject({ aiConnectionFailovers: 1, failureRetriesBeforeAiConnectionWait: 0 });
-      // The next account comes from the pool, never the limited one.
-      expect((await aiConnectionService(db).select({ ...input })).attribution.connectionId).toBe(accounts.second.connectionId);
+      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "ai_connection_pool_wait" });
+      // Due at the member's reset plus at most 120 s of per-run spread, never at once.
+      expect(retry.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(Date.parse(reset));
+      expect(retry.scheduledRetryAt!.getTime()).toBeLessThanOrEqual(Date.parse(reset) + 121_000);
+      expect(retry.contextSnapshot).toMatchObject({ failureRetriesBeforeAiConnectionWait: 0 });
+      expect(retry.contextSnapshot).not.toHaveProperty("aiConnectionFailovers");
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, accounts.first.connectionId)))
+        .toEqual(expect.arrayContaining([expect.objectContaining({ action: "ai_connection.pool_limit_reached", runId })]));
     });
 
     it("falls back to a 60 minute limit without a provider reset time", async () => {
       const runId = await failedPoolRun({ connectionId: accounts.second.connectionId });
       const before = Date.now();
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(runId)).toBe(true);
+      expect(await heartbeatService(db).handleProviderLimit(runId)).toMatchObject({ handled: true });
       const [state] = await db.select().from(aiConnectionQuotaStates).where(eq(aiConnectionQuotaStates.connectionId, accounts.second.connectionId));
       const minutes = (state.exhaustedUntil!.getTime() - before) / 60_000;
       expect(minutes).toBeGreaterThanOrEqual(59.9);
       expect(minutes).toBeLessThanOrEqual(60.5);
     });
 
-    it("hands back to the bounded retry after too many moves or for other failures", async () => {
-      const capped = await failedPoolRun({ connectionId: accounts.first.connectionId, failovers: 6 });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(capped)).toBe(false);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, capped))).toHaveLength(0);
+    it("waits on its own account however often the task moved before, and leaves other failures to the bounded retry", async () => {
+      const moved = await failedPoolRun({ connectionId: accounts.first.connectionId, failovers: 6 });
+      expect(await heartbeatService(db).handleProviderLimit(moved)).toMatchObject({ handled: true });
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, moved));
+      expect(retries.map((retry) => retry.scheduledRetryReason)).toEqual(["ai_connection_pool_wait"]);
       const overloaded = await failedPoolRun({ connectionId: accounts.first.connectionId, errorCode: "claude_transient_upstream" });
       await db.update(heartbeatRuns).set({ resultJson: { errorFamily: "transient_upstream" } }).where(eq(heartbeatRuns.id, overloaded));
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(overloaded)).toBe(false);
+      expect(await heartbeatService(db).handleProviderLimit(overloaded)).toMatchObject({ handled: false, reason: "not_a_limit" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, overloaded))).toHaveLength(0);
     });
   });
 });

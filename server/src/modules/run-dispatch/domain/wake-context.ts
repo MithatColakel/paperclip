@@ -32,6 +32,12 @@ export const RESOLVED_INTERACTION_CONTINUATION_STATUSES = new Set([
   "cancelled",
   "rejected",
 ]);
+/**
+ * Fork: set on a device, account or slot wait's successor whose predecessor
+ * was a resolved interaction continuation. The lane rewrites the successor's
+ * wake and retry reasons, so this flag carries the continuation's identity.
+ */
+export const RESOURCE_WAIT_RESOLVED_INTERACTION_KEY = "resourceWaitResolvedInteraction";
 
 /**
  * True for a resource-wait retry whose original run did not
@@ -109,6 +115,8 @@ export function isResolvedInteractionContinuationWakeContext(contextSnapshot: un
   return (
     (mutation === "interaction" && wakeReason === "issue_commented") ||
     wakeReason === INTERACTION_CONTINUATION_INFRA_WAKE_REASON ||
-    retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
+    retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON ||
+    // Fork: a continuation that waits for a device, an account or a slot stays one.
+    (isResourceWaitRetryReason(retryReason) && context[RESOURCE_WAIT_RESOLVED_INTERACTION_KEY] === true)
   );
 }

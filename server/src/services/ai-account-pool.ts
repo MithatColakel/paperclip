@@ -1414,7 +1414,12 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     return myAccountView(ctx.actor, account.id);
   }
 
-  /** Clears a limit (the owner or an admin checked it); waits are woken. */
+  /**
+   * Clears a limit (the owner or an admin checked it): the reset, the strikes,
+   * the limit episode, the probe claim and an unconfirmed sign-in failure, so
+   * neither the single-probe rule nor the two-strike rule acts on what came
+   * before (spec 4.6, 12). Waits are woken.
+   */
   async function clearLimitOf(ctx: PoolContext, account: AiAccountRow): Promise<AiAccountRow> {
     const now = clock();
     const [updated] = await db.update(aiAccounts).set({
@@ -1425,6 +1430,8 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
       limitStrikes: 0,
       limitEpisodeStartedAt: null,
       limitProbeRunId: null,
+      authSuspectAt: null,
+      authSuspectRunId: null,
       updatedAt: touched(aiAccounts.updatedAt, now),
     }).where(eq(aiAccounts.id, account.id)).returning();
     await wake({ accountIds: [account.id] });
@@ -1939,7 +1946,8 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
    * owner is an active member; an entry names an owner only where that owner
    * is a member. When neither owner is a member anywhere, it goes to the
    * companies whose agents use the account, without the label or either
-   * owner. The account's waits are woken.
+   * owner. The account's waits are woken. Its limit and sign-in state stay:
+   * they describe the credential, which a transfer does not change.
    */
   async function transferOwner(ctx: PoolContext, accountId: string, ownerUserId: string): Promise<InstanceAiAccountSummary> {
     const now = clock();

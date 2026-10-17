@@ -416,7 +416,11 @@ describe("ClaudeAccounts: my accounts", () => {
     const old = row(mine, "Old key");
     expect(old.textContent).toContain("API key");
     expect(old.textContent).toContain("Signed out: The key was revoked. Replace the key to use it again");
+    // A signed-out account can be neither paused nor resumed: a new key or removal are its fixes.
     expect(buttonIn(old, "Replace key")).toBeDefined();
+    expect(buttonIn(old, "Remove")).toBeDefined();
+    expect(buttonIn(old, "Pause")).toBeUndefined();
+    expect(buttonIn(old, "Resume")).toBeUndefined();
     expect(old.querySelector('[data-testid="account-usage"]')?.textContent).toContain("This month: $0.00");
 
     const spare = row(mine, "Spare");

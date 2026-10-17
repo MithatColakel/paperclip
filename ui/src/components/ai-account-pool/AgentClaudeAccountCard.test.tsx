@@ -188,6 +188,7 @@ function binding(overrides: Partial<AgentAiAccountBindingDetail> = {}): AgentAiA
     canChange: true,
     updatedAt: null,
     options: [TEAM, MINE],
+    canBindAny: true,
     ...overrides,
   };
 }
@@ -200,7 +201,7 @@ const ON_MINE = {
 };
 
 function setResponse(overrides: Partial<SetAgentAiAccountResponse> = {}): SetAgentAiAccountResponse {
-  const { options: _options, ...summary } = binding(ON_MINE);
+  const { options: _options, canBindAny: _canBindAny, ...summary } = binding(ON_MINE);
   return { ...summary, appliesFrom: "next_run", runningRunIds: [], warnings: [], ...overrides };
 }
 
@@ -539,24 +540,19 @@ describe("AgentClaudeAccountCard", () => {
     expect(poolApi.setAgentBinding).not.toHaveBeenCalled();
   });
 
-  it("offers the accounts of the agent's own list, with the server's reason per account", async () => {
-    // The agent's own list says Team Max would take a new slot on a full device;
-    // the binding's options do not know that.
-    poolApi.listCompanyAccounts.mockResolvedValue({
-      accounts: [option({ selectable: false, reason: "device_account_limit" }), MINE],
-      canBindAny: true,
-    });
-    await renderCard(binding(ON_MINE));
-    expect(poolApi.listCompanyAccounts).toHaveBeenCalledWith(AGENT.companyId, { agentId: AGENT.id });
+  it("offers the binding's own options for this agent, with the server's reason per account, and no second request", async () => {
+    // The binding's options are this agent's: Team Max would take a new slot on a full device.
+    await renderCard(binding({ ...ON_MINE, options: [option({ selectable: false, reason: "device_account_limit" }), MINE] }));
     await openSelect();
     expect(item("Team Max")?.getAttribute("aria-disabled")).toBe("true");
     expect(item("Team Max")?.textContent).toContain(AI_ACCOUNT_UNSELECTABLE_REASON_TEXT.device_account_limit);
     expect(item("My Pro")?.getAttribute("aria-disabled")).not.toBe("true");
+    expect(poolApi.getAgentBinding).toHaveBeenCalledTimes(1);
+    expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
   });
 
   it("keeps the agent's own paused account named in the picker", async () => {
-    // A paused account is not eligible, so the company's lists leave it out.
-    poolApi.listCompanyAccounts.mockResolvedValue({ accounts: [MINE], canBindAny: true });
+    // A paused account is not eligible, so the binding's options leave it out.
     await renderCard(binding({ ...ON_TEAM, account: accountRef({ state: "withdrawn" }), options: [MINE] }));
     expect(trigger()?.textContent).toContain("Team Max");
     expect(trigger()?.textContent).toContain("Paused by owner");
@@ -570,15 +566,14 @@ describe("AgentClaudeAccountCard", () => {
     expect(trigger()?.disabled).toBe(true);
     expect(container.textContent).toContain(AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT);
     expect(button("Clear")).toBeUndefined();
-    // Whether the caller is a company admin only matters while they can change something.
     expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
   });
 
   it("offers an owner the device login only while the agent is on their own account (D4)", async () => {
-    poolApi.listCompanyAccounts.mockResolvedValue({ accounts: [TEAM, MINE], canBindAny: false });
+    // Not a company admin: the binding says so itself.
     poolApi.setAgentBinding.mockResolvedValue(setResponse({ state: "device_login", mode: "device_login", account: null }));
-    await renderCard(binding(ON_MINE));
-    expect(poolApi.listCompanyAccounts).toHaveBeenCalledWith(AGENT.companyId, { agentId: AGENT.id });
+    await renderCard(binding({ ...ON_MINE, canBindAny: false }));
+    expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
     expect(button("Clear")).toBeDefined();
     await openSelect();
     expect(item("Device's own login")?.getAttribute("aria-disabled")).not.toBe("true");
@@ -591,7 +586,7 @@ describe("AgentClaudeAccountCard", () => {
     document.body.innerHTML = "";
     document.body.appendChild(container);
 
-    await renderCard(binding());
+    await renderCard(binding({ canBindAny: false }));
     await openSelect();
     expect(item("Device's own login")?.getAttribute("aria-disabled")).toBe("true");
     expect(item("Device's own login")?.textContent).toContain(DEVICE_LOGIN_NOT_PERMITTED_TEXT);
@@ -680,29 +675,27 @@ describe("AgentClaudeAccountCard", () => {
     await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }), CODEX_AGENT);
     expect(container.textContent).toContain("A Claude account selection is left over");
     expect(container.textContent).toContain("still counts toward its device's Claude account limit");
-    // Whether the caller is a company admin comes from the company's list, not the per-agent one.
-    expect(poolApi.listCompanyAccounts).toHaveBeenCalledWith(AGENT.companyId);
-    expect(poolApi.listCompanyAccounts).not.toHaveBeenCalledWith(AGENT.companyId, { agentId: AGENT.id });
+    // Whether the caller is a company admin comes with the binding: no account list is read.
+    expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
     await click("Remove");
     expect(poolApi.clearAgentBinding).toHaveBeenCalledWith(AGENT.id);
   });
 
-  it("offers Remove on a left-over selection only to those who may clear it, and shows a failed check", async () => {
-    poolApi.listCompanyAccounts.mockResolvedValue({ accounts: [TEAM, MINE], canBindAny: false });
-    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }), CODEX_AGENT);
+  it("offers Remove on a left-over selection only to those who may clear it", async () => {
+    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: false }), CODEX_AGENT);
     expect(container.textContent).toContain("A Claude account selection is left over");
     expect(button("Remove")).toBeUndefined();
     await act(async () => root?.unmount());
 
     // An owner may remove it while it is their own account.
-    await renderCard(binding({ ...ON_MINE, supported: false, adapterType: "codex_local" }), CODEX_AGENT);
+    await renderCard(binding({ ...ON_MINE, supported: false, adapterType: "codex_local", canBindAny: false }), CODEX_AGENT);
     expect(button("Remove")).toBeDefined();
     await act(async () => root?.unmount());
 
-    poolApi.listCompanyAccounts.mockRejectedValue(new ApiError("Server error", 500, { error: "Server error" }));
-    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local" }), CODEX_AGENT);
-    expect(alerts().join(" ")).toContain("Server error");
-    expect(button("Try again")).toBeDefined();
+    // A binding from a server that does not say whether the caller is a company admin: only the owner's rule applies.
+    await renderCard(binding({ ...ON_TEAM, supported: false, adapterType: "codex_local", canBindAny: undefined }), CODEX_AGENT);
+    expect(button("Remove")).toBeUndefined();
+    expect(poolApi.listCompanyAccounts).not.toHaveBeenCalled();
   });
 });
 
@@ -889,6 +882,15 @@ describe("agent Claude account helpers", () => {
       details: { code: "ai_account_incompatible", reason: "credential_type_unsupported" },
     }))).toContain("does not accept this account's credential type");
     expect(aiAccountPoolRefusalMessage(new ApiError("Placement changed", 409, { code: "placement_conflict" })))
+      .toBe("Someone changed this agent's environment at the same time. Reload the agent and try again.");
+    // The code may come in the details only, and a device Paperclip cannot place names that fix.
+    const unknownDevice = new ApiError("Incompatible", 422, {
+      error: "Incompatible",
+      details: { code: "ai_account_incompatible", reason: "device_unknown", environmentName: "Orphan sandbox" },
+    });
+    expect(aiAccountPoolRefusalMessage(unknownDevice)).toBe(aiAccountPoolErrorMessage(unknownDevice));
+    expect(aiAccountPoolRefusalMessage(unknownDevice)).not.toBe("Incompatible");
+    expect(aiAccountPoolRefusalMessage(new ApiError("Placement changed", 409, { details: { code: "placement_conflict" } })))
       .toBe("Someone changed this agent's environment at the same time. Reload the agent and try again.");
     expect(aiAccountPoolRefusalMessage(new ApiError("Name taken", 409, { error: "Name taken", code: "agent_name_conflict" }))).toBeNull();
     expect(aiAccountPoolRefusalMessage(new ApiError("Bad request", 400, { error: "Bad request" }))).toBeNull();

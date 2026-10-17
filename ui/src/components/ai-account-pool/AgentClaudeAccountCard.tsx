@@ -274,22 +274,13 @@ export function AgentClaudeAccountCard({ agent, className, now }: AgentClaudeAcc
   const supported = isClaude && binding?.supported !== false;
   // A selection left from when the agent ran Claude; it can only be removed.
   const leftOver = !supported && binding !== null && binding.mode !== null;
-  // Needed only while the caller may change something: whether they are a
-  // company admin (spec 5.1) and, for a Claude agent, which accounts this
-  // agent can take (selectable, reason, warning, already on its device). A
-  // left-over selection needs only the former, from the company's own list.
-  const accountsQuery = useQuery({
-    queryKey: aiAccountPoolKeys.companyAccounts(agent.companyId, supported ? agent.id : null),
-    queryFn: () => supported
-      ? aiAccountPoolApi.listCompanyAccounts(agent.companyId, { agentId: agent.id })
-      : aiAccountPoolApi.listCompanyAccounts(agent.companyId),
-    enabled: binding?.canChange === true && (supported || leftOver),
-    retry: false,
-  });
-  const canBindAny = accountsQuery.data?.canBindAny ?? false;
+  // The binding itself says whether the caller is a company admin (spec 5.1)
+  // and which accounts this agent can take (selectable, reason, warning,
+  // already on its device), so no second request is needed.
+  const canBindAny = binding?.canBindAny ?? false;
   const options = useMemo(
-    () => (binding ? accountOptionsWithCurrent(accountsQuery.data?.accounts ?? binding.options, binding.account) : []),
-    [accountsQuery.data, binding],
+    () => (binding ? accountOptionsWithCurrent(binding.options, binding.account) : []),
+    [binding],
   );
   const availability = useDeviceAvailability(agent.companyId, supported && (binding?.devices.length ?? 0) > 0);
 
@@ -362,7 +353,6 @@ export function AgentClaudeAccountCard({ agent, className, now }: AgentClaudeAcc
           device's Claude account limit until it is removed.
         </InlineBanner>
         <ErrorLine error={actionError} />
-        <ErrorLine error={accountsQuery.error} onRetry={() => void accountsQuery.refetch()} />
       </CardFrame>
     );
   }
@@ -392,7 +382,6 @@ export function AgentClaudeAccountCard({ agent, className, now }: AgentClaudeAcc
                   includeDeviceLogin
                   canSetDeviceLogin={canChooseDeviceLogin({ canBindAny, binding })}
                   disabled={!binding.canChange || busy}
-                  loading={accountsQuery.isLoading}
                   aria-label={`Claude account for ${agent.name}`}
                   now={now}
                 />
@@ -403,7 +392,6 @@ export function AgentClaudeAccountCard({ agent, className, now }: AgentClaudeAcc
             {!binding.canChange ? <p className="text-xs text-muted-foreground">{AGENT_CLAUDE_ACCOUNT_LOCKED_TEXT}</p> : null}
           </div>
           <ErrorLine error={actionError} />
-          <ErrorLine error={accountsQuery.error} onRetry={() => void accountsQuery.refetch()} />
           <DeviceList binding={binding} availability={availability} now={now} />
           <WaitNotice
             binding={binding}

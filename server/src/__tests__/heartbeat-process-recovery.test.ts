@@ -223,6 +223,7 @@ import {
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
+import { isResolvedInteractionContinuationWakeContext } from "../modules/run-dispatch/index.js";
 import {
   claimNativeRestartRecoveries,
   currentNativeControllerIdentity,
@@ -4557,15 +4558,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     mockAdapterExecute.mockClear();
   });
 
-  it("schedules an infra retry for a setup failure caused by a transient sandbox provider worker restart", async () => {
+  it("makes a run wait for a transient sandbox provider worker restart instead of failing setup", async () => {
     // Model a configured plugin manager whose worker is mid-restart when
     // a run tries to acquire a lease. A missing manager is a wiring error,
     // not a worker restart. The lease
     // acquisition fails BEFORE the adapter is ever dispatched (no call to
-    // mockAdapterExecute), so this hits the setup-failure catch (errorCode
-    // "setup_failed") rather than the adapter-failure catch. The condition is
-    // transient and self-healing, so it must be classified retryable
-    // infrastructure, not a terminal setup failure.
+    // mockAdapterExecute). The condition is transient and self-healing.
+    // Fork: hook H4 (spec 7.8) classifies it as an admission-scope
+    // `restarting` wait: the run is an expected cancellation and an
+    // environment_wait successor keeps the task, instead of a setup failure
+    // with an infrastructure retry.
     const { companyId, agentId, runId, wakeupRequestId, issueId } =
       await seedQueuedIssueRunFixture();
     const interactionId = randomUUID();
@@ -4689,7 +4691,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.resumeQueuedRuns();
 
     // The real manager waits up to five seconds for worker readiness before
-    // lease acquisition fails and the heartbeat can schedule its retry.
+    // lease acquisition fails and the heartbeat can schedule the wait.
     const runs = await waitForValue(async () => {
       const rows = await db
         .select()
@@ -4699,25 +4701,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }, 10_000);
     expect(runs).toHaveLength(2);
 
-    const failedRun = runs?.find((row) => row.id === runId);
-    const retryRun = runs?.find((row) => row.id !== runId);
-    expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("setup_failed");
-    expect(failedRun?.error).toContain("worker is not running");
-    expect(retryRun).toMatchObject({
+    const deferredRun = runs?.find((row) => row.id === runId);
+    const waitingRun = runs?.find((row) => row.id !== runId);
+    expect(deferredRun).toMatchObject({ status: "cancelled", errorCode: "environment_unavailable" });
+    expect(deferredRun?.resultJson).toMatchObject({
+      executionRecovery: { kind: "resource_wait", providerWorkStarted: false },
+      resourceWait: { kind: "environment", reason: "restarting", scope: "admission", environmentId },
+      cancellation: { expected: true },
+    });
+    expect(waitingRun).toMatchObject({
       status: "scheduled_retry",
       retryOfRunId: runId,
       scheduledRetryAttempt: 1,
-      scheduledRetryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
+      scheduledRetryReason: "environment_wait",
     });
-    expect(retryRun?.contextSnapshot).toMatchObject({
+    expect(waitingRun?.contextSnapshot).toMatchObject({
       issueId,
       interactionId,
       interactionStatus: "accepted",
-      retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
-      wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
-      scheduledRetryAttempt: 1,
+      retryReason: "environment_wait",
+      resourceWait: { kind: "environment", reason: "restarting", environmentId },
+      resourceWaitResolvedInteraction: true,
     });
+    // The wait keeps the accepted continuation's identity, so its claim and dispatch rechecks still apply.
+    expect(isResolvedInteractionContinuationWakeContext(waitingRun?.contextSnapshot)).toBe(true);
+    // A restarting worker gets another real attempt after 30 s (or at once when the plugin is enabled again).
+    expect(waitingRun!.scheduledRetryAt!.getTime() - deferredRun!.finishedAt!.getTime()).toBeLessThanOrEqual(31_000);
+    // The wait is no failure: nothing asks the board to reconcile it.
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
 
     // The lease never succeeded, so the adapter was never dispatched.
     expect(mockAdapterExecute).not.toHaveBeenCalled();
@@ -4729,7 +4741,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue).toEqual({
       status: "in_progress",
-      executionRunId: retryRun?.id ?? null,
+      executionRunId: waitingRun?.id ?? null,
     });
 
     mockAdapterExecute.mockClear();

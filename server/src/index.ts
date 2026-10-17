@@ -89,6 +89,8 @@ import {
   workspaceOperationService,
 } from "./services/index.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
+// Fork: the Claude account binding backfill job (spec 15.3).
+import { runDeferredAiAccountMigration } from "./services/ai-account-pool-migration.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
@@ -708,6 +710,13 @@ async function startServerWithDatabaseTeardown(
   const toolOAuthBackfill = await backfillLegacyToolOAuthTokens(db as any);
   if (toolOAuthBackfill.sanitizedConnections > 0 || toolOAuthBackfill.migratedConnections > 0) {
     logger.info(toolOAuthBackfill, "Backfilled legacy tool OAuth credentials into company secrets");
+  }
+  // Fork: the Claude account binding backfill (spec 15.3), before any run starts.
+  // Runs once (marker ai-account-bindings-v1) and never throws.
+  const aiAccountMigration = await runDeferredAiAccountMigration(db as any, { deploymentMode: config.deploymentMode })
+    .catch((error: unknown) => ({ status: "failed" as const, error: error instanceof Error ? error.message : String(error) }));
+  if (aiAccountMigration.status === "failed") {
+    logger.warn({ error: aiAccountMigration.error }, "Claude account binding backfill failed; boot continues and an instance admin can re-run it");
   }
   const confirmationSweep = await issueThreadInteractionService(db as any)
     .sweepSupersededPendingRequestConfirmations();
@@ -1783,6 +1792,11 @@ async function startServerWithDatabaseTeardown(
 
         if (heartbeatSchedulerStopped) return;
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
+          // Fork: the resource-wait sweep (spec 7.4): availability checks, stale
+          // probes, ended episodes and notices. Overlapping passes skip (advisory lock).
+          trackHeartbeatSchedulerWork(heartbeat.sweepResourceWaits().catch((err) => {
+            logger.error({ err }, "resource wait sweep failed");
+          }));
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat

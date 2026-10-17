@@ -277,6 +277,10 @@ const REPORT: AiAccountMigrationReport = {
     agents: [
       { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", plan: "use", reason: null },
       { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", plan: "wait", reason: "unassigned" },
+      // Not in the summary (bound by hand): its company comes with the entry.
+      { agentId: "agent-dave", agentName: "Dave", companyId: "company-b", companyName: "Presto", plan: "none", reason: "no Claude account is assigned" },
+      // A server that predates companyName: the company the page cannot name.
+      { agentId: "agent-erin", agentName: "Erin", companyId: "company-c", plan: "none", reason: "set explicitly in its Claude account selection" },
     ],
   },
 };
@@ -667,6 +671,9 @@ describe("InstanceAiAccounts", () => {
     expect(report.textContent).toContain(`Completed ${formatDateTime(REPORT.completedAt!)} · 1 attempt`);
     expect(report.textContent).toContain("No-go");
     expect(report.textContent).toContain("Bob (Cleanio) would wait: no account chosen");
+    expect(report.textContent).toContain("Dave (Presto) would use its device's own login: no Claude account is assigned");
+    expect(report.textContent).toContain("Erin (another company) would use its device's own login: set explicitly in its Claude account selection");
+    expect(report.textContent).not.toContain("would be refused");
     expect(report.textContent).not.toContain("Alice (Cleanio) would");
     expect(report.textContent).toContain("1 assigned · 1 waiting for an account · 1 not assigned");
     expect(report.textContent).toContain("Bob (Cleanio) · Waiting for an account · Over the device's account limit");

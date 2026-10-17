@@ -94,7 +94,13 @@ export function ResourceWaitCheckNowButton({ issueId, className }: { issueId: st
   );
 }
 
-/** The waiting card: what the task waits for, the fix when a person has to act, and "Check now". */
+/**
+ * The waiting card: what the task waits for, the fix when a person has to act,
+ * whose run waits, and "Check now". The waiting run may be another agent's
+ * than the assignee's (a mentioned agent's reply, or a wait that took the
+ * issue's wait over), and a wait that joined another one may have no start
+ * time of its own; the copy assumes neither.
+ */
 export function ResourceWaitBanner({
   issueId,
   scheduledRetry,
@@ -105,8 +111,9 @@ export function ResourceWaitBanner({
   className?: string;
 }) {
   const scheduled = scheduledResourceWait(scheduledRetry);
-  if (!scheduled) return null;
+  if (!scheduled || !scheduledRetry) return null;
   const copy = describeScheduledResourceWait(scheduled);
+  const agentName = scheduled.agentName?.trim();
   return (
     <div
       data-testid="resource-wait-banner"
@@ -121,6 +128,13 @@ export function ResourceWaitBanner({
         actions={<ResourceWaitCheckNowButton issueId={issueId} />}
       >
         {copy.detail}
+        <span className="mt-1 block text-xs" data-testid="resource-wait-run">
+          Waiting run{" "}
+          <Link to={`/agents/${scheduledRetry.agentId}/runs/${scheduledRetry.runId}`} className="font-mono hover:underline">
+            {scheduledRetry.runId.slice(0, 8)}
+          </Link>
+          {agentName ? ` by ${agentName}` : null}
+        </span>
       </InlineBanner>
     </div>
   );

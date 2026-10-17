@@ -3032,7 +3032,7 @@ export function buildHostServices(
     },
 
     // Fork: target reports and company environments of environment driver plugins (spec 9.4-9.5).
-    environments: pluginEnvironmentTargetsService(db, { pluginId, pluginKey }),
+    environments: pluginEnvironmentTargetsService(db, { pluginId, pluginKey, wakeWaits: (filter, now) => heartbeat.wakeResourceWaitsNow(filter, { now }) }),
 
     authorization: {
       async listGrants(params) {

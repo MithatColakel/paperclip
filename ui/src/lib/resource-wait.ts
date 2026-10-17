@@ -609,6 +609,7 @@ const POOL_ACTIVITY_VERBS: Record<string, string> = {
   "ai_account.admin_enabled": "re-enabled a Claude account",
   "ai_account.binding_updated": "changed the Claude account of",
   "ai_account.binding_cleared": "cleared the Claude account of",
+  "ai_account.binding_reviewed": "confirmed the Claude account of",
   "ai_account.limit_reached": "recorded a usage limit on a Claude account",
   "ai_account.signed_out": "recorded a sign-in failure on a Claude account",
   "resource_wait.started": "started waiting on",
@@ -616,6 +617,7 @@ const POOL_ACTIVITY_VERBS: Record<string, string> = {
   "resource_wait.resolved": "resumed after waiting on",
   "execution_device.updated": "updated an execution device",
   "execution_device.linked": "linked an execution device",
+  "execution_device.over_limit": "flagged an execution device over its account limit",
   "company.execution_wait_settings_updated": "updated wait notices for",
 };
 
@@ -631,6 +633,11 @@ function readAccountLabel(details: Record<string, unknown> | null | undefined): 
   return typeof label === "string" && label.trim() ? label.trim() : null;
 }
 
+function readDeviceName(details: Record<string, unknown> | null | undefined): string | null {
+  const name = details?.deviceName;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
 /** Activity-row verbs for the account pool, devices and waits; null for other actions. */
 export function accountPoolActivityVerb(action: string, details?: Record<string, unknown> | null): string | null {
   const verb = POOL_ACTIVITY_VERBS[action];
@@ -642,6 +649,10 @@ export function accountPoolActivityVerb(action: string, details?: Record<string,
   if (action === "resource_wait.started") {
     const short = readWaitShort(details);
     if (short) return `started waiting (${short}) on`;
+  }
+  if (action === "execution_device.over_limit") {
+    const deviceName = readDeviceName(details);
+    if (deviceName) return `flagged ${deviceName} over its account limit`;
   }
   return verb;
 }

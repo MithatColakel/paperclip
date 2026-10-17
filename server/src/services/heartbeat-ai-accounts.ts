@@ -108,7 +108,6 @@ import type { RunEnvironmentRow } from "./resource-waits/run-environment.js";
  * resource-wait sweep prunes slots of runs that ended more than 24 h ago.
  */
 
-type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type AccountRow = typeof aiAccounts.$inferSelect;
@@ -178,11 +177,6 @@ function namedRef(value: { id: string; name: string } | null | undefined): { id:
 /** `evaluateAccountPlan` reads only `id`, `name`, `driver` and `config` of the environment. */
 function asRunEnvironment(environment: DeviceEnvironmentRef): RunEnvironmentRow {
   return environment as unknown as RunEnvironmentRow;
-}
-
-/** `evaluateAccountPlan` runs plain selects; inside `acquire` they run on the transaction. */
-function asQueryDb(tx: Tx): Db {
-  return tx as unknown as Db;
 }
 
 function configuredDeploymentMode(): DeploymentMode | undefined {
@@ -1234,7 +1228,7 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     try {
       committed = await db.transaction(async (tx) => {
         const device = plan.device ? await lockDevice(tx, plan.device.id) : null;
-        const evaluation = await evaluateAccountPlan(asQueryDb(tx), {
+        const evaluation = await evaluateAccountPlan(tx, {
           companyId: run.companyId,
           accountId: plan.accountId,
           environment: !plan.persisted && plan.environment ? asRunEnvironment(plan.environment) : null,

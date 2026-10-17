@@ -1,20 +1,23 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, issues } from "@paperclipai/db";
 import { RESOURCE_WAIT_RETRY_REASONS } from "@paperclipai/shared";
-import { AI_CONNECTION_FAILOVER_RETRY_REASON } from "../modules/run-dispatch/index.js";
+import { AI_CONNECTION_POOL_WAIT_RETRY_REASON } from "../modules/run-dispatch/index.js";
 import { admitExplicitContinuationRetry } from "./explicit-native-continuation.js";
 import { PROVIDER_QUOTA_RECOVERY_RETRY_REASON } from "./recovery/provider-quota-recovery.js";
 
 /**
  * Fork usage-limit lanes that resume a turn the user continued explicitly: the
- * provider-quota monitor's replacement and the company-pool account failover.
- * Like a transient retry, each successor renews the user's authorization
- * through admitExplicitContinuationRetry. No lane borrows the parent's receipt.
+ * provider-quota monitor's replacement, a company-pool member's wait for its
+ * reset, and device, account and slot waits. Like a transient retry, each
+ * successor renews the user's authorization through
+ * admitExplicitContinuationRetry. No lane borrows the parent's receipt, and
+ * none moves the turn to another account (P7).
  */
 export const EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS: ReadonlySet<string> = new Set([
   PROVIDER_QUOTA_RECOVERY_RETRY_REASON,
-  AI_CONNECTION_FAILOVER_RETRY_REASON,
-  // Fork: device, account and slot waits renew the continuation too.
+  // A company_pool turn waits for its own member's reset (spec 4.6, 7.6),
+  // not for the provider-quota monitor.
+  AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   ...RESOURCE_WAIT_RETRY_REASONS,
 ]);
 

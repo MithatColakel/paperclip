@@ -30,6 +30,7 @@ import {
   instanceDefaultNotifyHours,
   readExecutionWaitSettings,
   resourceEpisodeKeys,
+  resourceWaitPmNoticeMarkdown,
   type ResourceWaitIssueNotice,
   type ResourceWaitWakeupOptions,
 } from "../services/resource-waits/index.js";
@@ -50,6 +51,64 @@ describe("notice settings defaults", () => {
     expect(instanceDefaultNotifyHours({ PAPERCLIP_RESOURCE_WAIT_NOTIFY_HOURS: "0" })).toBe(0);
     expect(instanceDefaultNotifyHours({ PAPERCLIP_RESOURCE_WAIT_NOTIFY_HOURS: "900" })).toBe(168);
     expect(instanceDefaultNotifyHours({ PAPERCLIP_RESOURCE_WAIT_NOTIFY_HOURS: "soon" })).toBe(24);
+  });
+});
+
+// Fork: the task context heartbeat renders for a PM's summary wake (spec 8).
+describe("resourceWaitPmNoticeMarkdown", () => {
+  const wake = (resourceWaitNotice: Record<string, unknown>) => ({ wakeReason: "resource_wait_notice", resourceWaitNotice });
+
+  it("names the resource, the reason, the reset and the waiting tasks, and says nothing moves", () => {
+    const text = resourceWaitPmNoticeMarkdown(wake({
+      kind: "ai_account",
+      reason: "usage_limit",
+      resourceLabel: "Max two",
+      resumeAt: "2026-10-17T18:00:00.000Z",
+      issueIds: ["issue-a", "issue-b"],
+    }));
+    expect(text).toContain('the Claude account "Max two" (usage limit)');
+    expect(text).toContain("2026-10-17 18:00 UTC");
+    expect(text).toContain("never moves a task to another Claude account or device");
+    expect(text).toContain("- issue-a\n- issue-b");
+    expect(resourceWaitPmNoticeMarkdown(wake({ kind: "environment", reason: "offline", resourceLabel: "Build box", issueIds: [] })))
+      .toContain('the device "Build box" (offline)');
+    expect(resourceWaitPmNoticeMarkdown(wake({ kind: "device_slots", reason: "slots_full", resourceLabel: "Build box" })))
+      .toContain('a free account slot on the device "Build box"');
+  });
+
+  it("never names an account its owner no longer shares with the company", () => {
+    const text = resourceWaitPmNoticeMarkdown(wake({
+      kind: "ai_account",
+      reason: "owner_not_member",
+      resourceLabel: "an account that is no longer available in this company",
+    }));
+    expect(text).toContain("a Claude account that is no longer available in this company (account no longer available)");
+    expect(text).not.toContain('"an account');
+  });
+
+  it("is empty for any other run", () => {
+    expect(resourceWaitPmNoticeMarkdown({ wakeReason: "issue_assigned", resourceWait: { kind: "ai_account" } })).toBe("");
+    expect(resourceWaitPmNoticeMarkdown({ wakeReason: "resource_wait_notice" })).toBe("");
+    expect(resourceWaitPmNoticeMarkdown(null)).toBe("");
+    // A lane run's own wait is never shown as a summary, whatever its wake reason.
+    expect(resourceWaitPmNoticeMarkdown({
+      wakeReason: "resource_wait_notice",
+      resourceWait: { version: 1, episodeId: "episode-1", kind: "environment", reason: "offline", scope: "target", issueIds: ["issue-a"] },
+    })).toBe("");
+  });
+
+  it("shows the summary after a later wake or the summary run's own wait replaced its wake reason", () => {
+    const summary = { kind: "ai_account", reason: "usage_limit", resourceLabel: "Max two", issueIds: ["issue-a"] };
+    // A timer wake merged into the queued summary run.
+    expect(resourceWaitPmNoticeMarkdown({ wakeReason: "heartbeat_timer", resourceWaitNotice: summary }))
+      .toContain('the Claude account "Max two" (usage limit)');
+    // The summary run waited for the PM's own device: its successor carries the lane's wake reason and wait.
+    expect(resourceWaitPmNoticeMarkdown({
+      wakeReason: "environment_wait_retry",
+      retryReason: "environment_wait",
+      resourceWait: { version: 1, episodeId: "episode-1", kind: "environment", reason: "offline", scope: "target" },
+      resourceWaitNotice: summary,
+    })).toContain("- issue-a");
   });
 });
 
@@ -227,9 +286,12 @@ describeEmbeddedPostgres("resource wait notices (database)", () => {
     expect(wakes[0]!.opts.contextSnapshot).not.toHaveProperty("issueId");
     expect(wakes[0]!.opts.contextSnapshot).toMatchObject({
       wakeReason: "resource_wait_notice",
-      resourceWait: { kind: "ai_account", reason: "usage_limit", resourceLabel: "Max-2" },
+      resourceWaitNotice: { kind: "ai_account", reason: "usage_limit", resourceLabel: "Max-2" },
     });
-    expect((wakes[0]!.opts.contextSnapshot.resourceWait as { issueIds: string[] }).issueIds.sort()).toEqual([...issueIds].sort());
+    // Fork: the summary is a run of its own, and `resourceWait` stays a lane run's own wait.
+    expect(wakes[0]!.opts.allowRunCoalescing).toBe(false);
+    expect(wakes[0]!.opts.contextSnapshot).not.toHaveProperty("resourceWait");
+    expect((wakes[0]!.opts.contextSnapshot.resourceWaitNotice as { issueIds: string[] }).issueIds.sort()).toEqual([...issueIds].sort());
     const keys = await resourceEpisodeKeys(db, episodes);
     expect(new Set(keys.values())).toEqual(new Set([now.toISOString()]));
 

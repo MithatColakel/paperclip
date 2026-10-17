@@ -9,6 +9,7 @@ import {
   buildStrandedRecoveryEscalationNotice,
   buildWorkspaceValidationRecoveryNoticeSeed,
 } from "./stranded-notice.js";
+import { resourceWaitRefusalNoticeSeed } from "./resource-wait-refusal-notice.js";
 
 function allRows(metadata: { sections: Array<{ rows: unknown[] }> }) {
   return metadata.sections.flatMap((section) => section.rows) as Array<Record<string, unknown>>;
@@ -58,6 +59,99 @@ describe("stranded recovery notice seeds", () => {
       pluginStatus: "disabled",
     });
     expect(disabled.body).toContain("an operator disabled it");
+  });
+
+  it("names the refusing or removed execution device and the move, not secret bindings (fork)", () => {
+    // The payload a resource-wait refusal records today: ids only.
+    const generic = buildConfigurationIncompleteRecoveryNoticeSeed({
+      reason: "environment_refused",
+      agentId: "4d5e6f70-8a9b-4c1d-8e2f-444444444444",
+      environmentId: "0c1d2e3f-4a5b-4c6d-8e7f-555555555555",
+      fingerprint: "environment_refused:0c1d2e3f-4a5b-4c6d-8e7f-555555555555",
+    });
+    expect(generic.title).toBe("Execution device refused the run");
+    expect(generic.tone).toBe("danger");
+    expect(generic.body).toContain("the agent's execution device was removed or refuses this agent's runs");
+    expect(generic.body).toContain("move the agent to another environment");
+    expect(generic.nextAction).toContain("Move the agent to another environment");
+    expect(generic.body).not.toContain("secret/env bindings");
+    expect(generic.body).not.toContain("0c1d2e3f");
+
+    const named = buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "environment_refused", deviceName: "Build `box`" });
+    expect(named.body).toContain("the execution device `Build 'box'` was removed or refuses this agent's runs");
+    expect(buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "environment_refused", environmentName: "SSH · Runner" }).body)
+      .toContain("the execution device `SSH · Runner`");
+    // It titles the escalation notice too.
+    expect(buildStrandedRecoveryEscalationNotice({
+      seed: named,
+      recoveryActionId: "6a2f8e64-6f5e-4b58-b7fd-111111111111",
+      recoveryOwner: null,
+      sourceRun: { id: "run-1", status: "failed", errorCode: "configuration_incomplete" },
+    }).presentation.title).toBe("Execution device refused the run");
+  });
+
+  it("names the setting to remove for a routing refusal, and a new execution for a changed account (fork)", () => {
+    // The payloads the account pool's refusals record (ids, an action link and a fingerprint), and upstream's bare one.
+    for (const payload of [
+      {
+        reason: "ai_connection_incompatible",
+        companyId: "9b1c2d3e-4f50-4a61-8b72-222222222222",
+        agentId: "4d5e6f70-8a9b-4c1d-8e2f-444444444444",
+        actionUrl: "/agents/4d5e6f70-8a9b-4c1d-8e2f-444444444444/runtime",
+        fingerprint: "ai-pool-incompatible:4d5e6f70-8a9b-4c1d-8e2f-444444444444:settings",
+      },
+      { reason: "ai_connection_incompatible", actionUrl: "/agents/4d5e6f70-8a9b-4c1d-8e2f-444444444444/runtime" },
+    ]) {
+      const seed = buildConfigurationIncompleteRecoveryNoticeSeed(payload);
+      expect(seed.title).toBe("AI account blocked by a conflicting setting");
+      expect(seed.tone).toBe("danger");
+      expect(seed.body).toContain("a provider routing override or an authentication setting conflicts with this agent's AI account");
+      expect(seed.body).toContain("`.claude/settings.json`");
+      expect(seed.nextAction).toBe("Remove the routing override or authentication setting named in the run failure, then resume the task.");
+      expect(seed.body).not.toContain("secret/env bindings");
+      expect(seed.body).not.toContain("4d5e6f70");
+    }
+
+    for (const payload of [
+      { reason: "ai_connection_changed", companyId: "9b1c2d3e-4f50-4a61-8b72-222222222222", agentId: "4d5e6f70-8a9b-4c1d-8e2f-444444444444" },
+      { reason: "ai_connection_changed", actionUrl: "/agents/4d5e6f70-8a9b-4c1d-8e2f-444444444444/runtime" },
+    ]) {
+      const seed = buildConfigurationIncompleteRecoveryNoticeSeed(payload);
+      expect(seed.title).toBe("AI account of a suspended run changed");
+      expect(seed.body).toContain("a suspended run never continues on another account");
+      expect(seed.body).toContain("start a new execution");
+      expect(seed.nextAction).toBe("Start a new execution of the task; it uses the agent's current AI account.");
+      expect(seed.body).not.toContain("secret/env bindings");
+    }
+
+    // They title the escalation notice and fill its next action.
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: buildConfigurationIncompleteRecoveryNoticeSeed({ reason: "ai_connection_incompatible" }),
+      recoveryActionId: "6a2f8e64-6f5e-4b58-b7fd-111111111111",
+      recoveryOwner: null,
+      sourceRun: {
+        id: "run-1",
+        status: "failed",
+        errorCode: "configuration_incomplete",
+        errorSummary: "ANTHROPIC_UNIX_SOCKET is set for Coder, so its Claude account cannot serve this run.",
+      },
+    });
+    expect(notice.presentation.title).toBe("AI account blocked by a conflicting setting");
+    expect(allRows(notice.metadata)).toContainEqual({
+      type: "key_value",
+      label: "Next action",
+      value: "Remove the routing override or authentication setting named in the run failure, then resume the task.",
+    });
+  });
+
+  it("leaves every other reason to the secret-binding copy (fork)", () => {
+    for (const payload of [{ reason: "secret_binding_missing" }, { reason: "environment_variable_missing" }, { reason: "" }, {}, null, undefined]) {
+      const seed = buildConfigurationIncompleteRecoveryNoticeSeed(payload);
+      expect(seed.title).toBe("Configuration incomplete");
+      expect(seed.body).toContain("secret/env bindings");
+      expect(seed.nextAction).toBeUndefined();
+      expect(resourceWaitRefusalNoticeSeed(payload)).toBeNull();
+    }
   });
 
   it("keeps the secret-binding copy for other configuration gaps", () => {

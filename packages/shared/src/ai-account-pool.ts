@@ -163,8 +163,12 @@ export function findPoolRunForbiddenEnvKeys(env: Record<string, unknown> | null 
 
 /**
  * Conflicts in a parsed Claude settings object (`.claude/settings*.json`):
- * forbidden helper keys by name, and routing overrides in its `env` block as
- * `env.<KEY>`.
+ * forbidden helper keys by name, routing overrides in its `env` block as
+ * `env.<KEY>`, and then, as `env.<KEY>` in `POOL_RUN_REMOVED_ENV_KEYS` order,
+ * every credential carrier a pool run deletes that the block names, whatever
+ * its value. The CLI applies a settings `env` block itself, so it would put a
+ * carrier back, and even an empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` selects
+ * the device owner's own stored login.
  */
 export function findPoolRunSettingsConflicts(settings: unknown): string[] {
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return [];
@@ -172,7 +176,11 @@ export function findPoolRunSettingsConflicts(settings: unknown): string[] {
   const conflicts: string[] = FORBIDDEN_SETTINGS_KEYS.filter((key) => isEnvValueSet(record[key]));
   const env = record.env;
   if (env && typeof env === "object" && !Array.isArray(env)) {
-    conflicts.push(...findPoolRunForbiddenEnvKeys(env as Record<string, unknown>).map((key) => `env.${key}`));
+    const block = env as Record<string, unknown>;
+    conflicts.push(...findPoolRunForbiddenEnvKeys(block).map((key) => `env.${key}`));
+    for (const key of POOL_RUN_REMOVED_ENV_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(block, key) && !conflicts.includes(`env.${key}`)) conflicts.push(`env.${key}`);
+    }
   }
   return conflicts;
 }
@@ -911,12 +919,17 @@ export interface AiAccountMigrationSummary {
   overLimitDevices: AiAccountMigrationDeviceEntry[];
 }
 
-/** Go/no-go: a recently active agent must plan to `use` its account. */
+/**
+ * Go/no-go: a recently active agent must plan to `use` its account. `none`:
+ * its runs would get no pool account and use the device's own login.
+ */
 export interface AiAccountMigrationGoNoGoEntry {
   agentId: string;
   agentName: string;
   companyId: string;
-  plan: "use" | "wait" | "refuse";
+  /** The agent's company; absent from servers that predate it. */
+  companyName?: string;
+  plan: "use" | "wait" | "none" | "refuse";
   reason: string | null;
 }
 

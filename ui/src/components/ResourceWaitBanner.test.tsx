@@ -16,11 +16,13 @@ import { ApiError } from "@/api/client";
 import {
   describeResourceWait,
   describeResourceWaitCheckNow,
+  describeScheduledResourceWait,
   isResourceWaitDeferralRun,
   readRunResourceWait,
   resourceWaitLaneLabel,
   resourceWaitReasonLabel,
   resourceWaitReasonText,
+  scheduledResourceWait,
 } from "@/lib/resource-wait";
 import { formatResetTime } from "@/lib/ai-account-pool";
 import { ResourceWaitBanner, ResourceWaitChip, ResourceWaitPropertyValue } from "./ResourceWaitBanner";
@@ -314,6 +316,61 @@ describe("ResourceWaitBanner", () => {
     act(() => checkNowButton()!.click());
     await waitForText("Available. Starting now.");
     expect(checkNowButton()!.disabled).toBe(true);
+  });
+
+  it("assumes no start time for a wait that joined another one", () => {
+    // A run that joined another agent's wait for another resource has no episode times of its own.
+    const joined = wait({ since: null, notifiedAt: null });
+    render(
+      <>
+        <ResourceWaitBanner issueId="issue-1" scheduledRetry={scheduledRetry(joined)} />
+        <ResourceWaitChip scheduledRetry={scheduledRetry(joined)} />
+        <ResourceWaitPropertyValue scheduledRetry={scheduledRetry(joined)} />
+      </>,
+    );
+    expect(container.textContent).toContain("Waiting for device Build box (offline)");
+    expect(container.textContent).not.toContain("since");
+    expect(container.querySelector('[data-testid="issue-row-resource-wait"]')?.textContent).toBe("Waiting for device: Build box");
+    expect(container.querySelector('[data-testid="issue-properties-resource-wait"]')?.textContent).toBe("device Build box (offline)");
+    expect(checkNowButton()?.textContent).toContain("Check now");
+  });
+
+  it("reads missing episode times of an older payload as unknown", () => {
+    const { since: _since, notifiedAt: _notifiedAt, ...context } = wait({ reason: "unreachable" });
+    const scheduled = scheduledResourceWait(scheduledRetry(context as ScheduledRetryResourceWait));
+    expect(scheduled?.wait).toMatchObject({ reason: "unreachable", since: null, notifiedAt: null });
+    expect(describeScheduledResourceWait(scheduled!, { now: NOW }).title).toBe("Waiting for device Build box (unreachable)");
+  });
+
+  it("names the waiting run's own agent, who need not be the task's assignee", () => {
+    // A mentioned reviewer's reply waits (or took the task's wait over) while the assignee does not.
+    const reviewerWait = (resourceWait: ScheduledRetryResourceWait, lane: string): IssueScheduledRetry => ({
+      ...scheduledRetry(resourceWait, lane),
+      runId: "run-reviewer-1",
+      agentId: "agent-reviewer",
+      agentName: "Reviewer",
+    });
+    render(<ResourceWaitBanner issueId="issue-1" scheduledRetry={reviewerWait(wait({ since: null, notifiedAt: null }), "environment_wait")} />);
+    expect(container.textContent).toContain("move Reviewer to another device");
+    expect(container.textContent).not.toContain("Coder");
+    const attribution = container.querySelector('[data-testid="resource-wait-run"]');
+    expect(attribution?.textContent).toBe("Waiting run run-revi by Reviewer");
+    expect(attribution?.querySelector("a")?.getAttribute("href")).toBe("/agents/agent-reviewer/runs/run-reviewer-1");
+
+    // A reason whose fix names no agent still says whose run waits.
+    render(
+      <ResourceWaitBanner
+        issueId="issue-1"
+        scheduledRetry={reviewerWait(wait({ kind: "ai_account", reason: "usage_limit", resumeAt: RESET.toISOString(), resumeAtSource: "provider", since: null }), "ai_account_wait")}
+      />,
+    );
+    expect(container.textContent).toContain("Waiting for Claude account Team Max: the usage limit resets at");
+    expect(container.querySelector('[data-testid="resource-wait-run"]')?.textContent).toBe("Waiting run run-revi by Reviewer");
+
+    // Without a name, the run link still identifies it.
+    render(<ResourceWaitBanner issueId="issue-1" scheduledRetry={{ ...reviewerWait(wait(), "environment_wait"), agentName: null }} />);
+    expect(container.querySelector('[data-testid="resource-wait-run"]')?.textContent).toBe("Waiting run run-revi");
+    expect(container.textContent).toContain("move the agent to another device");
   });
 
   it("renders nothing for an ordinary retry or a retry that already started", () => {

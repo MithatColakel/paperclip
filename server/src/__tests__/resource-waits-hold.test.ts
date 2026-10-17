@@ -1124,7 +1124,8 @@ describeEmbeddedPostgres("resource waits (database)", () => {
         expect.stringContaining("it is signed out"),
         expect.stringContaining("it is switched off"),
       ]);
-      expect(calls.wakes.map((wake) => (wake.contextSnapshot.resourceWait as { reason: string }).reason))
+      // The PM summary rides under its own key (a lane run keeps `resourceWait` for its own wait).
+      expect(calls.wakes.map((wake) => (wake.contextSnapshot.resourceWaitNotice as { reason: string }).reason))
         .toEqual(["usage_limit", "signed_out", "withdrawn"]);
       expect(calls.wakes.every((wake) => wake.agentId === lead.id)).toBe(true);
     });

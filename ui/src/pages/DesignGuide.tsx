@@ -21,6 +21,8 @@ import { AnnouncementCard } from "@/components/AnnouncementCard";
 import { announcementPreview, announcementAnimationPreview, announcementAnimationPreviewSrc } from "@/lib/announcement-preview";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { AiConnectionDesignExamples } from "@/components/ai-connections/AiConnectionDesignExamples";
+// Fork: Claude account pool and waiting UI examples (agent card, account picker, wait banner and chips, device link dialog).
+import { AccountPoolDesignExamples } from "@/components/ai-account-pool/AccountPoolDesignExamples";
 import { SavedProviderKeySelect } from "../components/onboarding/SavedProviderKeySelect";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { AgentCharacter } from "@/components/AgentCharacter";
@@ -2472,6 +2474,11 @@ export function DesignGuide() {
 
       <Section title="AI Connections">
         <AiConnectionDesignExamples />
+      </Section>
+
+      {/* Fork: the Claude account pool. */}
+      <Section title="Claude Accounts and Devices">
+        <AccountPoolDesignExamples />
       </Section>
 
       <Section title="Built-in Agent Lifecycle Chips">

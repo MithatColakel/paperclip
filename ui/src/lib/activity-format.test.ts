@@ -175,6 +175,16 @@ describe("account pool and wait activity (fork)", () => {
     expect(formatActivityVerb("company.execution_wait_settings_updated", null)).toBe("updated wait notices for");
   });
 
+  it("reads a confirmed migrated assignment and a device flagged over its account limit", () => {
+    expect(formatActivityVerb("ai_account.binding_reviewed", { mode: "pool_account", accountId: "acc-1", source: "migrated_host_pool" }))
+      .toBe("confirmed the Claude account of");
+    expect(formatActivityVerb("execution_device.over_limit", { deviceName: "Build box", limit: 3, inUse: 4 }))
+      .toBe("flagged Build box over its account limit");
+    expect(formatActivityVerb("execution_device.over_limit", { deviceName: "  ", limit: 3, inUse: 4 }))
+      .toBe("flagged an execution device over its account limit");
+    expect(formatActivityVerb("execution_device.over_limit", null)).toBe("flagged an execution device over its account limit");
+  });
+
   it("names the reason a task waited", () => {
     expect(formatActivityVerb("resource_wait.started", { kind: "environment", reason: "offline" }))
       .toBe("started waiting (device offline) on");

@@ -68,6 +68,12 @@ type AccountRow = typeof aiAccounts.$inferSelect;
 
 export const RESOURCE_WAIT_NOTICE_ACTOR_ID = "resource_waits";
 export const RESOURCE_WAIT_PM_WAKE_REASON = "resource_wait_notice";
+/**
+ * Where a PM's summary wake carries its summary. Not `resourceWait`: a lane
+ * run keeps its own written-once wait there (spec 7.1), and the summary run
+ * may itself wait, or take in a later wake, before the PM reads it.
+ */
+export const RESOURCE_WAIT_PM_NOTICE_CONTEXT_KEY = "resourceWaitNotice";
 const PM_ISSUE_LIMIT = 20;
 const HIDDEN_ACCOUNT_TEXT = "an account that is no longer available in this company";
 
@@ -207,6 +213,40 @@ const REASON_LABELS: Record<ResourceWaitReason, string> = {
 
 export function resourceWaitReasonLabel(reason: string): string {
   return isResourceWaitReason(reason) ? REASON_LABELS[reason] : "unavailable";
+}
+
+/**
+ * What a PM's summary wake shows (spec 8). The wake carries no issue id, so
+ * heartbeat renders this as the run's task context: what waits, for which
+ * resource, that Paperclip resumes it by itself, and what a person can fix.
+ * It reads the summary key, not the wake reason: a later wake merged into the
+ * queued summary run, or the summary run's own wait, replaces the wake reason.
+ * Empty for any other run.
+ */
+export function resourceWaitPmNoticeMarkdown(context: Record<string, unknown> | null | undefined): string {
+  const summary = context?.[RESOURCE_WAIT_PM_NOTICE_CONTEXT_KEY];
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return "";
+  const { kind, reason, resourceLabel, resumeAt, issueIds } = summary as Record<string, unknown>;
+  const label = typeof resourceLabel === "string" && resourceLabel.trim() ? resourceLabel.trim().slice(0, 120) : null;
+  const resource = kind === "ai_account"
+    ? label && label !== HIDDEN_ACCOUNT_TEXT ? `the Claude account "${label}"` : `a Claude account that is no longer available in this company`
+    : kind === "device_slots"
+      ? `a free account slot on the device "${label ?? "unknown"}"`
+      : `the device "${label ?? "unknown"}"`;
+  const reasonText = typeof reason === "string" ? resourceWaitReasonLabel(reason) : "unavailable";
+  const resume = typeof resumeAt === "string" && Number.isFinite(Date.parse(resumeAt))
+    ? ` It is expected back at ${formatUtc(new Date(resumeAt))}.`
+    : "";
+  const ids = Array.isArray(issueIds)
+    ? issueIds.filter((id): id is string => typeof id === "string" && id.length > 0).slice(0, PM_ISSUE_LIMIT)
+    : [];
+  return [
+    "Paperclip resource wait notice:",
+    `Tasks you are responsible for are waiting for ${resource} (${reasonText}). Paperclip starts them automatically when it is available, and it never moves a task to another Claude account or device.${resume}`,
+    ...(ids.length > 0 ? ["", "Waiting tasks:", ...ids.map((id) => `- ${id}`)] : []),
+    "",
+    "Do not reassign, restart or redo these tasks to work around the wait. If a person has to act (for example replace a signed-out token, choose an account for the agent, allow the project on the device, or move the agent to another device), tell the board what to fix. Otherwise there is nothing to do.",
+  ].join("\n");
 }
 
 interface NoticeFacts {
@@ -503,9 +543,12 @@ export function createResourceWaitNotifier(options: ResourceWaitNotifierOptions)
         payload: null,
         requestedByActorType: "system",
         requestedByActorId: null,
+        // Its own run: merged into a turn already running, the PM would never see it, and
+        // merged into the PM's own waiting run, it would change that run's wait.
+        allowRunCoalescing: false,
         contextSnapshot: {
           wakeReason: RESOURCE_WAIT_PM_WAKE_REASON,
-          resourceWait: {
+          [RESOURCE_WAIT_PM_NOTICE_CONTEXT_KEY]: {
             kind: episode.kind,
             reason: episode.reason,
             resourceLabel,

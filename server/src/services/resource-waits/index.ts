@@ -221,6 +221,7 @@ export {
 } from "./check-now.js";
 export {
   RESOURCE_WAIT_NOTICE_ACTOR_ID,
+  RESOURCE_WAIT_PM_NOTICE_CONTEXT_KEY,
   RESOURCE_WAIT_PM_WAKE_REASON,
   claimResourceWaitNotice,
   createResourceWaitNotifier,
@@ -232,6 +233,7 @@ export {
   readExecutionWaitSettings,
   releaseResourceWaitNotice,
   resourceEpisodeKeys,
+  resourceWaitPmNoticeMarkdown,
   resourceWaitReasonLabel,
   type ResourceWaitNotifier,
 } from "./notify.js";

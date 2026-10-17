@@ -44,8 +44,9 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 // A turn the user continued on a held task, failed on the Claude usage limit.
-// The fork's quota-recovery and company-pool failover lanes must renew the
-// user's authorization the same way upstream's transient retry does.
+// The fork's quota-recovery and company-pool wait lanes must renew the user's
+// authorization the same way upstream's transient retry does. Nothing moves the
+// turn to another account (P7).
 describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -182,6 +183,10 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
     context: run.contextSnapshot!, summary: null, exposeLowTrustRaw: false,
   });
 
+  // Fork: a task a test leaves without a recovery path must not reach the
+  // instance-wide sweeps (stale locks, stranded tasks, timers) of later tests.
+  const settle = (f: Fixture) => db.update(issues).set({ status: "done", executionRunId: null }).where(eq(issues.id, f.issueId));
+
   async function expectRenewedSuccessor(f: Fixture, parentId: string, retryReason: string) {
     const [successor, ...others] = await successorsOf(parentId);
     expect(others).toHaveLength(0);
@@ -222,36 +227,52 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
     expect(await renewedReceipts(f.issueId)).toHaveLength(2);
   });
 
-  it.each(["parent", "released"] as const)(
-    "fails a user-continued turn over to the next company-pool account (task claim %s)", async claim => {
-      const f = await seedUserContinuedQuotaFailure({ claim, pool: true });
-      expect(await heartbeatService(db).scheduleAiConnectionPoolFailover(f.runId)).toBe(true);
-      const successor = await expectRenewedSuccessor(f, f.runId, "ai_connection_failover");
-      expect(successor.contextSnapshot).toMatchObject({ aiConnectionFailovers: 1 });
-    },
-  );
+  // Fork: P7 removed the company-pool failover. A limited member is marked and
+  // the turn waits in the company-pool lane for that member's reset; nothing
+  // moves it to another account.
+  it("waits for its own company-pool member's reset and renews the user's authorization (task claim held)", async () => {
+    const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true });
+    expect(await heartbeatService(db).handleProviderLimit(f.runId)).toMatchObject({ handled: true, via: "company_pool" });
+    const successor = await expectRenewedSuccessor(f, f.runId, "ai_connection_pool_wait");
+    expect(successor.contextSnapshot).not.toHaveProperty("aiConnectionFailovers");
+    const [first] = await aiConnectionPoolService(db).members(f.companyId, "anthropic");
+    // Due at that member's reset plus at most 120 s of per-run spread, never at once.
+    const reset = first!.exhaustedUntil!.getTime();
+    expect(successor.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(reset);
+    expect(successor.scheduledRetryAt!.getTime()).toBeLessThanOrEqual(reset + 121_000);
+  });
 
-  it("does not fail over while the finished executor still owns its adapter controller", async () => {
+  it("leaves a turn whose task claim was released to the provider-quota wait", async () => {
+    // Fork: the company-pool lane keeps the task's lock, so it never takes a released claim.
     const f = await seedUserContinuedQuotaFailure({ claim: "released", pool: true });
+    expect(await heartbeatService(db).handleProviderLimit(f.runId)).toMatchObject({ handled: false, via: "company_pool" });
+    expect(await successorsOf(f.runId)).toHaveLength(0);
+    expect(await renewedReceipts(f.issueId)).toHaveLength(0);
+    expect(await taskClaim(f.issueId)).toBeNull();
+    await settle(f);
+  });
+
+  it("does not schedule the company-pool wait while the finished executor still owns its adapter controller", async () => {
+    const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true });
     const heartbeat = heartbeatService(db);
     const control = createAdapterExecutionControl();
     adapterExecutionControls.set(f.runId, control);
     try {
-      expect(await heartbeat.scheduleAiConnectionPoolFailover(f.runId)).toBe(false);
+      expect(await heartbeat.handleProviderLimit(f.runId)).toMatchObject({ handled: false });
       expect(await successorsOf(f.runId)).toHaveLength(0);
       expect(await renewedReceipts(f.issueId)).toHaveLength(0);
-      // The lent claim is taken back when admission refuses.
-      expect(await taskClaim(f.issueId)).toBeNull();
+      // The claim stays with the finished turn when admission refuses.
+      expect(await taskClaim(f.issueId)).toBe(f.runId);
     } finally {
       adapterExecutionControls.delete(f.runId);
       control.finish();
     }
-    // This is why finalization defers the failover until after cleanup.
-    expect(await heartbeat.scheduleAiConnectionPoolFailover(f.runId)).toBe(true);
-    await expectRenewedSuccessor(f, f.runId, "ai_connection_failover");
+    // This is why finalization defers the wait until after cleanup.
+    expect(await heartbeat.handleProviderLimit(f.runId)).toMatchObject({ handled: true });
+    await expectRenewedSuccessor(f, f.runId, "ai_connection_pool_wait");
   });
 
-  it("fails over through the real executor once its controller and lease are released", async () => {
+  it("marks the company-pool member once through the real executor and leaves the released turn to the provider-quota wait", async () => {
     const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true, queued: true });
     mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
       const invocation = input as { onCancellationReady: () => Promise<void>; onDispatch: () => void };
@@ -270,11 +291,18 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     expect(adapterExecutionControls.has(f.runId)).toBe(false);
     expect(await heartbeat.getRun(f.runId)).toMatchObject({ status: "failed" });
-    const successor = await expectRenewedSuccessor(f, f.runId, "ai_connection_failover");
-    expect(successor.contextSnapshot).toMatchObject({ aiConnectionFailovers: 1 });
-    // Finalization deferred the hand-off, so the account is marked only once.
+    // Fork: finalization released the task claim to the provider-quota wait, and
+    // the company-pool lane keeps a task's lock, so it never takes a released
+    // claim. Nothing moves the turn to another account (P7).
+    expect(await successorsOf(f.runId)).toHaveLength(0);
+    expect(await taskClaim(f.issueId)).toBeNull();
+    // Finalization deferred the limit handling, so the account is marked only once.
     expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
       eq(activityLog.action, "ai_connection.pool_limit_reached")))).toHaveLength(1);
+    const [first, second] = await aiConnectionPoolService(db).members(f.companyId, "anthropic");
+    expect(first!.exhaustedUntil!.getTime()).toBeGreaterThan(Date.now());
+    expect(second!.exhaustedUntil).toBeNull();
+    await settle(f);
   });
 
   const quotaFailure = (runId: string) => async (input?: unknown) => {
@@ -287,7 +315,7 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
       summary: null, provider: "test", model: "test-model" };
   };
 
-  it("lets newer user input take precedence over the company-pool failover", async () => {
+  it("lets newer user input take precedence over the company-pool wait", async () => {
     const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true, queued: true });
     const heartbeat = heartbeatService(db);
     const nextCommentId = randomUUID();
@@ -319,7 +347,7 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
     expect(await deferredWakes()).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
       sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${nextCommentId}`))).toHaveLength(1);
-    // The limited account is still marked, so the new turn selects the next one.
+    // The limited account is still marked; the other member is untouched.
     const [first, second] = await aiConnectionPoolService(db).members(f.companyId, "anthropic");
     expect(first!.exhaustedUntil!.getTime()).toBeGreaterThan(Date.now());
     expect(second!.exhaustedUntil).toBeNull();
@@ -390,7 +418,8 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
       }
       const heartbeat = heartbeatService(db);
 
-      expect(await heartbeat.scheduleAiConnectionPoolFailover(f.runId)).toBe(false);
+      // Fork: the company-pool wait (no failover since P7) is refused like the quota lane.
+      expect(await heartbeat.handleProviderLimit(f.runId)).toMatchObject({ handled: false });
       expect(await taskClaim(f.issueId)).toBe(expectedClaim);
       expect(await heartbeat.scheduleBoundedRetry(f.runId, { now: firstTickAt,
         retryReason: "provider_quota_recovery", wakeReason: "provider_quota_recovery", delayMs: 0, maxAttempts: 40 }))
@@ -405,6 +434,29 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
         expect(await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
           eq(issueRecoveryActions.cause, "provider_quota_exhausted")))).toMatchObject([{ ownerType: "board", status: "active" }]);
       }
+    },
+  );
+
+  it.each(["edited", "deleted", "new_input", "deferred_input"] as const)(
+    "refuses the company-pool wait of a turn that still holds its claim when the user's authorization is gone: %s", async kind => {
+      // Fork: with the claim held the lane's lock gate passes, so the admission decides.
+      const f = await seedUserContinuedQuotaFailure({ claim: "parent", pool: true });
+      if (kind === "edited") await db.update(issueComments).set({ body: "Actually, stop the release." })
+        .where(eq(issueComments.id, f.commentId));
+      if (kind === "deleted") await db.update(issueComments).set({ deletedAt: new Date() })
+        .where(eq(issueComments.id, f.commentId));
+      if (kind === "new_input") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+        runtimeMode: "legacy", status: "succeeded", createdAt: new Date(failedAt.getTime() + 60_000),
+        finishedAt: new Date(failedAt.getTime() + 120_000), contextSnapshot: { issueId: f.issueId } });
+      if (kind === "deferred_input") await db.insert(agentWakeupRequests).values({ companyId: f.companyId,
+        agentId: f.agentId, source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: f.issueId, commentId: randomUUID() }, status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: userId });
+      expect(await heartbeatService(db).handleProviderLimit(f.runId)).toMatchObject({ handled: false, via: "company_pool" });
+      expect(await successorsOf(f.runId)).toHaveLength(0);
+      expect(await renewedReceipts(f.issueId)).toHaveLength(0);
+      expect(await taskClaim(f.issueId)).toBe(f.runId);
+      await settle(f);
     },
   );
 

@@ -40,11 +40,13 @@ import { admitExplicitContinuationUsageLimitRetry, EXPLICIT_CONTINUATION_USAGE_L
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { AI_ACCOUNT_CREDIT_BALANCE_COOLDOWN_MS, AI_ACCOUNT_DEFAULT_LIMIT_COOLDOWN_MS, AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS, aiConnectionBindingSchema, aiProviderSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
+import { AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS, aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, isResourceWaitRetryReason, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
-import { aiConnectionPoolRetryAt, aiConnectionPoolService, isAiConnectionPoolExhausted } from "./ai-connection-pool.js";
-import { aiAccountHostService, HOST_POOL_AUTH_ENV_KEYS, HOST_POOL_FORBIDDEN_ROUTING_ENV_KEYS, isCreditBalanceFailure } from "./ai-account-hosts.js";
+import { aiConnectionPoolRetryAt, isAiConnectionPoolExhausted } from "./ai-connection-pool.js";
+// Fork: Claude account pool and resource waits (spec v3 §4, §7, §8). The logic lives in these modules.
+import { createHeartbeatAiAccounts, isPersistedNativeRun, ownPoolAttribution, type CredentialPlan } from "./heartbeat-ai-accounts.js";
+import { checkNowRateLimitedError, createResourceWaits, isConfigurationRefusal, isResourceWaitDeferral, mergeWakeEpochs, readScheduledRetryResourceWaits, resourceStillUnavailableError, resourceWaitHoldsForIssues, resourceWaitPmNoticeMarkdown, type CheckNowSource, type ResourceWaitWakeFilter, type ResourceWaitWakeOptions } from "./resource-waits/index.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
@@ -553,7 +555,6 @@ import {
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
-  AI_CONNECTION_FAILOVER_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
@@ -562,6 +563,7 @@ import {
   deriveCommentId,
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
+  RESOURCE_WAIT_RESOLVED_INTERACTION_KEY,
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
@@ -1154,9 +1156,15 @@ function readTransientRetryNotBeforeFromRun(
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function readAiConnectionFailoverCount(contextSnapshot: Record<string, unknown>) {
-  const value = contextSnapshot.aiConnectionFailovers;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+// Fork: a device or Claude account refusal (spec 7.1) blocks the run as
+// incomplete configuration. A ResourceWaitDeferral passes through unchanged to
+// the deferral finalizer (hook H5).
+function refusalAsConfigurationFailure(error: unknown): unknown {
+  return isConfigurationRefusal(error) ? new ConfigurationIncompleteFailure(error.message, error.resultJson) : error;
+}
+
+function rethrowRefusalAsConfigurationFailure(error: unknown): never {
+  throw refusalAsConfigurationFailure(error);
 }
 
 function readTransientRecoveryContractFromRun(
@@ -9707,6 +9715,36 @@ export function heartbeatService(
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   });
   const runDispatch = createRunDispatch(db);
+  // Fork: resource waits (spec 7, 8) and the Claude account pool's run path
+  // (spec 4), built from this service's own closures. The kill switch
+  // PAPERCLIP_ENVIRONMENT_WAITS is read here, once.
+  const resourceWaits = createResourceWaits({
+    db,
+    pluginWorkerManager: options.pluginWorkerManager,
+    env: runtimeEnv,
+    deps: {
+      setRunStatusIfRunning: (runId, status, patch) => setRunStatusIfRunning(runId, status, patch),
+      setWakeupStatus,
+      getRun: (runId) => getRun(runId),
+      getAgent,
+      scheduleBoundedRetryForRun: (run, agent, opts) => scheduleBoundedRetryForRun(run, agent, opts),
+      appendRunEvent: (run, event) => appendRunEvent(run, event),
+      releaseIssueExecutionAndPromote: (run) => releaseIssueExecutionAndPromote(run),
+      finalizeAgentStatus,
+      enqueueWakeup: (agentId, opts) => enqueueWakeup(agentId, opts),
+      addIssueSystemNotice: ({ issueId, body, presentation, metadata }) =>
+        issuesSvc.addComment(issueId, body, {}, { authorType: "system", presentation, metadata }),
+      evaluateScheduledRetryGate: (input) => runDispatch.evaluateScheduledRetryGate(input),
+    },
+  });
+  const heartbeatAiAccounts = createHeartbeatAiAccounts({
+    db,
+    resourceWaits,
+    deps: {
+      appendRunEvent: (run, event) => appendRunEvent(run, event),
+      scheduleBoundedRetryForRun: (run, agent, opts) => scheduleBoundedRetryForRun(run, agent, opts),
+    },
+  });
 
   // Applies the post-commit effects a run-dispatch operation returns, on a
   // best-effort basis, exactly as this service publishes them for every
@@ -12239,6 +12277,29 @@ export function heartbeatService(
     });
   }
 
+  // Fork: hook H13 (spec 7.6). While a task's run waits for a device, an account
+  // or a slot, its due monitor moves to max(the wait's next check, now + 15 min)
+  // and counts no attempt. Returns the issues whose monitor moved.
+  async function deferIssueMonitorsForResourceWaits(due: Array<{ id: string; companyId: string }>, now: Date) {
+    const deferred = new Set<string>();
+    const byCompany = new Map<string, string[]>();
+    for (const row of due) byCompany.set(row.companyId, [...(byCompany.get(row.companyId) ?? []), row.id]);
+    for (const [companyId, issueIds] of byCompany) {
+      try {
+        for (const [issueId, hold] of await resourceWaitHoldsForIssues(db, { companyId, issueIds })) {
+          const nextCheckAt = new Date(Math.max(hold.getTime(), now.getTime() + 15 * 60_000));
+          const moved = await db.update(issues).set({ monitorNextCheckAt: nextCheckAt, updatedAt: now })
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId), lte(issues.monitorNextCheckAt, now)))
+            .returning({ id: issues.id });
+          if (moved.length > 0) deferred.add(issueId);
+        }
+      } catch (err) {
+        logger.warn({ err, companyId }, "failed to read resource waits for due issue monitors; the monitors run as usual");
+      }
+    }
+    return deferred;
+  }
+
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const dueMonitors = await db
@@ -12264,8 +12325,11 @@ export function heartbeatService(
 
     let triggered = 0;
     let skipped = 0;
+    // Fork: hook H13.
+    const waiting = await deferIssueMonitorsForResourceWaits(dueMonitors, now);
 
     for (const due of dueMonitors) {
+      if (waiting.has(due.id)) continue;
       const claimed = await db.transaction(async (tx) => {
         const [updated] = await tx
           .update(issues)
@@ -15660,6 +15724,8 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      /** Fork: hook H8. Merged last into the successor's context (a resource wait's `resourceWait`). */
+      contextPatch?: Record<string, unknown>;
     },
   ) {
     if (run.errorCode === "provider_tool_definition_invalid") {
@@ -15842,6 +15908,8 @@ export function heartbeatService(
       isTransientWorkspaceGitScanCode(run.errorCode) ||
       hasConversationContinuationPolicy(run.resultJson) ||
       (retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON) ||
+      // Fork: hook H7. Device, account and slot waits pass the same gate.
+      isResourceWaitRetryReason(retryReason) ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
     if (requiresIssueGate) {
@@ -15911,11 +15979,8 @@ export function heartbeatService(
                 executionFailureRetryCount(run),
             }
           : {}),
-        ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON || retryReason === AI_CONNECTION_FAILOVER_RETRY_REASON
+        ...((retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON)
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
-          : {}),
-        ...(retryReason === AI_CONNECTION_FAILOVER_RETRY_REASON
-          ? { aiConnectionFailovers: readAiConnectionFailoverCount(contextSnapshot) + 1 }
           : {}),
         ...(retryReason === PROVIDER_QUOTA_RECOVERY_RETRY_REASON
           ? {
@@ -15961,6 +16026,11 @@ export function heartbeatService(
       },
       "normal_model",
     );
+    // Fork: hook H8. The deferral's written-once wait context is merged last.
+    if (opts?.contextPatch) Object.assign(retryContextSnapshot, opts.contextPatch);
+    // Fork: a resolved interaction continuation stays one while it waits in a lane (spec 7.6).
+    if (isResourceWaitRetryReason(retryReason) && isResolvedInteractionContinuationWakeContext(contextSnapshot)) retryContextSnapshot[RESOURCE_WAIT_RESOLVED_INTERACTION_KEY] = true;
+    else delete retryContextSnapshot[RESOURCE_WAIT_RESOLVED_INTERACTION_KEY];
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(
       run,
       retryContextSnapshot,
@@ -16249,7 +16319,8 @@ export function heartbeatService(
         }
 
         if (
-          (retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON) && issueId &&
+          // Fork: hook H7. A device, account or slot wait keeps its task's lock too.
+          (retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON || isResourceWaitRetryReason(retryReason)) && issueId &&
           !isNonAssigneeWorkspaceBusyRetry(retryReason, contextSnapshot)
         ) {
           // The issue row is locked above. Recheck after the preflight gate so
@@ -16273,8 +16344,8 @@ export function heartbeatService(
           } : null;
           const continuation = !admission ? null
             : retryReason === "transient_failure" ? await admitExplicitContinuationRetry(admission)
-            // Fork: the quota-recovery and company-pool failover lanes renew
-            // the same user authorization instead of failing closed.
+            // Fork: the quota-recovery, company-pool and resource-wait lanes
+            // renew the same user authorization instead of failing closed.
             : EXPLICIT_CONTINUATION_USAGE_LIMIT_RETRY_REASONS.has(retryReason)
               ? await admitExplicitContinuationUsageLimitRetry(admission) : null;
           if (!continuation) return {
@@ -16670,196 +16741,6 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // Fork: a host-pool account that hit its usage limit (or whose sign-in
-  // failed) rests, and the run moves at once to another account of the same
-  // host (doc/plans/2026-10-14-host-ai-account-pools.md). Returns false when
-  // the normal retry or the provider-quota wait should handle the failure.
-  async function scheduleHostPoolFailover(
-    run: typeof heartbeatRuns.$inferSelect,
-    agent: typeof agents.$inferSelect,
-    failure:
-      | { kind: "provider_quota"; retryNotBefore: Date | null }
-      | { kind: "credit_balance" }
-      | { kind: "auth_failed"; message: string },
-  ): Promise<boolean> {
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const attribution = parseObject(contextSnapshot.aiConnection);
-    const accountId = readNonEmptyString(attribution.accountId);
-    const hostId = readNonEmptyString(attribution.hostId);
-    if (attribution.mode !== "host_pool" || !accountId || !hostId) return false;
-    const accounts = aiAccountHostService(db);
-    const now = new Date();
-    let until: Date | null = null;
-    if (failure.kind === "auth_failed") {
-      await accounts.markAuthFailed({ accountId, message: failure.message });
-    } else {
-      until = failure.kind === "credit_balance"
-        ? new Date(now.getTime() + AI_ACCOUNT_CREDIT_BALANCE_COOLDOWN_MS)
-        : failure.retryNotBefore && failure.retryNotBefore.getTime() > now.getTime()
-          ? failure.retryNotBefore
-          : new Date(now.getTime() + AI_ACCOUNT_DEFAULT_LIMIT_COOLDOWN_MS);
-      await accounts.markLimited({ accountId, until, reason: failure.kind, runId: run.id });
-    }
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: "system",
-      actorId: "heartbeat",
-      action: failure.kind === "auth_failed" ? "ai_account.auth_failed" : "ai_account.limit_reached",
-      entityType: "ai_account",
-      entityId: accountId,
-      agentId: agent.id,
-      runId: run.id,
-      details: {
-        host: attribution.hostName ?? null,
-        account: attribution.accountName ?? null,
-        reason: failure.kind,
-        ...(until ? { exhaustedUntil: until.toISOString() } : {}),
-      },
-    });
-    const accountLabel = String(attribution.accountName ?? "This Claude account");
-    const hostLabel = String(attribution.hostName ?? "this host");
-    if (contextSnapshot.explicitUserContinuation && !(await accounts.hasAvailableAccount(hostId, now, readNonEmptyString(contextSnapshot.projectId) ?? null))) {
-      await appendRunEvent(run, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message: `Every Claude account on ${hostLabel} is unavailable; the provider-quota monitor resumes this task after the reset.`,
-        payload: { accountId, ...(until ? { exhaustedUntil: until.toISOString() } : {}) },
-      });
-      return false;
-    }
-    const poolSize = await accounts.countPoolAccounts(hostId);
-    const failovers = readAiConnectionFailoverCount(contextSnapshot);
-    if (poolSize === 0 || failovers >= Math.max(1, poolSize) * 2) {
-      await appendRunEvent(run, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: `This task already moved between the Claude accounts on ${hostLabel} too often; it now waits like any usage-limited run.`,
-        payload: { accountId, failovers },
-      });
-      return false;
-    }
-    // Delay 0: runtime preparation picks another account of the host, or
-    // waits for the earliest reset when every account is limited.
-    const retry = await scheduleBoundedRetryForRun(run, agent, {
-      now,
-      retryReason: AI_CONNECTION_FAILOVER_RETRY_REASON,
-      wakeReason: "ai_connection_failover_retry",
-      maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
-      delayMs: 0,
-    });
-    const what = failure.kind === "auth_failed"
-      ? `${accountLabel} could not sign in and is out of the pool until it is fixed`
-      : failure.kind === "credit_balance"
-        ? `${accountLabel} has no API credit left`
-        : `${accountLabel} reached its usage limit until ${until!.toISOString()}`;
-    await appendRunEvent(run, {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "info",
-      message: retry.outcome === "scheduled"
-        ? `${what}. The task continues with another Claude account on ${hostLabel}.`
-        : `${what}. The task could not move to another account.`,
-      payload: { accountId, reason: failure.kind, retryOutcome: retry.outcome, ...(until ? { exhaustedUntil: until.toISOString() } : {}) },
-    });
-    return retry.outcome === "scheduled";
-  }
-
-  // A company-pool account that hit its usage limit is skipped until its reset,
-  // and the run moves to the company's next account at once instead of
-  // waiting. Returns false when the normal bounded retry should handle the
-  // failure (not a pool run, not a usage limit, or too many hand-offs).
-  async function scheduleAiConnectionPoolFailover(
-    run: typeof heartbeatRuns.$inferSelect,
-    agent: typeof agents.$inferSelect,
-  ): Promise<boolean> {
-    const recovery = readTransientRecoveryContractFromRun(run);
-    if (recovery?.errorFamily !== "provider_quota") return false;
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const attribution = parseObject(contextSnapshot.aiConnection);
-    if (attribution.mode === "host_pool") {
-      const limitText = [run.error, run.stderrExcerpt, run.stdoutExcerpt].filter(Boolean).join("\n");
-      return scheduleHostPoolFailover(run, agent, isCreditBalanceFailure(limitText)
-        ? { kind: "credit_balance" }
-        : { kind: "provider_quota", retryNotBefore: recovery.retryNotBefore ?? null });
-    }
-    const connectionId = readNonEmptyString(attribution.connectionId);
-    const provider = aiProviderSchema.safeParse(attribution.provider);
-    if (attribution.mode !== "company_pool" || !connectionId || !provider.success) return false;
-    const now = new Date();
-    const until =
-      recovery.retryNotBefore && recovery.retryNotBefore.getTime() > now.getTime()
-        ? recovery.retryNotBefore
-        : new Date(now.getTime() + AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS);
-    const pool = aiConnectionPoolService(db);
-    await pool.markExhausted({
-      companyId: run.companyId,
-      connectionId,
-      until,
-      reason: "provider_quota",
-      source: "run_failure",
-      runId: run.id,
-    });
-    await logActivity(db, {
-      companyId: run.companyId,
-      actorType: "system",
-      actorId: "heartbeat",
-      action: "ai_connection.pool_limit_reached",
-      entityType: "tool_connection",
-      entityId: connectionId,
-      agentId: agent.id,
-      runId: run.id,
-      details: { provider: provider.data, exhaustedUntil: until.toISOString(), poolPriority: attribution.poolPriority ?? null },
-    });
-    // Fork: a successor of a user-continued turn carries the user's
-    // authorization, which the ai_connection_busy wait for a fully limited
-    // pool refuses. Leave the wait to the provider-quota monitor instead.
-    // Approximate: the >=95% usage-window skip is not counted here.
-    if (contextSnapshot.explicitUserContinuation &&
-        !(await pool.hasAvailableMember(run.companyId, provider.data, now))) {
-      await appendRunEvent(run, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message: "Every company AI account is at its usage limit; the provider-quota monitor resumes this task after the reset.",
-        payload: { connectionId, exhaustedUntil: until.toISOString() },
-      });
-      return false;
-    }
-    const members = await pool.members(run.companyId, provider.data);
-    const failovers = readAiConnectionFailoverCount(contextSnapshot);
-    if (failovers >= members.length * 2) {
-      await appendRunEvent(run, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message: "This task already moved between the company's AI accounts too often; it now waits like any usage-limited run.",
-        payload: { connectionId, failovers },
-      });
-      return false;
-    }
-    // Delay 0: runtime preparation picks the next available account, or waits
-    // for the earliest reset when every account is limited.
-    const retry = await scheduleBoundedRetryForRun(run, agent, {
-      now,
-      retryReason: AI_CONNECTION_FAILOVER_RETRY_REASON,
-      wakeReason: "ai_connection_failover_retry",
-      maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1,
-      delayMs: 0,
-    });
-    await appendRunEvent(run, {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "info",
-      message: retry.outcome === "scheduled"
-        ? `This AI account reached its usage limit until ${until.toISOString()}. The task continues with the company's next account.`
-        : "This AI account reached its usage limit; the task could not move to another account.",
-      payload: { connectionId, exhaustedUntil: until.toISOString(), retryOutcome: retry.outcome },
-    });
-    return retry.outcome === "scheduled";
-  }
-
   // Raised today only when every account in a company AI pool is at its usage
   // limit (`ai_connection_pool_exhausted`, with the earliest reset as the
   // delay). A stored run row can also still carry `ai_connection_busy` from an
@@ -17059,12 +16940,57 @@ export function heartbeatService(
 
   async function promoteDueScheduledRetries(now = new Date()) {
     const cutoff = await getWorktreeExecutionCutoff();
+    // Fork: hook H11 (spec 7.4). Due device, account and slot waits are re-checked
+    // first; one whose resource is still unavailable is held, not promoted.
+    await resourceWaits.holdDueWaits({ now, cutoff }).catch((err) => {
+      logger.warn({ err }, "resource wait hold pass failed; due waits get a real attempt");
+    });
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };
+  }
+
+  // Fork: starts woken or promoted resource waits without blocking the caller.
+  function startResourceWaitRunsSoon(agentIds: readonly string[], promote: boolean) {
+    if (agentIds.length === 0 || shutdownInProgress) return;
+    void (async () => {
+      if ((await getSchedulingSuppression()).suppressed) return;
+      if (promote) await promoteDueScheduledRetries();
+      for (const agentId of new Set(agentIds)) await startNextQueuedRunForAgent(agentId);
+    })().catch((err) => {
+      logger.warn({ err }, "failed to start woken resource waits");
+    });
+  }
+
+  // Fork: hook H12 (spec 7.5). Makes the matching device, account and slot
+  // waits due, then promotes and starts them in the background (unless
+  // `start: false`). The hold still re-checks each one before it runs.
+  async function wakeResourceWaitsNow(filter: ResourceWaitWakeFilter, opts: ResourceWaitWakeOptions & { start?: boolean } = {}) {
+    const { start, ...wakeOptions } = opts;
+    const woken = await resourceWaits.wakeResourceWaits(filter, wakeOptions);
+    if (start !== false && woken.runIds.length > 0) startResourceWaitRunsSoon(woken.agentIds, true);
+    return woken;
+  }
+
+  // Fork: hook H12 (spec 7.5). "Check now" on one waiting run (a comment on its
+  // task, or retry-now through W11): a forced check, then the run is promoted
+  // and started when it may proceed. Otherwise `details` is the 409
+  // `resource_still_unavailable` body; `rate_limited` is the 429.
+  async function checkResourceWaitNow(input: { runId: string; companyId?: string; source?: CheckNowSource; now?: Date }) {
+    const now = input.now ?? new Date();
+    const check = await resourceWaits.checkRunNow({ runId: input.runId, companyId: input.companyId, source: input.source ?? "retry_now", now });
+    if (check.outcome !== "proceed") return { ...check, promoted: false };
+    const [row] = await db.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+    if (!row) return { ...check, promoted: false };
+    const promotion = await runDispatch.promoteScheduledRetry({ runId: input.runId, companyId: row.companyId, now });
+    if (promotion.outcome !== "promoted") return { ...check, promoted: false };
+    applyRunDispatchPostCommitEffects(promotion.postCommitEffects);
+    startResourceWaitRunsSoon([row.agentId], false);
+    return { ...check, promoted: true };
   }
 
   async function getIssueRetryRun(
@@ -17089,6 +17015,8 @@ export function heartbeatService(
         ),
       )
       .orderBy(
+        // Fork: the task's own execution run first, so a mentioned agent's wait never shadows the assignee's.
+        sql`(${heartbeatRuns.id} = (select ${issues.executionRunId} from ${issues} where ${issues.id} = ${issueId} and ${issues.companyId} = ${companyId})) desc nulls last`,
         desc(heartbeatRuns.updatedAt),
         desc(heartbeatRuns.createdAt),
         desc(heartbeatRuns.id),
@@ -17097,11 +17025,14 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  function summarizeIssueScheduledRetryRun(row: {
+  async function summarizeIssueScheduledRetryRun(row: {
     run: typeof heartbeatRuns.$inferSelect;
     agentName: string | null;
   }) {
+    // Fork: a device, account or slot wait also says what it waits for and since when.
+    const resourceWait = (await readScheduledRetryResourceWaits(db, [row.run])).get(row.run.id) ?? null;
     return {
+      ...(resourceWait ? { resourceWait } : {}),
       runId: row.run.id,
       status: row.run.status as
         "scheduled_retry" | "queued" | "running" | "cancelled",
@@ -17145,7 +17076,7 @@ export function heartbeatService(
         return {
           outcome: "already_promoted" as const,
           message: "Scheduled retry was already promoted",
-          scheduledRetry: summarizeIssueScheduledRetryRun(alreadyPromoted),
+          scheduledRetry: await summarizeIssueScheduledRetryRun(alreadyPromoted),
         };
       }
       return {
@@ -17153,6 +17084,14 @@ export function heartbeatService(
         message: "No live scheduled retry exists for this issue",
         scheduledRetry: null,
       };
+    }
+
+    // Fork: hook H15 (spec 7.5). "Check now" on a device, account or slot wait checks
+    // the resource first: once a minute (429), and 409 while it is still unavailable.
+    if (isResourceWaitRetryReason(scheduled.run.scheduledRetryReason)) {
+      const check = await resourceWaits.checkRunNow({ runId: scheduled.run.id, companyId: issue.companyId, source: "retry_now", now });
+      if (check.outcome === "rate_limited") throw checkNowRateLimitedError(check.retryAfterMs);
+      if (check.outcome === "still_unavailable") throw resourceStillUnavailableError(check.details);
     }
 
     const contextSnapshot = {
@@ -17215,7 +17154,7 @@ export function heartbeatService(
         return {
           outcome: "already_promoted" as const,
           message: "Scheduled retry was already promoted",
-          scheduledRetry: summarizeIssueScheduledRetryRun(alreadyPromoted),
+          scheduledRetry: await summarizeIssueScheduledRetryRun(alreadyPromoted),
         };
       }
       return {
@@ -17256,8 +17195,8 @@ export function heartbeatService(
       "cancelled",
     ]);
     const scheduledRetry = promotedRow
-      ? summarizeIssueScheduledRetryRun(promotedRow)
-      : summarizeIssueScheduledRetryRun({
+      ? await summarizeIssueScheduledRetryRun(promotedRow)
+      : await summarizeIssueScheduledRetryRun({
           run: updated,
           agentName: scheduled.agentName,
         });
@@ -17372,6 +17311,8 @@ export function heartbeatService(
         // its bounded retries, each hit used to spend three runs of the cap.
         sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'provider_quota'`,
         sql`coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '') <> 'provider_quota'`,
+        // Fork: hook H6 (spec 7.6). A run that only waited for a device, an account or a slot did no work.
+        sql`coalesce(${heartbeatRuns.resultJson} -> 'executionRecovery' ->> 'kind', '') not in ('resource_wait', 'ai_connection_wait')`,
       ];
       if (options.excludeRunId) {
         conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
@@ -21747,7 +21688,10 @@ export function heartbeatService(
         : null;
       const routerHasPersistedInput = Object.keys(parseObject(parseObject(run.runnerProfileJson).nativeExecutionInput)).length > 0;
       const persistedRouterPoolId = routerHasPersistedInput ? readNonEmptyString(parseObject(context.aiRouterSelection).poolId) : null;
-      const requestedAiBinding = persistedRouterPoolId ? { mode: "router" as const, connectionId: persistedRouterPoolId } : agent.runtimeConfig?.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
+      // Fork: hook H1 (spec 4.1). A claude_local agent's pool_account or
+      // device_login binding wins over its upstream AI connection.
+      const accountBinding = await heartbeatAiAccounts.readBinding({ agent, run });
+      const requestedAiBinding = persistedRouterPoolId ? { mode: "router" as const, connectionId: persistedRouterPoolId } : accountBinding.source !== "none" ? undefined : agent.runtimeConfig?.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
       let aiBinding = requestedAiBinding?.mode === "router" ? undefined : requestedAiBinding;
       const originalAiIssueOverrides = issueAssigneeOverrides;
       if (requestedAiBinding?.mode === "router") {
@@ -22087,6 +22031,9 @@ export function heartbeatService(
       } else {
         delete context.paperclipTaskMarkdownAssignmentCompact;
       }
+      // Fork: a PM's summary wake for waiting tasks carries no issue (spec 8); it says what waits.
+      const resourceWaitNotice = issueRef ? "" : resourceWaitPmNoticeMarkdown(context);
+      if (resourceWaitNotice) context.paperclipTaskMarkdown = context.paperclipTaskMarkdownAssignment = resourceWaitNotice;
       if (issueRef) {
         const redactedWakeContext = await createRunSecretRedactionRegistry(
           db,
@@ -22322,6 +22269,30 @@ export function heartbeatService(
             "Pick one of this company's environments for the agent and retry.",
         );
       }
+      // Fork: hook H2 (spec 7.2). A retired device refuses the run; a device the
+      // registry saw unavailable within the last 10 minutes makes it wait.
+      const devicePreflight = await resourceWaits.preflightEnvironment({
+        run,
+        agent,
+        environment: selectedEnvironmentForConfig,
+        skip: Boolean(persistedNativeExecutionInput) || executionForcedToKubernetes || managedSandboxOnly,
+      }).catch((err) => {
+        // A fault in the wait module never fails the run here: the lease decides.
+        logger.warn({ err, runId: run.id }, "resource-wait preflight failed; the lease decides");
+        return { action: "continue" as const, epochs: null };
+      });
+      if (devicePreflight.action === "wait") throw devicePreflight.deferral;
+      if (devicePreflight.action === "refuse") throw refusalAsConfigurationFailure(devicePreflight.refusal);
+      // Fork: hook H4 (spec 7.8). A lease or workspace error that says the device
+      // is unavailable makes the run wait; a refusal blocks it. Persisted native
+      // input never waits.
+      const deviceLeaseContext = { run, agent, environment: selectedEnvironmentForConfig, epochs: devicePreflight.epochs };
+      const deviceLeaseError = async (error: unknown) => persistedNativeExecutionInput ? error : refusalAsConfigurationFailure(
+        (await resourceWaits.toDeferral(error, deviceLeaseContext).catch((classifyError) => {
+          logger.warn({ err: classifyError, runId: deviceLeaseContext.run.id }, "failed to classify an environment error");
+          return null;
+        })) ?? error,
+      );
       const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
         adapterType: agent.adapterType,
         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -22513,15 +22484,21 @@ export function heartbeatService(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
 
-      // Fork: an unbound claude_local run on a host with a Claude account pool
-      // takes its credential from that pool (doc/plans/2026-10-14-host-ai-account-pools.md).
-      const hostPoolHost = !aiBinding && agent.adapterType === "claude_local"
-        ? await aiAccountHostService(db).poolHostForEnvironment(selectedEnvironmentForConfig)
-        : null;
-      const stripAiAuth = Boolean(aiBinding) || Boolean(hostPoolHost);
-      if (!hostPoolHost && !aiBinding && parseObject(context.aiConnection).mode === "host_pool") {
-        // A retry copies its source run's context; drop a host-pool attribution
-        // this run will not use, so a later failure cannot rest that account.
+      // Fork: hook H3 (spec 4.1-4.4). A pool_account binding plans the run's
+      // Claude account, or makes the run wait for it; there is no host-pool
+      // selection and no automatic choice among accounts (P7).
+      await heartbeatAiAccounts.dropStaleAttribution({ run, context, persistedNativeExecutionInput: Boolean(persistedNativeExecutionInput) });
+      const poolPlan: CredentialPlan = accountBinding.source === "pool"
+        ? await heartbeatAiAccounts.planCredential({
+          run, agent, binding: accountBinding, environment: selectedEnvironmentForConfig,
+          epochs: mergeWakeEpochs(accountBinding.epochs, devicePreflight.epochs),
+        }).catch(rethrowRefusalAsConfigurationFailure)
+        : { kind: "none" };
+      const usePool = poolPlan.kind === "use";
+      const stripAiAuth = Boolean(aiBinding) || usePool;
+      if (accountBinding.source === "device_login" && !persistedNativeExecutionInput && context.aiConnection !== undefined) {
+        // Fork: a device-login run keeps no AI attribution copied from the run it
+        // retries, so no failure handler charges an account it never used.
         delete context.aiConnection;
         await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) - 'aiConnection'` }).where(eq(heartbeatRuns.id, run.id));
       }
@@ -22547,62 +22524,19 @@ export function heartbeatService(
           trustPreset,
         });
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
-      if (hostPoolHost) {
-        // A pool credential goes only to Anthropic and only where no project
-        // or argument overrides authentication (same guards as managed bindings).
-        const routedEnv = parseObject(resolvedConfig.env);
-        const routedKey = HOST_POOL_FORBIDDEN_ROUTING_ENV_KEYS.find((key) => {
-          const value = routedEnv[key];
-          return typeof value === "string" ? value.trim().length > 0 : value != null && value !== false;
-        });
-        let incompatible: string | null = routedKey
-          ? `${routedKey} is set for this agent, so the ${hostPoolHost.name} Claude account pool cannot serve it. Remove the provider routing override.`
-          : null;
-        if (!incompatible) {
-          try { await assertManagedAiProjectAuth(resolvedConfig, "anthropic"); }
-          catch { incompatible = `Project or argument authentication conflicts with the ${hostPoolHost.name} Claude account pool.`; }
-        }
-        if (incompatible) {
-          throw new ConfigurationIncompleteFailure(incompatible, {
-            configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime`, fingerprint: `ai-host-incompatible:${agent.id}` },
-          });
-        }
-        let pick: Awaited<ReturnType<ReturnType<typeof aiAccountHostService>["selectForRun"]>>;
-        try {
-          pick = await aiAccountHostService(db).selectForRun({ host: hostPoolHost, runId: run.id, projectId: projectContext?.id ?? null });
-        } catch (error) {
-          if (isAiConnectionPoolExhausted(error) && !persistedNativeExecutionInput) {
-            const authorizedNonAssigneeWake =
-              parseObject(run.runnerProfileJson).aiConnectionNonAssigneeCommentWake === true ||
-              (run.scheduledRetryReason === AI_CONNECTION_BUSY_RETRY_REASON &&
-                isNonAssigneeWorkspaceBusyRetry(run.scheduledRetryReason, parseObject(run.contextSnapshot)));
-            const poolRetryAt = aiConnectionPoolRetryAt(error);
-            await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake, {
-              delayMs: poolRetryAt ? Math.max(0, poolRetryAt.getTime() - Date.now()) : AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS,
-              waitMessage: `Every Claude account on ${hostPoolHost.name} is at its usage limit. This task resumes${poolRetryAt ? ` at ${poolRetryAt.toISOString()}` : " when an account is available"}.`,
-            });
-            return;
-          }
-          throw new ConfigurationIncompleteFailure(error instanceof Error ? error.message : `No Claude account on ${hostPoolHost.name} can serve this run`, {
-            configurationIncomplete: { reason: "ai_connection_unavailable", companyId: agent.companyId, agentId: agent.id, responsibleUserId,
-              provider: "anthropic", actionUrl: "/instance/settings/ai-accounts", fingerprint: `ai-host:${hostPoolHost.id}` },
-          });
-        }
-        const env = { ...parseObject(resolvedConfig.env) };
-        for (const key of HOST_POOL_AUTH_ENV_KEYS) env[key] = "";
-        env[pick.envKey] = pick.value;
-        resolvedConfig.env = env;
-        for (const key of HOST_POOL_AUTH_ENV_KEYS) secretKeys.add(key);
-        // selectForRun already wrote the attribution to the run under the host lock.
-        context.aiConnection = pick.attribution;
-        await appendRunEvent(run, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "info",
-          message: `Using Claude account "${pick.attribution.accountName}" (${pick.attribution.method === "api_key" ? "API key" : "subscription"}) on ${pick.attribution.hostName}${pick.attribution.scope === "project" ? ", reserved for this project" : pick.attribution.scope === "overflow" ? ", borrowed from another project because this project's accounts are unavailable" : ""}`,
-          payload: { accountId: pick.attribution.accountId, hostId: pick.attribution.hostId, method: pick.attribution.method, scope: pick.attribution.scope },
-        });
+      if (poolPlan.kind === "use") {
+        // Fork: the routing guard, then the device slot and the credential (spec 4.3, 4.4).
+        await heartbeatAiAccounts.assertRoutingCompatible({
+          run, agent, config: resolvedConfig,
+          envLayers: [selectedEnvironmentForConfig?.envVars, executionRunConfig.env, projectContext?.env, routineEnvContext.env],
+          targetIsRemote: (selectedEnvironmentForConfig?.driver ?? "local") !== "local",
+        }).catch(rethrowRefusalAsConfigurationFailure);
+        const credential = await heartbeatAiAccounts.acquire({ run, plan: poolPlan }).catch(rethrowRefusalAsConfigurationFailure);
+        await heartbeatAiAccounts.inject({ run, config: resolvedConfig, secretKeys, context, credential });
       }
+      await resourceWaits.noteRunPassed({ run, step: "credentials" }).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to end a resource wait after credentials");
+      });
       if (aiBinding) {
         try {
           managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
@@ -23539,6 +23473,8 @@ export function heartbeatService(
           agentId: agent.id,
           persistedExecutionWorkspace,
           executionWorkspaceSettings: environmentExecutionWorkspaceSettings,
+          // Fork: sent to a driver plugin only when its worker opts in (spec 9.2).
+          projectId: projectContext?.id ?? null,
         });
         await controllerLease.assertOwned();
         nativeRunnerPreparationSpans.push({
@@ -23557,8 +23493,13 @@ export function heartbeatService(
           outcome: "failed",
           attributes: { adapter: agent.adapterType },
         });
-        throw error;
+        // Fork: hook H4.
+        throw await deviceLeaseError(error);
       }
+      // Fork: a lease ends a recorded outage of the device (spec 6.3).
+      await resourceWaits.noteAcquired(acquiredEnvironment.environment.id).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to note an environment lease");
+      });
       const selectedEnvironment = acquiredEnvironment.environment;
       // Defense-in-depth: re-check the actually-acquired environment against the
       // execution allowlist. Even if selection were bypassed, a denied (local/ssh/
@@ -23643,8 +23584,13 @@ export function heartbeatService(
           outcome: "failed",
           attributes: { driver: selectedEnvironment.driver },
         });
-        throw error;
+        // Fork: hook H4. A driver refuses workspaces too (a company stop, Stop now, an account).
+        throw await deviceLeaseError(error);
       }
+      // Fork: the device took the run, so its wait ends here (spec 7.2).
+      await resourceWaits.noteRunPassed({ run, step: "lease" }).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to end a resource wait after the lease");
+      });
       const environmentRealizeEndedAtMs = Date.now();
       activeEnvironmentLease = {
         ...activeEnvironmentLease,
@@ -23689,10 +23635,11 @@ export function heartbeatService(
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
-      } else if (hostPoolHost) {
-        // Fork: the realized workspace (local or remote) must not override the pool credential either.
-        try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, "anthropic", executionTarget); }
-        catch { throw new ConfigurationIncompleteFailure(`Project authentication conflicts with the ${hostPoolHost.name} Claude account pool`, { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
+      } else if (usePool) {
+        // Fork: the realized workspace (scanned on a remote target) must not route the pool credential either.
+        await heartbeatAiAccounts.assertRoutingCompatible({
+          run, agent, config: { ...resolvedConfig, cwd: executionWorkspace.cwd }, target: executionTarget, checkEnv: false,
+        }).catch(rethrowRefusalAsConfigurationFailure);
       }
       const remoteExecution = realizationResult.remoteExecution;
       if (
@@ -26492,6 +26439,9 @@ export function heartbeatService(
                   ? { executionRecovery: adapterResult.executionRecovery }
                   : {}),
                 configFreshness: configFreshnessResultMetadata,
+                // Fork: where a limit or sign-in classification came from (W16), for the account handlers.
+                ...(adapterResult.classificationSource ? { classificationSource: adapterResult.classificationSource } : {}),
+                ...(adapterResult.retryNotBeforeSource ? { retryNotBeforeSource: adapterResult.retryNotBeforeSource } : {}),
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
@@ -26766,6 +26716,14 @@ export function heartbeatService(
             );
           }
           let providerQuotaWaitOwnsRetry = false;
+          // Fork: a pool account's wait owns the task after a limit or a sign-in failure (spec 4.6).
+          let accountWaitOwnsTask = false;
+          const provenance = {
+            errorFamily: adapterResult.errorFamily ?? null,
+            classificationSource: adapterResult.classificationSource ?? null,
+            retryNotBefore: adapterResult.retryNotBefore ?? null,
+            retryNotBeforeSource: adapterResult.retryNotBeforeSource ?? null,
+          };
           if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
@@ -26792,12 +26750,21 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            // Fork: a user-continued legacy turn can renew its authorization
-            // only after this executor releases its controller and lease, so
-            // its company-pool failover runs after cleanup (below).
-            const deferPoolFailover = livenessRun.runtimeMode === "legacy" &&
+            // Fork: hook H9 (spec 4.6). A usage limit on the run's pool account
+            // (or company_pool member) waits for its reset; nothing moves the
+            // task to another account (P7). A user-continued legacy turn renews
+            // its authorization only after this executor releases its controller
+            // and lease, so its wait is scheduled after cleanup (below).
+            const deferAccountWait = livenessRun.runtimeMode === "legacy" &&
               Boolean(livenessRun.contextSnapshot?.explicitUserContinuation);
-            if (deferPoolFailover || !(await scheduleAiConnectionPoolFailover(livenessRun, agent))) {
+            // A failing handler never stops this finalization; the normal retry below takes over (never another account).
+            const limit = deferAccountWait ? null : await heartbeatAiAccounts.handleProviderLimit({ run: livenessRun, agent, provenance }).catch((err) => {
+              logger.error({ err, runId: livenessRun.id }, "failed to handle a pool account limit");
+              return null;
+            });
+            if (limit?.handled) {
+              accountWaitOwnsTask = true;
+            } else {
               const retry = await scheduleBoundedRetryForRun(livenessRun, agent);
               providerQuotaWaitOwnsRetry =
                 retry.outcome === "not_scheduled" &&
@@ -26806,17 +26773,17 @@ export function heartbeatService(
           } else if (
             outcome === "failed" &&
             isAiAuthenticationFailure(livenessRun.errorCode) &&
-            parseObject(parseObject(livenessRun.contextSnapshot).aiConnection).mode === "host_pool" &&
+            ownPoolAttribution(livenessRun) !== null &&
             // A user-continued legacy turn renews its authorization only after
-            // cleanup; that move happens in the post-cleanup block below.
-            !(livenessRun.runtimeMode === "legacy" && Boolean(livenessRun.contextSnapshot?.explicitUserContinuation))
+            // cleanup; its wait is scheduled in the post-cleanup block below.
+            !(livenessRun.runtimeMode === "legacy" && Boolean(livenessRun.contextSnapshot?.explicitUserContinuation)) &&
+            // Fork: hook H10, the two-strike sign-in rule (spec 4.6). Unhandled, or a failing handler, falls through.
+            (await heartbeatAiAccounts.handleRunAuthFailure({ run: livenessRun, agent, provenance }).catch((err) => {
+              logger.error({ err, runId: livenessRun.id }, "failed to handle a pool sign-in failure");
+              return { handled: false };
+            })).handled
           ) {
-            // Fork: a host-pool credential that cannot sign in leaves the pool,
-            // and the task moves to another account of the same host.
-            await scheduleHostPoolFailover(livenessRun, agent, {
-              kind: "auth_failed",
-              message: livenessRun.error ?? "Claude sign-in failed",
-            });
+            accountWaitOwnsTask = true;
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -26825,6 +26792,12 @@ export function heartbeatService(
               livenessRun,
               agent,
             );
+          }
+          // Fork: hook H14 (spec 4.6 "Success"): a pool run the provider served ends its account's limit state.
+          if (outcome === "succeeded" || ((outcome === "failed" || outcome === "timed_out") && !accountWaitOwnsTask)) {
+            await heartbeatAiAccounts.noteAccountRunSucceeded({ run: livenessRun }).catch((err) => {
+              logger.warn({ err, runId: livenessRun.id }, "failed to note how a pool run ended");
+            });
           }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
@@ -26837,6 +26810,7 @@ export function heartbeatService(
             // same exhausted account, resumes a usage-limited issue.
             suppressImmediateRecovery: conversationSettled ||
               providerQuotaWaitOwnsRetry ||
+              accountWaitOwnsTask ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||
@@ -27344,6 +27318,12 @@ export function heartbeatService(
             );
           },
         );
+      } else if (isResourceWaitDeferral(outerErr) && !isPersistedNativeRun(run)) {
+        // Fork: hook H5 (spec 7.3). The device, account or slot is unavailable:
+        // an expected cancellation, and a successor waits for it.
+        await resourceWaits.finalizeDeferral(run, outerErr).catch((deferralErr) => {
+          logger.error({ err: deferralErr, runId }, "failed to finalize resource-wait deferral");
+        });
       } else {
         // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
         // The inner catch did not fire, so we must record the failure here.
@@ -27759,23 +27739,19 @@ export function heartbeatService(
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && latestRun.status === "failed" &&
           latestRun.contextSnapshot?.explicitUserContinuation) {
-        // Fork: the company-pool failover deferred at finalization. It takes
-        // precedence over a transient retry on the same limited account; a
-        // refusal leaves the provider-quota wait in charge. Newer input that
-        // waits on the task claim refuses it, so the settlement below promotes
-        // that input onto the next account.
-        const failoverRun = await getRun(latestRun.id, { unsafeFullResultJson: true }).catch(() => null);
-        const failoverAgent = failoverRun ? await getAgent(failoverRun.agentId).catch(() => null) : null;
-        if (failoverRun && failoverAgent) await scheduleAiConnectionPoolFailover(failoverRun, failoverAgent).catch(err => {
-          logger.error({ err, runId: run.id }, "failed to fail over an explicit continuation after cleanup");
+        // Fork: the account wait deferred at finalization (spec 4.6). The turn
+        // waits for its own account's reset or sign-in, never another account
+        // (P7); a refusal leaves the provider-quota wait in charge. Newer input
+        // that waits on the task claim refuses it, so the settlement below
+        // promotes that input instead.
+        const continuedRun = await getRun(latestRun.id, { unsafeFullResultJson: true }).catch(() => null);
+        const continuedAgent = continuedRun ? await getAgent(continuedRun.agentId).catch(() => null) : null;
+        if (continuedRun && continuedAgent) await heartbeatAiAccounts.handleProviderLimit({ run: continuedRun, agent: continuedAgent }).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to schedule the account wait of an explicit continuation after cleanup");
         });
-        if (failoverRun && failoverAgent && isAiAuthenticationFailure(failoverRun.errorCode) &&
-            parseObject(parseObject(failoverRun.contextSnapshot).aiConnection).mode === "host_pool") {
-          await scheduleHostPoolFailover(failoverRun, failoverAgent, {
-            kind: "auth_failed",
-            message: failoverRun.error ?? "Claude sign-in failed",
-          }).catch(err => {
-            logger.error({ err, runId: run.id }, "failed to move an explicit continuation to another host-pool account after cleanup");
+        if (continuedRun && continuedAgent && isAiAuthenticationFailure(continuedRun.errorCode) && ownPoolAttribution(continuedRun)) {
+          await heartbeatAiAccounts.handleRunAuthFailure({ run: continuedRun, agent: continuedAgent }).catch(err => {
+            logger.error({ err, runId: run.id }, "failed to schedule the sign-in wait of an explicit continuation after cleanup");
           });
         }
       }
@@ -29326,6 +29302,8 @@ export function heartbeatService(
                 .update(issues)
                 .set({
                   status: "blocked",
+                  // Fork: record the transition as issueService.update does, so a waiting run on this task ends.
+                  ...(issue.status !== "blocked" ? { blockedTransitionAt: now, blockedOwnerNotifiedAt: null } : {}),
                   checkoutRunId: null,
                   executionRunId: null,
                   executionAgentNameKey: null,
@@ -31385,11 +31363,22 @@ export function heartbeatService(
       return scheduleBoundedRetryForRun(run, agent, opts);
     },
 
-    scheduleAiConnectionPoolFailover: async (runId: string) => {
+    // Fork: hook H9 for a finished run (spec 4.6). A usage limit on the run's
+    // pool account or company_pool member waits for its reset; nothing ever
+    // moves the task to another account (P7).
+    handleProviderLimit: async (runId: string) => {
       const run = await getRun(runId, { unsafeFullResultJson: true });
       const agent = run ? await getAgent(run.agentId) : null;
-      return run && agent ? scheduleAiConnectionPoolFailover(run, agent) : false;
+      return run && agent
+        ? heartbeatAiAccounts.handleProviderLimit({ run, agent })
+        : { handled: false, reason: "run_not_found", via: null };
     },
+
+    // Fork: hook H12 (spec 7.4, 7.5): resource waits for the scheduler, routes and plugin hosts.
+    resourceWaits,
+    sweepResourceWaits: (input?: { now?: Date; force?: boolean }) => resourceWaits.sweepResourceWaits(input),
+    wakeResourceWaitsNow,
+    checkResourceWaitNow,
 
     reconcileStrandedAssignedIssues,
     recoverPendingSessionGoalActions,

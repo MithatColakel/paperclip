@@ -1005,10 +1005,14 @@ type PreviewAgent = Pick<typeof agents.$inferSelect, "id" | "companyId" | "name"
 
 const PREVIEW_SEVERITY: Record<CredentialPlanPreview["outcome"], number> = { use: 0, none: 1, wait: 2, refuse: 3 };
 
-/** Go/no-go wording for an agent that would get no pool account (shown as is by the instance page). */
+/**
+ * Go/no-go wording for why an agent's runs would get no pool account (plan
+ * `none`, which the instance page reads as "would use its device's own
+ * login"); shown as is.
+ */
 const NO_POOL_ACCOUNT_TEXT: Record<Extract<CredentialPlanPreview, { outcome: "none" }>["reason"], string> = {
-  unbound: "no Claude account is assigned, so its runs would use the device's own login",
-  device_login: "it is set to use the device's own login",
+  unbound: "no Claude account is assigned",
+  device_login: "set explicitly in its Claude account selection",
   adapter_unsupported: "it is not a Claude agent",
 };
 
@@ -1081,11 +1085,12 @@ export async function previewPlan(
 
 /**
  * Go/no-go (spec 15.3): every non-terminated Claude agent with a host-pool run
- * in the last 7 days, with its preview. `go` only when each one would use its
- * account. An agent that would get no pool account at all is listed as
- * `refuse` with the reason in words. An agent without a binding row that now
- * has its own AI connection (`runtimeConfig.aiConnection`) is left out: its
- * runs use that connection, never the device's own login.
+ * in the last 7 days, with its preview and its company. `go` only when each
+ * one would use its account. An agent that would get no pool account at all
+ * is listed as `none` (its runs would use the device's own login) with the
+ * reason in words. An agent without a binding row that now has its own AI
+ * connection (`runtimeConfig.aiConnection`) is left out: its runs use that
+ * connection, never the device's own login.
  */
 export async function aiAccountMigrationGoNoGo(
   db: Db,
@@ -1097,6 +1102,7 @@ export async function aiAccountMigrationGoNoGo(
     .select({
       id: agents.id,
       companyId: agents.companyId,
+      companyName: companies.name,
       name: agents.name,
       adapterType: agents.adapterType,
       defaultEnvironmentId: agents.defaultEnvironmentId,
@@ -1104,6 +1110,7 @@ export async function aiAccountMigrationGoNoGo(
       bindingAgentId: aiAccountAgentBindings.agentId,
     })
     .from(agents)
+    .innerJoin(companies, eq(companies.id, agents.companyId))
     .leftJoin(aiAccountAgentBindings, eq(aiAccountAgentBindings.agentId, agents.id))
     .where(and(
       eq(agents.adapterType, POOL_ACCOUNT_ADAPTER_TYPE),
@@ -1117,17 +1124,24 @@ export async function aiAccountMigrationGoNoGo(
       )`,
     ))
     .orderBy(asc(agents.companyId), asc(agents.createdAt), asc(agents.id));
-  const recent: PreviewAgent[] = rows
-    .filter((row) => row.bindingAgentId !== null || !hasAiConnection({ aiConnection: asRecord(row.runtimeConfig).aiConnection }))
-    .map(({ runtimeConfig: _runtimeConfig, bindingAgentId: _bindingAgentId, ...agent }) => agent);
-  const previews = await previewPlans(db, recent, { ...opts, now });
+  const recent = rows.filter((row) => row.bindingAgentId !== null || !hasAiConnection({ aiConnection: asRecord(row.runtimeConfig).aiConnection }));
+  const previews = await previewPlans(
+    db,
+    recent.map(({ runtimeConfig: _runtimeConfig, bindingAgentId: _bindingAgentId, companyName: _companyName, ...agent }): PreviewAgent => agent),
+    { ...opts, now },
+  );
   const entries = recent.map((agent): AiAccountMigrationGoNoGoEntry => {
     const preview = previews.get(agent.id)!;
-    if (preview.outcome === "none") {
-      const reason = preview.reason as keyof typeof NO_POOL_ACCOUNT_TEXT;
-      return { agentId: agent.id, agentName: agent.name, companyId: agent.companyId, plan: "refuse", reason: NO_POOL_ACCOUNT_TEXT[reason] ?? preview.reason };
-    }
-    return { agentId: agent.id, agentName: agent.name, companyId: agent.companyId, plan: preview.outcome, reason: preview.reason };
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      companyId: agent.companyId,
+      companyName: agent.companyName,
+      plan: preview.outcome,
+      reason: preview.outcome === "none"
+        ? NO_POOL_ACCOUNT_TEXT[preview.reason as keyof typeof NO_POOL_ACCOUNT_TEXT] ?? preview.reason
+        : preview.reason,
+    };
   });
   return { go: entries.every((entry) => entry.plan === "use"), agents: entries };
 }

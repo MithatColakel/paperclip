@@ -5,6 +5,7 @@ import {
   extractWakeCommentIds,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  RESOURCE_WAIT_RESOLVED_INTERACTION_KEY,
   WORKSPACE_BUSY_RETRY_REASON,
 } from "./wake-context.js";
 
@@ -105,4 +106,29 @@ it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("treats a %
   // Another lane's receipt does not count.
   expect(isNonAssigneeWorkspaceBusyRetry(lane, { workspaceBusyDeferredWhileAssignee: false })).toBe(false);
   expect(isNonAssigneeWorkspaceBusyRetry("transient_failure", { resourceWaitDeferredWhileAssignee: false })).toBe(false);
+});
+
+// Fork: a resolved interaction continuation waiting in a resource-wait lane (spec 7.6).
+it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("keeps a resolved continuation that waits in %s one", (lane) => {
+  const waiting = {
+    interactionId: "interaction-1",
+    interactionStatus: "accepted",
+    mutation: "interaction",
+    wakeReason: `${lane}_retry`,
+    retryReason: lane,
+  };
+  expect(isResolvedInteractionContinuationWakeContext(waiting)).toBe(false);
+  expect(isResolvedInteractionContinuationWakeContext({ ...waiting, [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: true })).toBe(true);
+  // A comment that joined the waiting run keeps it one.
+  expect(isResolvedInteractionContinuationWakeContext({
+    ...waiting,
+    [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: true,
+    wakeReason: "issue_commented",
+    mutation: "comment",
+  })).toBe(true);
+  // The flag needs a lane, the interaction and its resolution.
+  expect(isResolvedInteractionContinuationWakeContext({ ...waiting, [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: true, retryReason: "transient_failure" })).toBe(false);
+  expect(isResolvedInteractionContinuationWakeContext({ ...waiting, [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: true, interactionStatus: "pending" })).toBe(false);
+  expect(isResolvedInteractionContinuationWakeContext({ ...waiting, [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: true, interactionId: undefined })).toBe(false);
+  expect(isResolvedInteractionContinuationWakeContext({ ...waiting, [RESOURCE_WAIT_RESOLVED_INTERACTION_KEY]: "true" })).toBe(false);
 });

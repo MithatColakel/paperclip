@@ -936,6 +936,7 @@ function RemoveAccountForm({ account, onDone }: { account: InstanceAiAccountSumm
 const GO_NO_GO_PLAN_TEXT: Record<AiAccountMigrationGoNoGoEntry["plan"], string> = {
   use: "would use its account",
   wait: "would wait",
+  none: "would use its device's own login",
   refuse: "would be refused",
 };
 
@@ -1023,7 +1024,7 @@ function MigrationReport({ report }: { report: AiAccountMigrationReport }) {
               <li key={entry.agentId}>
                 <span className="font-medium">{entry.agentName}</span>
                 <span className="text-muted-foreground">
-                  {" "}({companyNames.get(entry.companyId) ?? "another company"}) {GO_NO_GO_PLAN_TEXT[entry.plan]}
+                  {" "}({entry.companyName || companyNames.get(entry.companyId) || "another company"}) {GO_NO_GO_PLAN_TEXT[entry.plan]}
                   {planReasonText(entry.reason) ? `: ${planReasonText(entry.reason)}` : ""}
                 </span>
               </li>
