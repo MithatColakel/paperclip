@@ -164,7 +164,7 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
   const projectId = randomUUID();
   const host = {
     runner: randomUUID(),
-    mac: randomUUID(),
+    computer: randomUUID(),
     split: randomUUID(),
     twinA: randomUUID(),
     twinB: randomUUID(),
@@ -235,7 +235,7 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
 
     await db.execute(sql`INSERT INTO ai_account_hosts (id, name, kind) VALUES
       (${host.runner}, 'Runner', 'ssh_host'),
-      (${host.mac}, 'Mini', 'mac'),
+      (${host.computer}, 'Tower', 'mac'),
       (${host.split}, 'Split runner', 'ssh_host'),
       (${host.twinA}, 'Twin A', 'ssh_host'),
       (${host.twinB}, 'Twin B', 'mac'),
@@ -246,8 +246,8 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
       [await ssh("runner one", { host: "Runner.Example.COM", port: 22 }), host.runner],
       [await ssh("runner two", { host: " runner.example.com " }), host.runner],
       // A port stored as a string; the sandbox mapping does not count.
-      [await ssh("mini over ssh", { host: "mini.example.com", port: "2222" }), host.mac],
-      [sandboxEnvironmentId, host.mac],
+      [await ssh("tower over ssh", { host: "tower.example.com", port: "2222" }), host.computer],
+      [sandboxEnvironmentId, host.computer],
       // Two different ports on one device: ambiguous, skipped.
       [await ssh("split one", { host: "alpha.example.com", port: 22 }), host.split],
       [await ssh("split two", { host: "alpha.example.com", port: 2200 }), host.split],
@@ -263,7 +263,7 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     // Accounts as the old image inserts them.
     await db.insert(oldImageAiAccounts).values([
       { id: account.owned, hostId: host.runner, credentialType: "subscription", label: "Max 1", emailHint: "Shared@Example.com", credentialMaterial: material(1), credentialFingerprint: "fp-1", createdByUserId: "user-a" },
-      { id: account.unowned, hostId: host.mac, credentialType: "api_key", label: "Key", credentialMaterial: material(2), credentialFingerprint: "fp-2" },
+      { id: account.unowned, hostId: host.computer, credentialType: "api_key", label: "Key", credentialMaterial: material(2), credentialFingerprint: "fp-2" },
       { id: account.outOfPool, hostId: host.runner, credentialType: "subscription", label: "Not in pool", poolEnabled: false, credentialMaterial: material(3), credentialFingerprint: "fp-3", createdByUserId: "user-b" },
       { id: account.signedOutOutOfPool, hostId: host.server, credentialType: "subscription", label: "Signed out", poolEnabled: false, status: "auth_failed", credentialMaterial: material(4), credentialFingerprint: "fp-4", createdByUserId: "user-b" },
     ]);
@@ -323,7 +323,7 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
       .from(aiAccountHosts);
     expect(Object.fromEntries(rows.map((row) => [row.id, row.externalKey]))).toEqual({
       [host.runner]: "ssh:runner.example.com:22",
-      [host.mac]: "ssh:mini.example.com:2222",
+      [host.computer]: "ssh:tower.example.com:2222",
       [host.split]: null,
       [host.twinA]: null,
       [host.twinB]: null,
@@ -343,17 +343,17 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     const configs: Array<Record<string, unknown>> = [
       { host: "Runner.Example.COM", port: 22 },
       { host: " runner.example.com " },
-      { host: "mini.example.com", port: "0022" },
-      { host: "mini.example.com", port: " 2222 " },
-      { host: "mini.example.com", port: "" },
-      { host: "mini.example.com", port: null },
+      { host: "tower.example.com", port: "0022" },
+      { host: "tower.example.com", port: " 2222 " },
+      { host: "tower.example.com", port: "" },
+      { host: "tower.example.com", port: null },
       { host: "\tTabbed.Example", port: 2200 },
       { host: "   " },
       { port: 22 },
-      { host: "mini.example.com", port: "22a" },
-      { host: "mini.example.com", port: 22.5 },
-      { host: "mini.example.com", port: 123456 },
-      { host: "mini.example.com", port: true },
+      { host: "tower.example.com", port: "22a" },
+      { host: "tower.example.com", port: 22.5 },
+      { host: "tower.example.com", port: 123456 },
+      { host: "tower.example.com", port: true },
     ];
     const rows = await db.execute(sql`SELECT e.ord::int AS ord, ${sql.raw(keyExpression!)} AS key
       FROM jsonb_array_elements(${JSON.stringify(configs)}::jsonb) WITH ORDINALITY AS e("config", ord)
@@ -363,10 +363,10 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     expect(keys.slice(0, 7)).toEqual([
       "ssh:runner.example.com:22",
       "ssh:runner.example.com:22",
-      "ssh:mini.example.com:22",
-      "ssh:mini.example.com:2222",
-      "ssh:mini.example.com:22",
-      "ssh:mini.example.com:22",
+      "ssh:tower.example.com:22",
+      "ssh:tower.example.com:2222",
+      "ssh:tower.example.com:22",
+      "ssh:tower.example.com:22",
       "ssh:\ttabbed.example:2200",
     ]);
     expect(dataSql).toContain(`SET "external_key" = '${LOCAL_EXECUTION_DEVICE_KEY}'`);

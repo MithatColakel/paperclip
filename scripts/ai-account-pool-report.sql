@@ -17,17 +17,26 @@
 -- company, so section 8 can be ignored for its accounts.
 --
 -- Two checks are not SQL:
--- - The binding backfill dry run (spec 15.3). Restore the latest snapshot
---   into a scratch database and start the new image against it: its
---   migrations and the boot job run. Then read "Devices & Claude accounts"
---   on the instance settings page, or GET /api/instance/ai-accounts/migration,
---   for the proposed bindings, the skips, the agents left unbound with a
---   review note, the over-cap devices, and the go/no-go. Section 10 lists
---   the agents the go/no-go covers: each must plan to use its account.
+-- - The binding backfill dry run (spec 15.3): the rehearsal script. Restore
+--   the latest dump into a throwaway database whose name contains
+--   "rehearsal" or "snapshot", then run, from /app in the new image:
+--
+--     PAPERCLIP_REHEARSAL_DATABASE_URL=postgres://<user>:<password>@<host>:<port>/<name> PAPERCLIP_DEPLOYMENT_MODE=<production's mode> node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/scripts/ai-account-pool-rehearsal.js --snapshot > ai-account-pool-rehearsal.json
+--
+--   It applies the migrations and the binding backfill to that copy only,
+--   never reads DATABASE_URL, and starts no scheduler, heartbeat, plugin
+--   worker or HTTP server. It prints the migration report: the proposed
+--   bindings, the skips, the agents left unassigned or unbound with a
+--   review note, the over-cap devices, and the go/no-go (exit code 0 go,
+--   2 no-go, 1 error or refusal). Section 10 lists the agents the go/no-go
+--   covers: each must plan to use its account, or only wait for its own
+--   account's limit. The Upgrade Guide in
+--   releases/fork-claude-account-pool.md has the full procedure.
 -- - Plugin devices. An environment driver plugin keeps its own device owners
 --   and project ticks, and reports them itself. Section 9 lists what the core
---   sees: sandbox environments, the agents pinned to them, and the projects
---   their runs worked on in the last 14 days, to compare with those ticks.
+--   sees: sandbox environments, the agents pinned to them, the projects that
+--   use them as their default, and the projects their runs worked on in the
+--   last 14 days, to compare with those ticks.
 
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 
@@ -294,8 +303,13 @@ WHERE r.created_at >= now() - interval '45 days'
   )
 ORDER BY company, account;
 
--- 9. Sandbox environments (plugin devices): the agents pinned to them and the
--- projects their runs worked on in the last 14 days.
+-- 9. Sandbox environments (plugin devices): the agents pinned to them, the
+-- projects that use them as their default, and the projects their runs worked
+-- on in the last 14 days. The backfill runs at boot, before any plugin reports
+-- its devices, so an unpinned Claude agent with host-pool history in a company
+-- that has such a project default is left unassigned ("cannot tell which
+-- device the environment runs on") until the plugin reports; re-run the
+-- backfill after that report.
 SELECT
   '9 sandbox environments' AS section,
   e.config ->> 'provider' AS provider,
@@ -307,6 +321,12 @@ SELECT
     JOIN companies pc ON pc.id = pa.company_id
     WHERE pa.default_environment_id = e.id AND pa.status <> 'terminated'
   ) AS pinned_agents,
+  (
+    SELECT string_agg(dp.name || ' (' || dc.name || ')', ', ' ORDER BY dc.name, dp.name)
+    FROM projects dp
+    JOIN companies dc ON dc.id = dp.company_id
+    WHERE dp.default_environment_id = e.id AND dp.archived_at IS NULL
+  ) AS project_defaults,
   (
     SELECT string_agg(DISTINCT p.name || ' (' || rc.name || ')', ', ')
     FROM environment_leases l
@@ -323,7 +343,9 @@ ORDER BY provider, e.name;
 
 -- 10. The go/no-go population: Claude agents with a host-pool run in the
 -- last 7 days. After the backfill, every one of them must plan to use its
--- account (GET /api/instance/ai-accounts/migration lists their plans).
+-- account, or only wait for its own account's limit. Before the deploy, the
+-- rehearsal script (see the header) prints their plans for a restored copy;
+-- after it, GET /api/instance/ai-accounts/migration lists them.
 SELECT
   '10 go/no-go agents (7 days)' AS section,
   c.name AS company,

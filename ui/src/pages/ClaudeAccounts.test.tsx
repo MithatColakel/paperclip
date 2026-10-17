@@ -52,11 +52,11 @@ vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBrea
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
     companies: [
-      { id: "company-a", name: "Cleanio", issuePrefix: "CLE" },
-      { id: "company-b", name: "Presto", issuePrefix: "PRE" },
+      { id: "company-a", name: "Acme", issuePrefix: "ACM" },
+      { id: "company-b", name: "Globex", issuePrefix: "GLO" },
     ],
     selectedCompanyId: "company-a",
-    selectedCompany: { id: "company-a", name: "Cleanio", issuePrefix: "CLE" },
+    selectedCompany: { id: "company-a", name: "Acme", issuePrefix: "ACM" },
   }),
 }));
 
@@ -67,7 +67,7 @@ const API_KEY = `sk-ant-api03-${"k".repeat(90)}`;
 const FUTURE = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
 const EMPTY_WINDOW: AiAccountUsageWindow = { runs: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costCents: 0 };
 const NO_USAGE = { lastFiveHours: EMPTY_WINDOW, lastSevenDays: EMPTY_WINDOW, thisMonth: EMPTY_WINDOW };
-const MOBILE: AiAccountProjectSummary = { id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Cleanio", issuePrefix: "CLE" };
+const MOBILE: AiAccountProjectSummary = { id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Acme", issuePrefix: "ACM" };
 const SERVER: ExecutionDeviceRef = { id: "device-server", name: "Paperclip server", kind: "server", owner: null };
 const BUILD_BOX: ExecutionDeviceRef = {
   id: "device-build",
@@ -96,6 +96,7 @@ function myAccount(overrides: Partial<MyAiAccount>): MyAiAccount {
     limitSource: null,
     lastLimitedAt: null,
     reservedProjects: [],
+    otherReservedProjects: 0,
     usedBy: [],
     otherCompanies: 0,
     usage: NO_USAGE,
@@ -112,7 +113,8 @@ const TEAM_MAX = myAccount({
   plan: "Max 20x",
   credentialHint: "…a1b2",
   reservedProjects: [MOBILE],
-  usedBy: [{ companyId: "company-a", companyName: "Cleanio", agents: [{ agentId: "agent-dev", agentName: "Dev", devices: [SERVER] }] }],
+  otherReservedProjects: 1,
+  usedBy: [{ companyId: "company-a", companyName: "Acme", agents: [{ agentId: "agent-dev", agentName: "Dev", devices: [SERVER] }] }],
   otherCompanies: 2,
   usage: { ...NO_USAGE, lastFiveHours: { ...EMPTY_WINDOW, runs: 3, inputTokens: 12_300_000, outputTokens: 840_000 } },
 });
@@ -261,7 +263,7 @@ async function renderPage() {
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/CLE/company/settings/claude-accounts"]}>
+        <MemoryRouter initialEntries={["/ACM/company/settings/claude-accounts"]}>
           <ClaudeAccounts />
         </MemoryRouter>
       </QueryClientProvider>,
@@ -381,7 +383,7 @@ async function renderLoaded() {
   await eventually(() => {
     expect(row(region("My Claude accounts"), "Team Max")).toBeTruthy();
     expect(row(region("Agent assignments"), "Dev")).toBeTruthy();
-    expect(row(region("Available in Cleanio"), "Ada Max")).toBeTruthy();
+    expect(row(region("Available in Acme"), "Ada Max")).toBeTruthy();
   });
 }
 
@@ -400,11 +402,13 @@ describe("ClaudeAccounts: my accounts", () => {
     expect(max.textContent).toContain("mi•••@example.com · Max 20x");
     expect(max.textContent).not.toContain("mithat@example.com");
     expect(max.textContent).toContain("…a1b2");
-    expect(max.querySelector('[data-testid="account-used-by"]')?.textContent).toContain("Cleanio: Dev (Paperclip server)");
+    expect(max.querySelector('[data-testid="account-used-by"]')?.textContent).toContain("Acme: Dev (Paperclip server)");
     expect(max.textContent).toContain("Agents in 2 other companies");
     expect(max.querySelector('[data-testid="account-usage"]')?.textContent).toContain("Last 5 h: 3 runs · 12.3M in · 840.0k out");
     const restriction = max.querySelector<HTMLElement>('[data-testid="account-restriction"]')!;
-    expect(restriction.textContent).toContain("CLE · Mobile app");
+    expect(restriction.textContent).toContain("ACM · Mobile app");
+    // A reserved project of a company the caller is not in comes as a count only.
+    expect(restriction.textContent).toContain("+1 project in another company");
     expect(buttonIn(restriction, "Clear")).toBeDefined();
 
     const night = row(mine, "Night Pro");
@@ -427,6 +431,18 @@ describe("ClaudeAccounts: my accounts", () => {
     expect(spare.textContent).toContain("Paused by owner");
     expect(buttonIn(spare, "Resume")).toBeDefined();
     expect(buttonIn(spare, "Pause")).toBeUndefined();
+  });
+
+  it("keeps the reservation and its Clear action for an account reserved only in other companies", async () => {
+    const elsewhere = myAccount({ id: "acc-elsewhere", label: "Elsewhere", otherReservedProjects: 2 });
+    mocks.api.listMine.mockResolvedValue({ accounts: [elsewhere] });
+    mocks.api.update.mockResolvedValue(elsewhere);
+    await renderPage();
+    await eventually(() => expect(row(region("My Claude accounts"), "Elsewhere")).toBeTruthy());
+    const restriction = row(region("My Claude accounts"), "Elsewhere").querySelector<HTMLElement>('[data-testid="account-restriction"]');
+    expect(restriction?.textContent).toContain("+2 projects in other companies");
+    await click(buttonIn(restriction!, "Clear"));
+    await eventually(() => expect(mocks.api.update).toHaveBeenCalledWith("acc-elsewhere", { clearProjectRestriction: true }));
   });
 
   it("does not poll my accounts, which sum usage, while the company lists stay current", async () => {
@@ -513,7 +529,7 @@ describe("ClaudeAccounts: my accounts", () => {
     await click(buttonIn(row(mine, "Team Max"), "Remove"));
     await eventually(() => expect(alertDialog()?.textContent).toContain("Remove Team Max?"));
     const bindings = alertDialog()!.querySelector('[data-testid="remove-account-bindings"]')!;
-    expect(bindings.textContent).toContain("Cleanio: Dev");
+    expect(bindings.textContent).toContain("Acme: Dev");
     expect(bindings.textContent).toContain("Agents in 2 other companies");
     await click(buttonIn(alertDialog()!, "Remove and release agents"));
     await eventually(() => expect(mocks.api.remove).toHaveBeenCalledWith("acc-max", { release: true }));
@@ -525,7 +541,7 @@ describe("ClaudeAccounts: my accounts", () => {
       code: "ai_account_in_use",
       details: {
         code: "ai_account_in_use",
-        bindings: [{ agentId: "agent-night", agentName: "Night shift", companyId: "company-b", companyName: "Presto" }],
+        bindings: [{ agentId: "agent-night", agentName: "Night shift", companyId: "company-b", companyName: "Globex" }],
         otherCompanies: 0,
       },
     }));
@@ -534,7 +550,7 @@ describe("ClaudeAccounts: my accounts", () => {
     await eventually(() => expect(alertDialog()?.textContent).toContain("No agent uses it."));
     await click(buttonIn(alertDialog()!, "Remove account"));
     await eventually(() => expect(mocks.api.remove).toHaveBeenCalledWith("acc-spare", { release: false }));
-    await eventually(() => expect(alertDialog()?.textContent).toContain("Presto: Night shift"));
+    await eventually(() => expect(alertDialog()?.textContent).toContain("Globex: Night shift"));
     await click(buttonIn(alertDialog()!, "Remove and release agents"));
     await eventually(() => expect(mocks.api.remove).toHaveBeenCalledWith("acc-spare", { release: true }));
     await eventually(() => expect(alertDialog()).toBeNull());
@@ -654,7 +670,7 @@ describe("ClaudeAccounts: add dialog", () => {
 
     const connections = add.querySelector('[role="radiogroup"][aria-label="Your Claude connections"]')!;
     expect(connections.textContent).toContain("My Claude Max");
-    expect(connections.textContent).toContain("Cleanio · Claude Max");
+    expect(connections.textContent).toContain("Acme · Claude Max");
     expect(connections.textContent).not.toContain("Team shared");
     expect(connections.textContent).not.toContain("Ada's Max");
     expect(connections.textContent).not.toContain("My key");
@@ -675,7 +691,7 @@ describe("ClaudeAccounts: add dialog", () => {
 describe("ClaudeAccounts: available accounts and agent assignments", () => {
   it("lists the accounts available in the company with owner, agents and devices", async () => {
     await renderLoaded();
-    const available = region("Available in Cleanio");
+    const available = region("Available in Acme");
     expect(row(available, "Team Max").textContent).toContain("Yours · Max 20x");
     const ada = row(available, "Ada Max");
     expect(ada.textContent).toContain("Owner Ada");

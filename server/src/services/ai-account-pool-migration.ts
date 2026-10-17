@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNull, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import {
   type Db,
   agents,
@@ -21,6 +21,7 @@ import {
   AI_ACCOUNT_MIGRATION_OUTCOMES,
   AI_ACCOUNT_MIGRATION_RULES,
   DEFERRED_DATA_MIGRATION_STATUSES,
+  isGoNoGoBlocker,
   type AiAccountBindingSource,
   type AiAccountMigrationAgentEntry,
   type AiAccountMigrationDeviceEntry,
@@ -88,7 +89,12 @@ import { wakeResourceWaits } from "./resource-waits/wake.js";
  *   or its pinned company pool, and the report says why.
  *
  * Only agents without a binding row are candidates, so a re-run adds only the
- * bindings an earlier run could not make. A failure marks the job `failed` and
+ * bindings an earlier run could not make. A re-run also evaluates again an
+ * agent whose row an earlier run left without an account, while nobody has
+ * changed or reviewed that row: it gives the row the account when the checks
+ * pass now (for example once a plugin has reported the device of a sandbox
+ * environment that had none at boot), and otherwise leaves it as it is.
+ * A failure marks the job `failed` and
  * never throws, so boot always continues. Nothing here rewrites
  * `runtime_config`, reservations or the company pool tables, and nothing is
  * decrypted: the company pool match compares hashes. Paperclip never moves a
@@ -160,6 +166,8 @@ interface UnboundAgent {
   defaultEnvironmentId: string | null;
   /** `runtimeConfig.aiConnection`, as stored. */
   aiConnection: unknown;
+  /** The agent has a row an earlier run left without an account, untouched since (`retriableMigratedRow`). */
+  retry: boolean;
 }
 
 interface HistoryRow {
@@ -198,6 +206,8 @@ interface InsertedBinding {
   source: AiAccountBindingSource;
   rule: AiAccountMigrationRule | null;
   note: string;
+  /** `pool_account` when a re-run gave an account to a row an earlier run left without one. */
+  previousMode: "pool_account" | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +393,27 @@ function poolProblemNote(problem: PoolMatchProblem): string {
 // Inputs
 // ---------------------------------------------------------------------------
 
-/** Non-terminated Claude agents without a binding row, in processing order. */
+/**
+ * Fork: a row this job wrote without an account (`unassigned`) that nobody
+ * has touched since: a manual change sets `source = 'manual'` or deletes the
+ * row, and a review sets `reviewed_at`. A re-run evaluates such an agent
+ * again and gives it an account when one passes now, for example once a
+ * plugin has reported the device of a sandbox environment.
+ */
+function retriableMigratedRow(): SQL {
+  return and(
+    eq(aiAccountAgentBindings.mode, "pool_account"),
+    isNull(aiAccountAgentBindings.accountId),
+    eq(aiAccountAgentBindings.source, "migrated_host_pool"),
+    isNull(aiAccountAgentBindings.reviewedAt),
+  )!;
+}
+
+/**
+ * Non-terminated Claude agents without a binding row, and those whose row an
+ * earlier run left without an account (`retriableMigratedRow`), in
+ * processing order.
+ */
 async function unboundClaudeAgents(tx: Tx): Promise<UnboundAgent[]> {
   const rows = await tx
     .select({
@@ -394,6 +424,7 @@ async function unboundClaudeAgents(tx: Tx): Promise<UnboundAgent[]> {
       createdAt: agents.createdAt,
       defaultEnvironmentId: agents.defaultEnvironmentId,
       runtimeConfig: agents.runtimeConfig,
+      bindingAgentId: aiAccountAgentBindings.agentId,
     })
     .from(agents)
     .innerJoin(companies, eq(companies.id, agents.companyId))
@@ -401,10 +432,17 @@ async function unboundClaudeAgents(tx: Tx): Promise<UnboundAgent[]> {
     .where(and(
       eq(agents.adapterType, POOL_ACCOUNT_ADAPTER_TYPE),
       ne(agents.status, "terminated"),
-      isNull(aiAccountAgentBindings.agentId),
+      or(
+        isNull(aiAccountAgentBindings.agentId),
+        and(eq(aiAccountAgentBindings.companyId, agents.companyId), retriableMigratedRow()),
+      ),
     ))
     .orderBy(asc(agents.companyId), asc(agents.createdAt), asc(agents.id));
-  return rows.map(({ runtimeConfig, ...row }) => ({ ...row, aiConnection: asRecord(runtimeConfig).aiConnection }));
+  return rows.map(({ runtimeConfig, bindingAgentId, ...row }) => ({
+    ...row,
+    aiConnection: asRecord(runtimeConfig).aiConnection,
+    retry: bindingAgentId !== null,
+  }));
 }
 
 /** Host-pool history (spec 15.3): runs of the window with attribution scope `project` or `shared`; overflow is ignored. */
@@ -841,8 +879,12 @@ async function backfillBindings(
     }
 
     const accountId = decision.outcome === "bound" ? decision.choice.account.id : null;
+    // Fork: a re-run only gives an account to a row an earlier run left
+    // without one. Otherwise it leaves that row, and its earlier entry in the
+    // summary, as they are.
+    if (agent.retry && decision.outcome !== "bound") continue;
     if (decision.outcome !== "unbound") {
-      const rows = await tx
+      const insert = tx
         .insert(aiAccountAgentBindings)
         .values({
           agentId: agent.id,
@@ -855,10 +897,19 @@ async function backfillBindings(
           updatedByUserId: input.updatedByUserId,
           createdAt: now,
           updatedAt: now,
-        })
-        .onConflictDoNothing({ target: aiAccountAgentBindings.agentId })
-        .returning({ agentId: aiAccountAgentBindings.agentId });
-      // A row that appeared meanwhile is someone's own choice: it is not this run's to report.
+        });
+      const rows = agent.retry
+        ? await insert
+          .onConflictDoUpdate({
+            target: aiAccountAgentBindings.agentId,
+            set: { accountId, source, migrationNote: decision.note, updatedByUserId: input.updatedByUserId, updatedAt: now },
+            setWhere: and(eq(aiAccountAgentBindings.companyId, agent.companyId), retriableMigratedRow()),
+          })
+          .returning({ agentId: aiAccountAgentBindings.agentId })
+        : await insert
+          .onConflictDoNothing({ target: aiAccountAgentBindings.agentId })
+          .returning({ agentId: aiAccountAgentBindings.agentId });
+      // A row that appeared or changed meanwhile is someone's own choice: it is not this run's to report.
       if (rows.length === 0) continue;
       if (decision.outcome === "bound") {
         for (const device of decision.devices) {
@@ -875,6 +926,7 @@ async function backfillBindings(
         source,
         rule: decision.choice?.rule ?? null,
         note: decision.note,
+        previousMode: agent.retry ? "pool_account" : null,
       });
     }
     order.set(agent.id, { companyId: agent.companyId, createdAt: agent.createdAt });
@@ -928,7 +980,7 @@ async function afterCommit(
           source: row.source,
           rule: row.rule,
           migrationNote: row.note,
-          previousMode: null,
+          previousMode: row.previousMode,
           previousAccountId: null,
         },
       });
@@ -1086,7 +1138,9 @@ export async function previewPlan(
 /**
  * Go/no-go (spec 15.3): every non-terminated Claude agent with a host-pool run
  * in the last 7 days, with its preview and its company. `go` only when each
- * one would use its account. An agent that would get no pool account at all
+ * one would use its account, or only waits for that account's limit to reset
+ * (`isGoNoGoBlocker`: the account resolved and passed every other check, and
+ * its tasks wait for the reset, P7). An agent that would get no pool account at all
  * is listed as `none` (its runs would use the device's own login) with the
  * reason in words. An agent without a binding row that now has its own AI
  * connection (`runtimeConfig.aiConnection`) is left out: its runs use that
@@ -1143,7 +1197,8 @@ export async function aiAccountMigrationGoNoGo(
         : preview.reason,
     };
   });
-  return { go: entries.every((entry) => entry.plan === "use"), agents: entries };
+  // Fork: an agent whose own account is only at its limit waits for the reset (P7); it does not block go.
+  return { go: entries.every((entry) => !isGoNoGoBlocker(entry)), agents: entries };
 }
 
 function markerStatus(marker: MarkerRow | null): DeferredDataMigrationStatus {

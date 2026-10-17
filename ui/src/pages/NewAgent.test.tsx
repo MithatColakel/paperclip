@@ -665,13 +665,13 @@ describe("New agent setup", () => {
   it("asks where the agent runs before connecting and follows the company default", async () => {
     envApi.list.mockResolvedValue([
       { id: "local-1", name: "Local", driver: "local", status: "active", config: {}, metadata: { defaultForInstance: true } },
-      { id: "mac-1", name: "Build Mac", driver: "sandbox", status: "active", config: { provider: "mac-fleet" }, metadata: null },
+      { id: "device-1", name: "Build computer", driver: "sandbox", status: "active", config: { provider: "box" }, metadata: null },
     ]);
     envApi.capabilities.mockResolvedValue({
-      sandboxProviders: { "mac-fleet": { supportsLoginPty: true } },
+      sandboxProviders: { box: { supportsLoginPty: true } },
     });
     settings.get.mockResolvedValue({ defaultEnvironmentId: null });
-    state.companies = [{ id: "company-1", defaultEnvironmentId: "mac-1" }];
+    state.companies = [{ id: "company-1", defaultEnvironmentId: "device-1" }];
     api.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "saved-oauth", latestVersion: 1 });
     await render("claude_local");
     const picker = container.querySelector(
@@ -679,11 +679,11 @@ describe("New agent setup", () => {
     ) as HTMLSelectElement | null;
     expect(picker).toBeTruthy();
     expect(container.textContent).toContain("Where will Atlas run?");
-    expect(picker!.options[0].textContent).toBe("Company default: Build Mac · sandbox");
+    expect(picker!.options[0].textContent).toBe("Company default: Build computer · sandbox");
     await click("ClaudeSubscription");
     await click("Use saved subscription");
     await click("Finish setup");
-    expect(api.testEnvironment.mock.calls[0][2].environmentId).toBe("mac-1");
+    expect(api.testEnvironment.mock.calls[0][2].environmentId).toBe("device-1");
     // Inheriting keeps the agent on whatever the company default becomes.
     expect(api.hire.mock.calls[0][1]).toMatchObject({ defaultEnvironmentId: null });
   });

@@ -147,6 +147,17 @@ const SETTINGS_CONFLICT_KEY_SOURCE =
   `|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|${POOL_RUN_REMOVED_ENV_KEYS.join("|")}`;
 const SETTINGS_CONFLICT_KEY_RE = new RegExp(`"(${SETTINGS_CONFLICT_KEY_SOURCE})"\\s*:`);
 const SETTINGS_CONFLICT_KEY_ERE = `"(${SETTINGS_CONFLICT_KEY_SOURCE})"[[:space:]]*:`;
+/**
+ * The project authentication keys and override arguments the upstream check
+ * (`assertManagedAiProjectAuth`) refuses. On a remote target the routing scan
+ * checks the keys itself, on every level including `$HOME` as upstream does,
+ * so one remote command decides both checks and tells a conflict from a scan
+ * that could not run.
+ */
+const AUTH_CONFLICT_KEY_ERE =
+  "apiKeyHelper|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY" +
+  "|model_provider[[:space:]]*=|env_key[[:space:]]*=|experimental_bearer_token|cli_auth_credentials_store";
+const AUTH_OVERRIDE_ARGUMENT_RE = /^(--config|-c|--settings|--setting-sources|--api-key|--auth-token)(=|$)/;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -681,51 +692,108 @@ async function localProjectSettingsConflicts(cwd: string, options: { skipUserSet
 
 /**
  * The `sh -c` script of the remote scan: `$1` is the working directory, `$2`
- * the ERE of conflicting keys, then the settings files relative to each
- * directory. Exit 42: a conflict; 43: a file could not be read; 0: none. The
- * home directory as the project itself still counts.
+ * the ERE of conflicting routing keys, `$3` the ERE of the upstream
+ * authentication keys, then the settings files relative to each directory.
+ * The authentication pass runs first and scans every level; the routing pass
+ * skips the home directory's own files unless it is the project. Exit 44: an
+ * authentication conflict; 42: a routing conflict; 43: a file could not be
+ * read; 0: none. Any other end means the scan did not run.
  */
 const REMOTE_SETTINGS_SCAN_SCRIPT = `
-directory=$1; pattern=$2; shift 2
+directory=$1; pattern=$2; auth_pattern=$3; shift 3
 start=$directory
 home=\${HOME%/}
-while :; do
-  if test "$directory" = "$start" || test -z "$home" || test "$directory" != "$home"; then
-    for relative in "$@"; do
-      file="$directory/$relative"
-      if test -f "$file"; then
-        grep -Eq "$pattern" "$file"
-        result=$?
-        if test "$result" -eq 0; then exit 42; fi
-        if test "$result" -ne 1; then exit 43; fi
-      fi
-    done
-  fi
-  parent=$(dirname "$directory")
-  if test "$parent" = "$directory"; then break; fi
-  directory=$parent
+for pass in auth routing; do
+  directory=$start
+  while :; do
+    if test "$pass" = auth || test "$directory" = "$start" || test -z "$home" || test "$directory" != "$home"; then
+      for relative in "$@"; do
+        file="$directory/$relative"
+        if test -f "$file"; then
+          if test "$pass" = auth; then grep -Eq "$auth_pattern" "$file"; else grep -Eq "$pattern" "$file"; fi
+          result=$?
+          if test "$result" -eq 0; then if test "$pass" = auth; then exit 44; fi; exit 42; fi
+          if test "$result" -ne 1; then exit 43; fi
+        fi
+      done
+    fi
+    parent=$(dirname "$directory")
+    if test "$parent" = "$directory"; then break; fi
+    directory=$parent
+  done
 done`;
 
 /**
- * The same scan on a remote target, from its working directory up. Only an
- * exit code comes back, never file content. The remote user's own
- * `$HOME/.claude` files are skipped when the walk passes through `$HOME`:
- * claude-local points a remote pool run at the account's managed config
- * directory, so it never reads them. True when a conflicting key is present;
- * throws when the scan could not run.
+ * Fork: the remote scan could not run (an ssh transport failure, a timeout, a
+ * signal, an unexpected exit, or the driver refused the command). It is not a
+ * refusal: the caller classifies it like a lease error (spec 7.8), so a device
+ * that is unavailable makes the run wait. It carries the exit code and stderr,
+ * or the driver's error as its cause, for that classification.
  */
-async function remoteProjectSettingsConflict(runId: string, target: AdapterExecutionTarget): Promise<boolean> {
-  if (target.kind !== "remote") return false;
-  const result = await runAdapterExecutionTargetProcess(
-    `ai-pool-routing-check-${runId}`,
-    target,
-    "sh",
-    ["-c", REMOTE_SETTINGS_SCAN_SCRIPT, "ai-pool-routing-check", target.remoteCwd, SETTINGS_CONFLICT_KEY_ERE, ...PROJECT_SETTINGS_FILES],
-    { cwd: target.remoteCwd, env: {}, timeoutSec: 15, graceSec: 1, onLog: async () => {} },
-  );
-  if (result.exitCode === 42) return true;
-  if (result.exitCode === 0) return false;
-  throw new Error(`The project's Claude settings could not be checked (exit ${result.exitCode ?? "unknown"})`);
+export class RoutingCheckUnavailableError extends Error {
+  readonly code: number | null;
+  readonly signal: string | null;
+  readonly timedOut: boolean;
+  readonly stderr: string;
+
+  constructor(detail: { code?: number | null; signal?: string | null; timedOut?: boolean; stderr?: string; cause?: unknown }) {
+    const how = detail.cause !== undefined
+      ? "the execution target refused the command"
+      : detail.timedOut
+        ? "the check timed out"
+        : `exit ${detail.code ?? detail.signal ?? "unknown"}`;
+    super(`The project's Claude settings could not be checked on the execution target (${how}).`, detail.cause !== undefined ? { cause: detail.cause } : undefined);
+    this.name = "RoutingCheckUnavailableError";
+    this.code = detail.code ?? null;
+    this.signal = detail.signal ?? null;
+    this.timedOut = detail.timedOut ?? false;
+    this.stderr = detail.stderr ?? "";
+  }
+}
+
+export function isRoutingCheckUnavailable(error: unknown): error is RoutingCheckUnavailableError {
+  return error instanceof RoutingCheckUnavailableError;
+}
+
+type RemoteSettingsScan = "none" | "routing" | "auth" | "unreadable";
+
+/**
+ * The project-settings scan on a remote target, from its working directory
+ * up. Only an exit code comes back, never file content. The remote user's own
+ * `$HOME/.claude` files are skipped by the routing pass when the walk passes
+ * through `$HOME`: claude-local points a remote pool run at the account's
+ * managed config directory, so it never reads them. Throws a
+ * `RoutingCheckUnavailableError` when the scan did not run.
+ */
+async function remoteProjectSettingsScan(runId: string, target: AdapterExecutionTarget): Promise<RemoteSettingsScan> {
+  if (target.kind !== "remote") return "none";
+  let result: Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+  try {
+    result = await runAdapterExecutionTargetProcess(
+      `ai-pool-routing-check-${runId}`,
+      target,
+      "sh",
+      [
+        "-c", REMOTE_SETTINGS_SCAN_SCRIPT, "ai-pool-routing-check", target.remoteCwd,
+        SETTINGS_CONFLICT_KEY_ERE, AUTH_CONFLICT_KEY_ERE, ...PROJECT_SETTINGS_FILES,
+      ],
+      { cwd: target.remoteCwd, env: {}, timeoutSec: 15, graceSec: 1, onLog: async () => {} },
+    );
+  } catch (error) {
+    throw new RoutingCheckUnavailableError({ cause: error });
+  }
+  if (!result.timedOut && !result.signal) {
+    if (result.exitCode === 0) return "none";
+    if (result.exitCode === 42) return "routing";
+    if (result.exitCode === 43) return "unreadable";
+    if (result.exitCode === 44) return "auth";
+  }
+  throw new RoutingCheckUnavailableError({
+    code: result.exitCode,
+    signal: result.signal,
+    timedOut: result.timedOut,
+    stderr: result.stderr,
+  });
 }
 
 export interface AssertRoutingCompatibleInput {
@@ -1155,7 +1223,10 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
    * auth keys are stripped), in authentication arguments, or in the project's
    * `.claude/settings*.json` (helper keys, and routing keys in its `env`
    * block). Call it before `acquire` with the resolved config, and again after
-   * the workspace is realized with the realized cwd and target.
+   * the workspace is realized with the realized cwd and target. On a remote
+   * target, a scan that could not run throws a `RoutingCheckUnavailableError`
+   * instead (no refusal, no ended episode); the run must not dispatch, and the
+   * caller classifies the error as it does a lease error.
    */
   async function assertRoutingCompatible(input: AssertRoutingCompatibleInput): Promise<void> {
     const { run, agent, config } = input;
@@ -1183,31 +1254,46 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     }
     if (input.checkProjectSettings === false) return;
     const target = input.target ?? null;
+    const authRefusal = () => refusal(`Project or argument authentication conflicts with ${agent.name}'s Claude account.`, "auth");
+    const uncheckedRefusal = () => refusal(
+      `The project's Claude settings could not be checked before using ${agent.name}'s Claude account.`,
+      "settings_unchecked",
+    );
+    const settingsRefusal = (conflicts: readonly string[]) => refusal(
+      `The project's Claude settings set ${conflicts.join(", ")}, so ${agent.name}'s Claude account cannot serve this run. Remove ${conflicts.length === 1 ? "it" : "them"} from .claude/settings.json.`,
+      "settings",
+    );
+    if (target?.kind === "remote") {
+      // Fork: one remote scan decides the authentication and routing checks.
+      // A scan that could not run throws a RoutingCheckUnavailableError, which
+      // is not a refusal: the caller classifies it like a lease error, so an
+      // unreachable or stopped device makes the run wait (spec 7.8, D1, D6).
+      const extraArgs = [...(Array.isArray(config.extraArgs) ? config.extraArgs : []), ...(Array.isArray(config.args) ? config.args : [])];
+      if (extraArgs.some((arg) => typeof arg === "string" && AUTH_OVERRIDE_ARGUMENT_RE.test(arg))) await refuse(run, authRefusal());
+      const scan = await remoteProjectSettingsScan(run.id, target);
+      if (scan === "auth") await refuse(run, authRefusal());
+      if (scan === "unreadable") {
+        logger.warn({ runId: run.id }, "a project Claude settings file could not be read on the execution target for a pool run");
+        await refuse(run, uncheckedRefusal());
+      }
+      if (scan === "routing") await refuse(run, settingsRefusal(["a provider routing or credential key"]));
+      return;
+    }
     try {
       await assertManagedAiProjectAuth(config, "anthropic", target);
     } catch {
-      await refuse(run, refusal(`Project or argument authentication conflicts with ${agent.name}'s Claude account.`, "auth"));
+      await refuse(run, authRefusal());
     }
     let conflicts: string[];
     try {
-      conflicts = target?.kind === "remote"
-        ? (await remoteProjectSettingsConflict(run.id, target) ? ["a provider routing or credential key"] : [])
-        : await localProjectSettingsConflicts(typeof config.cwd === "string" ? config.cwd : process.cwd(), {
-          skipUserSettings: input.targetIsRemote ?? false,
-        });
+      conflicts = await localProjectSettingsConflicts(typeof config.cwd === "string" ? config.cwd : process.cwd(), {
+        skipUserSettings: input.targetIsRemote ?? false,
+      });
     } catch (error) {
       logger.warn({ err: error, runId: run.id }, "could not check the project's Claude settings for a pool run");
-      return refuse(run, refusal(
-        `The project's Claude settings could not be checked before using ${agent.name}'s Claude account.`,
-        "settings_unchecked",
-      ));
+      return refuse(run, uncheckedRefusal());
     }
-    if (conflicts.length > 0) {
-      await refuse(run, refusal(
-        `The project's Claude settings set ${conflicts.join(", ")}, so ${agent.name}'s Claude account cannot serve this run. Remove ${conflicts.length === 1 ? "it" : "them"} from .claude/settings.json.`,
-        "settings",
-      ));
-    }
+    if (conflicts.length > 0) await refuse(run, settingsRefusal(conflicts));
   }
 
   /**

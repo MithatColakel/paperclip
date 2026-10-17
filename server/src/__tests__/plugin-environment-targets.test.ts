@@ -585,8 +585,8 @@ describeEmbeddedPostgres("plugin environment targets (database)", () => {
       expect(await dueNow(all)).toEqual([]);
 
       // Retired: the environment refuses from now on, and its waits wake to find out.
-      await svc.reportTargets({ driverKey: "box", targets: [report({ state: "unavailable", reason: "other", message: "Removed from the fleet", retired: true })] });
-      expect(await availabilityOf(mine.id)).toMatchObject({ state: "retired", message: "Removed from the fleet" });
+      await svc.reportTargets({ driverKey: "box", targets: [report({ state: "unavailable", reason: "other", message: "Removed from service", retired: true })] });
+      expect(await availabilityOf(mine.id)).toMatchObject({ state: "retired", message: "Removed from service" });
       expect(await availabilityOf(other.id)).toMatchObject({ state: "available" });
       expect(await dueNow(all)).toEqual([runs.offline, runs.notServing, runs.credentialType, runs.usageLimit]);
     });

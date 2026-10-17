@@ -32,7 +32,7 @@ vi.mock("../context/CompanyContext", () => ({
 }));
 
 const LOCAL = { id: "local-1", name: "Local", driver: "local", status: "active", config: {}, metadata: { defaultForInstance: true } };
-const MAC = { id: "mac-1", name: "Build Mac", driver: "sandbox", status: "active", config: { provider: "mac-fleet" }, metadata: null };
+const DEVICE = { id: "device-1", name: "Build computer", driver: "sandbox", status: "active", config: { provider: "box" }, metadata: null };
 
 let container: HTMLDivElement;
 let root: Root;
@@ -84,20 +84,20 @@ describe("NewProjectDialog — where the project runs", () => {
   });
 
   it("asks where the work runs and sends the pick with the new project", async () => {
-    mocks.listEnvironments.mockResolvedValue([LOCAL, MAC]);
-    mocks.companies = [{ id: "company-1", defaultEnvironmentId: "mac-1" }];
+    mocks.listEnvironments.mockResolvedValue([LOCAL, DEVICE]);
+    mocks.companies = [{ id: "company-1", defaultEnvironmentId: "device-1" }];
     await render();
 
     const select = picker();
     expect(select).not.toBeNull();
     expect(document.body.textContent).toContain("Where does this project's work run?");
-    expect(select!.options[0].textContent).toBe("Company default: Build Mac · sandbox");
+    expect(select!.options[0].textContent).toBe("Company default: Build computer · sandbox");
 
     const name = document.body.querySelector<HTMLInputElement>('input[aria-label="Project name"]')!;
     await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(name, "Cleanio iOS");
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(name, "Acme iOS");
       name.dispatchEvent(new Event("input", { bubbles: true }));
-      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(select, "mac-1");
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(select, "device-1");
       select!.dispatchEvent(new Event("change", { bubbles: true }));
     });
     const submit = Array.from(document.body.querySelectorAll("button")).find(
@@ -107,13 +107,13 @@ describe("NewProjectDialog — where the project runs", () => {
     await settle();
 
     expect(mocks.createProject).toHaveBeenCalledWith("company-1", expect.objectContaining({
-      name: "Cleanio iOS",
-      defaultEnvironmentId: "mac-1",
+      name: "Acme iOS",
+      defaultEnvironmentId: "device-1",
     }));
   });
 
   it("leaves the project on the inherited default when nothing is picked", async () => {
-    mocks.listEnvironments.mockResolvedValue([LOCAL, MAC]);
+    mocks.listEnvironments.mockResolvedValue([LOCAL, DEVICE]);
     await render();
     const name = document.body.querySelector<HTMLInputElement>('input[aria-label="Project name"]')!;
     await act(async () => {

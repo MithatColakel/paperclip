@@ -253,7 +253,7 @@ export async function prepareManagedAiRuntime(
       runnerProvider: input.config.provider,
       acpxAgent: input.config.acpxAgent,
       // The pool already chose this account; re-validate it rather than choose again.
-      ...(input.binding.mode === "company_pool" ? { pinnedGrantId: selectedGrantId, probeUsage: false } : {}),
+      ...(input.binding.mode === "company_pool" ? { pinnedGrantId: selectedGrantId } : {}),
     });
     if (selection.grant.id !== selectedGrantId)
       throw unprocessable(

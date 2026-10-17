@@ -35,6 +35,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { PluginEnvironmentUnavailableError } from "@paperclipai/plugin-sdk";
 import { createRunDispatch } from "../modules/run-dispatch/index.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { credentialRefForAccount } from "../services/ai-account-credentials.js";
@@ -44,6 +45,7 @@ import {
   dropStaleAttribution,
   estimatedLimitMs,
   injectPoolCredential,
+  isRoutingCheckUnavailable,
   previewCredentialPlan,
   projectSettingsConflicts,
   readBinding,
@@ -60,12 +62,15 @@ import {
   type ResourceWaitIssueNotice,
   type ResourceWaitScheduleOptions,
 } from "../services/resource-waits/index.js";
+import { classifyEnvironmentError } from "../services/resource-waits/classify.js";
 
 // Remote project-settings scans never leave this test: the target process runner is stubbed.
 // With `shellHome` set, the scan script itself runs in a local `sh` with that HOME.
+// `outcomes` replaces a scan's result (a transport failure, a timeout) or makes the runner throw.
 const remoteStub = vi.hoisted(() => ({
   calls: [] as Array<{ args: string[] }>,
   exitCodes: {} as Record<string, number>,
+  outcomes: {} as Record<string, { exitCode?: number | null; signal?: string | null; timedOut?: boolean; stderr?: string } | { throws: unknown }>,
   shellHome: null as string | null,
 }));
 vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => {
@@ -76,6 +81,17 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
     runAdapterExecutionTargetProcess: async (_runId: string, _target: unknown, command: string, args: string[]) => {
       remoteStub.calls.push({ args });
       const name = args[2] ?? "";
+      const outcome = remoteStub.outcomes[name];
+      if (outcome && "throws" in outcome) throw outcome.throws;
+      if (outcome) {
+        return {
+          exitCode: outcome.exitCode === undefined ? 0 : outcome.exitCode,
+          signal: outcome.signal ?? null,
+          timedOut: outcome.timedOut ?? false,
+          stdout: "",
+          stderr: outcome.stderr ?? "",
+        };
+      }
       if (remoteStub.shellHome && name === "ai-pool-routing-check") {
         const result = spawnSync(command, args, { env: { HOME: remoteStub.shellHome, PATH: process.env.PATH ?? "/usr/bin:/bin" }, encoding: "utf8" });
         return { exitCode: result.status, signal: null, timedOut: false, stdout: "", stderr: "" };
@@ -125,6 +141,7 @@ describeEmbeddedPostgres("heartbeat AI accounts (database)", () => {
   beforeEach(async () => {
     remoteStub.calls = [];
     remoteStub.exitCodes = {};
+    remoteStub.outcomes = {};
     remoteStub.shellHome = null;
     await db.execute(sql`truncate table companies, plugins, ai_account_hosts, ai_accounts, environments, "user" cascade`);
     [localEnvironment] = await db.insert(environments).values({ name: "Local", driver: "local" }).returning();
@@ -867,9 +884,17 @@ describeEmbeddedPostgres("heartbeat AI accounts (database)", () => {
       const remote = { kind: "remote", transport: "ssh", remoteCwd: "/srv/work" } as never;
       await expect(accounts.assertRoutingCompatible({ run: target, agent: worker, config: { env: {} }, target: remote })).resolves.toBeUndefined();
       const scan = remoteStub.calls.find((call) => call.args[2] === "ai-pool-routing-check");
-      expect(scan?.args.slice(3)).toEqual(["/srv/work", expect.stringContaining("apiKeyHelper"), ".claude/settings.json", ".claude/settings.local.json"]);
+      expect(scan?.args.slice(3)).toEqual([
+        "/srv/work",
+        expect.stringContaining("apiKeyHelper"),
+        expect.stringContaining("CLAUDE_CODE_OAUTH_TOKEN"),
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+      ]);
       for (const key of POOL_RUN_REMOVED_ENV_KEYS) expect(scan?.args[4]).toContain(key);
       expect(scan?.args[1]).toContain("home=${HOME%/}");
+      // One remote command decides both checks.
+      expect(remoteStub.calls.map((call) => call.args[2])).toEqual(["ai-pool-routing-check"]);
 
       remoteStub.exitCodes["ai-pool-routing-check"] = 42;
       expect((await expectRefusal(accounts.assertRoutingCompatible({ run: target, agent: worker, config: { env: {} }, target: remote }))).reason)
@@ -877,6 +902,63 @@ describeEmbeddedPostgres("heartbeat AI accounts (database)", () => {
       remoteStub.exitCodes["ai-pool-routing-check"] = 43;
       expect((await expectRefusal(accounts.assertRoutingCompatible({ run: target, agent: worker, config: { env: {} }, target: remote }))).message)
         .toContain("could not be checked");
+      remoteStub.exitCodes["ai-pool-routing-check"] = 44;
+      expect((await expectRefusal(accounts.assertRoutingCompatible({ run: target, agent: worker, config: { env: {} }, target: remote }))).message)
+        .toContain("authentication conflicts");
+    });
+
+    it("refuses an authentication argument on a remote target without a remote call", async () => {
+      const { accounts, worker, target } = await guardFixture();
+      const remote = { kind: "remote", transport: "ssh", remoteCwd: "/srv/work" } as never;
+      const refusal = await expectRefusal(accounts.assertRoutingCompatible({
+        run: target, agent: worker, config: { env: {}, extraArgs: ["--settings", "x.json"] }, target: remote,
+      }));
+      expect(refusal.message).toContain("authentication conflicts");
+      expect(remoteStub.calls).toEqual([]);
+    });
+
+    it("throws a classifiable error, not a refusal, when the remote scan could not run", async () => {
+      const { accounts, worker, target } = await guardFixture();
+      const [episode] = await db.insert(resourceWaitEpisodes).values({
+        companyId: worker.companyId,
+        agentId: worker.id,
+        kind: "environment",
+        reason: "offline",
+        scope: "target",
+        resourceKey: `environment:${randomUUID()}`,
+        since: new Date(),
+        currentRunId: target.id,
+      }).returning();
+      const remote = { kind: "remote", transport: "ssh", remoteCwd: "/srv/work" } as never;
+      const check = async () => {
+        const error = await accounts.assertRoutingCompatible({ run: target, agent: worker, config: { env: {} }, target: remote })
+          .then(() => null, (thrown: unknown) => thrown);
+        expect(error).not.toBeNull();
+        expect(error).not.toBeInstanceOf(ConfigurationRefusal);
+        expect(isRoutingCheckUnavailable(error)).toBe(true);
+        return classifyEnvironmentError(error);
+      };
+
+      // sshd dropped the connection in a burst (MaxStartups): this run waits briefly.
+      remoteStub.outcomes["ai-pool-routing-check"] = { exitCode: 255, stderr: "kex_exchange_identification: Connection closed by remote host\r\n" };
+      expect(await check()).toMatchObject({ action: "wait", scope: "admission", reason: "throttled", source: "ssh" });
+      // The host cannot be reached: the device waits.
+      remoteStub.outcomes["ai-pool-routing-check"] = { exitCode: 255, stderr: "ssh: connect to host box.invalid port 22: Connection refused\r\n" };
+      expect(await check()).toMatchObject({ action: "wait", scope: "target", reason: "unreachable" });
+      // A per-company Emergency stop between the lease and the check waits (D6).
+      remoteStub.outcomes["ai-pool-routing-check"] = {
+        throws: new Error("execute refused", { cause: new PluginEnvironmentUnavailableError({ scope: "admission", reason: "stopped", retryable: true }) }),
+      };
+      expect(await check()).toMatchObject({ action: "wait", scope: "admission", reason: "stopped", source: "envelope" });
+      // A timeout or an unexpected exit is left to the setup failure path.
+      remoteStub.outcomes["ai-pool-routing-check"] = { exitCode: null, signal: "SIGTERM", timedOut: true };
+      expect(await check()).toBeNull();
+      remoteStub.outcomes["ai-pool-routing-check"] = { exitCode: 2 };
+      expect(await check()).toBeNull();
+
+      // None of them ended the run's wait as refused.
+      const [open] = await db.select().from(resourceWaitEpisodes).where(eq(resourceWaitEpisodes.id, episode!.id));
+      expect(open!.resolution).toBeNull();
     });
 
     it("refuses a credential carrier in a project settings env block, an empty one included", async () => {
@@ -929,6 +1011,30 @@ describeEmbeddedPostgres("heartbeat AI accounts (database)", () => {
         // The project's own file is still scanned on the target, a credential carrier included.
         await writeFile(path.join(project, ".claude", "settings.local.json"), JSON.stringify({ env: { ANTHROPIC_UNIX_SOCKET: "/tmp/x.sock" } }));
         expect((await expectRefusal(check(project))).message).toContain(conflict);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses an authentication key anywhere up the remote tree, the remote user's own settings included", async () => {
+      const { accounts, worker, target } = await guardFixture();
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-pool-remote-auth-"));
+      try {
+        const home = path.join(root, "home");
+        const project = path.join(home, "work", "project");
+        await mkdir(path.join(home, ".claude"), { recursive: true });
+        await mkdir(project, { recursive: true });
+        remoteStub.shellHome = home;
+        const check = () => accounts.assertRoutingCompatible({
+          run: target,
+          agent: worker,
+          config: { env: {} },
+          target: { kind: "remote", transport: "ssh", remoteCwd: project } as never,
+        });
+        await expect(check()).resolves.toBeUndefined();
+        // The routing pass skips this file; the authentication pass scans it, as the upstream check does.
+        await writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-x" } }));
+        expect((await expectRefusal(check())).message).toContain("authentication conflicts");
       } finally {
         await rm(root, { recursive: true, force: true });
       }

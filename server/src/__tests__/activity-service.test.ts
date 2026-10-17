@@ -13,7 +13,7 @@ import {
   issueDocuments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, buildResourceWaitContext, readResourceWaitContext } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -252,6 +252,63 @@ describeEmbeddedPostgres("activity service", () => {
       nextAction: "Review the completed output.",
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
+  });
+
+  it("returns the wait of a deferred run and of its waiting successor for the run ledger", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const deferredId = randomUUID();
+    const successorId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: `W${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Builder", role: "engineer", status: "idle", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    const wait = buildResourceWaitContext({
+      episodeId: randomUUID(),
+      kind: "environment",
+      reason: "offline",
+      scope: "target",
+      environmentId: randomUUID(),
+      environmentName: "Build env",
+      deviceId: randomUUID(),
+      deviceName: "Build box",
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: deferredId,
+        companyId,
+        agentId,
+        status: "cancelled",
+        errorCode: "environment_unavailable",
+        contextSnapshot: { issueId },
+        resultJson: { executionRecovery: { kind: "resource_wait" }, resourceWait: wait },
+        createdAt: new Date("2026-10-16T10:00:00.000Z"),
+      },
+      {
+        id: successorId,
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        retryOfRunId: deferredId,
+        scheduledRetryReason: "environment_wait",
+        scheduledRetryAt: new Date("2026-10-16T10:05:00.000Z"),
+        contextSnapshot: { issueId, wakeReason: "resource_wait", resourceWait: wait },
+        createdAt: new Date("2026-10-16T10:00:01.000Z"),
+      },
+    ]);
+
+    const runs = await activityService(db).runsForIssue(companyId, issueId);
+    const deferred = runs.find((run) => run.runId === deferredId)!;
+    const successor = runs.find((run) => run.runId === successorId)!;
+    expect(readResourceWaitContext(deferred.resultJson?.resourceWait)).toEqual(wait);
+    expect(deferred).not.toHaveProperty("contextSnapshot");
+    // Only the wait of the successor's context is sent.
+    expect(successor.contextSnapshot).toEqual({ resourceWait: wait });
+    expect(readResourceWaitContext(successor.contextSnapshot?.resourceWait)).toEqual(wait);
   });
 
   it("backfills missing liveness for completed issue runs before returning the ledger", async () => {

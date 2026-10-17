@@ -1,26 +1,26 @@
-# Device-authoritative workspaces for SSH and Mac Fleet devices
+# Device-authoritative workspaces for SSH and sandbox-provider devices
 
 - Date: 2026-10-06
-- Status: Parts 0 and A implemented on 2026-10-06 (see section 11). Part B (Mac Fleet) is not started.
+- Status: Parts 0 and A implemented on 2026-10-06 (see section 11). Part B (the sandbox provider plugin) is not started.
 - Scope:
   - Core fork: `packages/adapter-utils`, `packages/adapters/claude-local`, `packages/shared`, `server`, `ui`.
-  - `packages/plugins/mac-fleet` (its own nested repository), for Part B only.
+  - An environment driver plugin (kept in its own repository), for Part B only.
 - Related documents:
-  - `doc/plans/2026-10-06-mac-fleet-duplex-channel.md`. That plan made Mac Fleet transfers cheaper. This plan removes the transfer for git-backed workspaces.
+  - The plugin's duplex-channel plan, kept in the plugin's own repository. That plan made the plugin's transfers cheaper. This plan removes the transfer for git-backed workspaces.
 
 ## 1. Why: measured on prod, 2026-10-06
 
 **The setup:**
-- Company: VPNProjects (`7a6a7811-…`).
-- Agent: SecurezoneiOS.
-- Environment: `mac-securezone` (`051374ed-…`).
+- Company: VPNProjects.
+- Agent: the engineer agent of app A.
+- Environment: the SSH environment of computer A.
   - Driver: `ssh`.
-  - Connection: the runner tunnel `10.114.0.2:2201`.
-  - `remoteWorkspacePath`: `/Users/mithatcolakel/Documents/Projects`. This is the user's own Mac and their real projects folder.
-- `bernamanavmac` (port 2202, agent SecurefieldiOS) uses the same driver and has the same problems.
+  - Connection: a port of the runner tunnel.
+  - `remoteWorkspacePath`: `~/Documents/Projects`. This is the user's own computer and their real projects folder.
+- Computer B (another tunnel port, the engineer agent of app B) uses the same driver and has the same problems.
 
 **What every run does today (copy mode):**
-1. The server owns the worktree, for example `…/SecurezoneVPN/.paperclip/worktrees/VPN-146-…`.
+1. The server owns the worktree, for example `…/<app A repo>/.paperclip/worktrees/VPN-146-…`.
 2. `prepareRemoteManagedRuntime` (`packages/adapter-utils/src/remote-managed-runtime.ts:~121`) creates a new directory on the device for every run: `<remoteCwd>/.paperclip-runtime/runs/<runId>/workspace`.
 3. `importGitWorkspaceToSsh` (`ssh.ts:~762`) uploads a bundle of the whole history reachable from HEAD.
 4. `syncDirectoryToSsh` (`ssh.ts:~1316`) then uploads a tar of the whole tree.
@@ -32,7 +32,7 @@
 | Run | Git bundle up | Tree up | Tree back | Result |
 |---|---|---|---|---|
 | `503b0a78` 14:12Z | 159 MB | small | 324 MB | succeeded, 11 min, about 9 min of it transfer |
-| `d9f9f7b4` 16:19Z | 159 MB | 1,918 MB (8 min) | failed at 6% of 2,114 MB | "Connection to 10.114.0.2 closed by remote host" |
+| `d9f9f7b4` 16:19Z | 159 MB | 1,918 MB (8 min) | failed at 6% of 2,114 MB | "Connection to <tunnel host> closed by remote host" |
 | `33cdab8a` 16:37Z | 159 MB | 1,918 MB | — | `process_lost`: the server crashed at 16:45:45Z |
 | `7c777d7f` 16:47Z | 159 MB | cancelled at 0% | — | cancelled by the operator |
 
@@ -40,12 +40,12 @@
 - Copy mode ignores `.gitignore`:
   - The upload excludes only `._*`, `.git` and `.paperclip-runtime` (`ssh.ts:~411`).
   - The pull-back excludes only `GIT_BACKED_WORKSPACE_BASELINE_EXCLUDES` (`remote-managed-runtime.ts:41`).
-- The agent built SwiftPM packages on the Mac. The pull-back copied 1.8 GB of `.build/` into the server worktree: `SZFeaturePaywalls` 859 MB, `SZDesign` 800 MB and `SZAds` 151 MB.
+- The agent built packages on the device. The pull-back copied 1.8 GB of `.build/` into the server worktree, from three packages of 859 MB, 800 MB and 151 MB.
 - From then on, every run uploaded those build outputs and pulled them back.
 - The sandbox lane already honours `.gitignore` (`sandbox-managed-runtime.ts:~1137-1165`). The SSH lane never got that fix.
 
 **Other damage found on the same day:**
-- **The device disk.** The Mac held 31 run directories totalling 25 GB, and its disk was 98% full.
+- **The device disk.** The device held 31 run directories totalling 25 GB, and its disk was 98% full.
 - **An orphan process.** The `paperclip-bridge-server.mjs` of failed run `9fe6fd8e` was still alive 5.5 h later.
 - **Cancel does not stop the transfer.** After `POST /heartbeat-runs/:id/cancel`, the server's `tar | ssh` and the device's `tar -xf` kept running.
 - **The whole server crashes when an SSH transfer drops.** This happened at 12:06Z and again at 16:45:45Z, each time with `Error: write EPIPE … Unhandled 'error' event` on a Socket. The cause: nothing listens for errors on `ssh.stdin`:
@@ -57,7 +57,7 @@
 
 Paperclip treats every execution environment as disposable compute, and the server worktree as the only authoritative copy. That fits ephemeral sandboxes such as Daytona, E2B or Cloudflare, where nothing survives the lease. It does not fit a persistent device:
 - **Heavy transfers.** Each run moves the full history and the full tree twice over a home uplink.
-- **No build cache.** The Xcode and SwiftPM caches are thrown away every run, so every run is a cold build.
+- **No build cache.** The build caches are thrown away every run, so every run is a cold build.
 - **No session resume.** The per-run directory changes the cwd, so Claude session resume never matches (`claude-local/src/server/execute.ts:~779-789`).
 - **Work can be lost.** Work that exists only on the device is lost when the pull-back fails. In run `d9f9f7b4`, the only copy sat in a run directory. In run `d86bbf50`, an agent created a local branch that was never restored.
 
@@ -234,35 +234,35 @@ Mirror Codex:
 - **Claude adapter:** an `in_place` unit test mirroring the Codex test.
 - **Orchestrator:** the `spec.remoteCwd` test from A.4.
 
-## 6. Part B: Mac Fleet uses device mode
+## 6. Part B: the sandbox provider plugin uses device mode
 
-The Mac Fleet sandbox provider can already return `in_place` through its realize metadata. It goes through the sandbox driver, which calls `realizeWorkspace`.
+The environment driver plugin's sandbox provider can already return `in_place` through its realize metadata. It goes through the sandbox driver, which calls `realizeWorkspace`.
 
-- **`realizeWorkspace`** (`packages/plugins/mac-fleet/src/runner/provider.ts:~350-357`):
+- **`realizeWorkspace`** (the plugin's provider):
   - Read `params.workspace.metadata.workspaceRealizationRequest.source`.
-  - Run the same realize script as A.3 under `runnerRoot`, which is required by `isUnder(root, cwd)` (~192, ~235).
+  - Run the same realize script as A.3 under the plugin's runner root, which the provider requires for every working directory.
   - Return `metadata.workspaceRealization = { mode: "in_place", authoritativeRoot }`.
-- **Keep the clone outside the lease's `remoteCwd`.** `destroyLease` runs `rm -rf remoteCwd` (~246).
+- **Keep the clone outside the lease's `remoteCwd`.** Destroying the lease runs `rm -rf remoteCwd`.
 - **Share the code.** The realize script and the run-end script live once in `packages/adapter-utils` (shell text plus parsers), and both the SSH driver and the plugin use them.
-- **Keep the delta tar sync** from the duplex plan only for plain-folder projects.
-- **Open question:** the Mac Fleet devices need GitHub credentials (decision 9.4).
+- **Keep the delta tar sync** from the plugin's duplex plan only for plain-folder projects.
+- **Open question:** the plugin's devices need GitHub credentials (decision 9.4).
 
 ## 7. Rollout
 
 1. **Part 0.**
    1. Implement and test.
    2. Build with `./build-patch.sh <sha>`.
-   3. Deploy with `/opt/paperclip/deploy-when-no-run.sh <image>`.
-   4. Check: no EPIPE crash under a forced SSH drop, no `.build/` in transfers, and no run directories left on the Mac after a run.
+   3. Deploy the image with the deploy script, which waits until no run is active.
+   4. Check: no EPIPE crash under a forced SSH drop, no `.build/` in transfers, and no run directories left on the device after a run.
 2. **Part A** behind `workspaceMode: "device"`.
-   1. Change `mac-securezone` to a dedicated root (decision 9.3) and set `workspaceMode: "device"`.
+   1. Change computer A's environment to a dedicated root (decision 9.3) and set `workspaceMode: "device"`.
    2. Verify on VPN-146:
       - The first run fetches from GitHub, and the server log shows no "Importing git history" or "Syncing workspace" lines.
       - The second run moves 5 MB or less.
       - The build is incremental.
       - The branch is pushed, and the server worktree fast-forwards.
-   3. Then switch `bernamanavmac`.
-3. **Part B** for Mac Fleet (TECHNOGRADE), after the duplex rollout is verified.
+   3. Then switch computer B.
+3. **Part B** for the sandbox provider plugin, after the duplex rollout is verified.
 4. **Rollback:** set `workspaceMode` back to `"copy"`. The next run uses today's path. Work that was pushed from the device is on origin, and the server fast-forward picks it up.
 
 ## 8. Risks
@@ -276,24 +276,24 @@ The Mac Fleet sandbox provider can already return `in_place` through its realize
 
 1. **Push at run end.** Should Paperclip push the issue branch automatically at run end (recommended), or rely on the agent to push?
 2. **Unfinished work and close.** Should unpushed or uncommitted device work block closing the issue (recommended), or only show as a warning?
-3. **Remote root for `mac-securezone`.** Should it move to a dedicated folder such as `~/PaperclipDevice` (recommended), instead of `~/Documents/Projects`?
+3. **Remote root for computer A.** Should it move to a dedicated folder such as `~/PaperclipDevice` (recommended), instead of `~/Documents/Projects`?
 4. **Credentials.**
-   - v1 uses the device's own GitHub login (`gh auth` or an SSH key). Is that acceptable for both Macs?
-   - Do the Mac Fleet devices have one?
+   - v1 uses the device's own GitHub login (`gh auth` or an SSH key). Is that acceptable for both computers?
+   - Do the sandbox provider plugin's devices have one?
 
 ## 10. Operator cleanup done on 2026-10-06 (for the record)
 
 - **Runs:**
   - Retry run `7c777d7f` was cancelled; it was still uploading at 0%.
   - Its orphan server-side `tar` was stopped. Only `tar` was killed, to avoid the EPIPE crash.
-  - The orphan `paperclip-bridge-server.mjs` from run `9fe6fd8e` was killed on the Mac.
-- **Backups** are in `~/PaperclipRunBackups/2026-10-06/` on the Mac (161 MB):
-  - `vpn146-duplicate-local-backup.bundle` holds 3 VPN-146 commits that existed only on the Mac. Its base is `6ee9dc5`. To recover: `git fetch <bundle> vpn146-duplicate-local-backup:vpn146-duplicate-local-backup`.
+  - The orphan `paperclip-bridge-server.mjs` from run `9fe6fd8e` was killed on the device.
+- **Backups** are in `~/PaperclipRunBackups/2026-10-06/` on the device (161 MB):
+  - `vpn146-duplicate-local-backup.bundle` holds 3 VPN-146 commits that existed only on the device. Its base is `6ee9dc5`. To recover: `git fetch <bundle> vpn146-duplicate-local-backup:vpn146-duplicate-local-backup`.
   - Patches and untracked files from 7 run directories with working changes: `changes.patch`, `untracked.tgz` and `info.txt` per run.
   - Every other run-directory HEAD was present on the server or on GitHub.
 - **Deleted:**
   - All 31 run directories under `~/Documents/Projects/.paperclip-runtime/runs/`, about 25 GB.
-  - The 5 `.build/` directories in the server worktrees: VPN-146 (3), VPN-5's nested SecurezoneVPN copy, and SecureField VPN-129. VPN-146 went from 2.0 GB to 162 MB.
+  - The 5 `.build/` directories in the server worktrees: VPN-146 (3), VPN-5's nested copy of the app A repository, and app B's VPN-129. VPN-146 went from 2.0 GB to 162 MB.
 
 ## 11. Implementation status (2026-10-06)
 
@@ -325,7 +325,7 @@ The user accepted every recommendation in section 9:
 **Not done:**
 - The device lock from A.2.
 - Skipping runtime services for device workspaces (A.7).
-- Part B (Mac Fleet).
+- Part B (the sandbox provider plugin).
 
 **Tests:**
 - `ssh-transfer.test.ts`, `device-workspace.test.ts` and `remote-managed-runtime.test.ts` all use a stand-in `ssh` plus real git and tar.

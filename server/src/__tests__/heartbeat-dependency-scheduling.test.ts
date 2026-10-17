@@ -1416,7 +1416,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
               selectionMode: "single",
               required: true,
               options: [
-                { id: "mac", label: "Mac" },
+                { id: "workstation", label: "Workstation" },
                 { id: "linux", label: "Linux" },
               ],
             },
@@ -1428,7 +1428,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     const answered = await interactions.answerQuestions(
       { id: blockedIssueId, companyId, status: "blocked" },
       interaction.id,
-      { answers: [{ questionId: "device", optionIds: ["mac"] }] },
+      { answers: [{ questionId: "device", optionIds: ["workstation"] }] },
       { userId: "responsible-user" },
     );
     const wakeup = vi.fn((wakeAgentId: string, opts: Parameters<typeof heartbeat.wakeup>[1]) =>

@@ -32,8 +32,6 @@ const { errorHandler } = await import("../middleware/error-handler.js");
 const { heartbeatService } = await import("../services/heartbeat.js");
 const {
   aiConnectionPoolService,
-  claudeUsageToPoolWindows,
-  usageBlockedUntil,
   isAiConnectionPoolExhausted,
   aiConnectionPoolRetryAt,
 } = await import("../services/ai-connection-pool.js");
@@ -134,8 +132,7 @@ describe("company AI account pool", () => {
     const error = await aiConnectionService(db).select({ ...input, now }).catch((e: unknown) => e);
     expect(isAiConnectionPoolExhausted(error)).toBe(true);
     expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(120).toISOString());
-    expect(await pool.hasAvailableMember(companyId, "anthropic", now)).toBe(false);
-    expect(await pool.hasAvailableMember(companyId, "anthropic", at(31))).toBe(true);
+    // The second account is free again after 30 minutes; this agent still waits for its own.
     await expect(aiConnectionService(db).select({ ...input, now: at(31) })).rejects.toMatchObject({ details: { code: "ai_connection_pool_exhausted" } });
   });
 
@@ -172,18 +169,6 @@ describe("company AI account pool", () => {
     const summary = await aiConnectionPoolService(db).summary(companyId, "anthropic");
     expect(summary.members.map((m) => m.connectionId)).toEqual([accounts.first.connectionId, accounts.second.connectionId, accounts.api.connectionId]);
     expect(summary.candidates.some((c) => c.connectionId === accounts.foreign.connectionId)).toBe(false);
-  });
-
-  it("maps provider usage windows and applies the threshold per model", () => {
-    const windows = claudeUsageToPoolWindows([
-      { label: "Current session", usedPercent: 20, resetsAt: at(30).toISOString() },
-      { label: "Current week (Opus only)", usedPercent: 96, resetsAt: at(900).toISOString() },
-      { label: "Extra usage", usedPercent: 99, resetsAt: null },
-    ]);
-    expect(windows.map((w) => w.key)).toEqual(["five_hour", "seven_day_opus"]);
-    expect(usageBlockedUntil(windows, "claude-opus-5-5", now)?.toISOString()).toBe(at(900).toISOString());
-    expect(usageBlockedUntil(windows, "claude-sonnet-5-5", now)).toBeNull();
-    expect(usageBlockedUntil([{ key: "five_hour", usedPercent: 99, resetsAt: null }], null, now)?.toISOString()).toBe(at(60).toISOString());
   });
 
   it("lets only connection managers reorder the pool or clear a limit, and logs both", async () => {

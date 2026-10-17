@@ -471,7 +471,9 @@ describe("ssh env-lab fixture", () => {
       },
       command: "node",
       args: ["--version"],
-      env: { FOO: "bar" },
+      // Fork: a known non-secret name rides the command line; any other value
+      // is staged on the host first, which this unreachable host cannot do.
+      env: { PAPERCLIP_RUN_ID: "run-1" },
     });
 
     // The remote script rides the last ssh argument. The SSH target is an

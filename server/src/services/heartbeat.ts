@@ -45,7 +45,7 @@ import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnection
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import { aiConnectionPoolRetryAt, isAiConnectionPoolExhausted } from "./ai-connection-pool.js";
 // Fork: Claude account pool and resource waits (spec v3 §4, §7, §8). The logic lives in these modules.
-import { createHeartbeatAiAccounts, isPersistedNativeRun, ownPoolAttribution, type CredentialPlan } from "./heartbeat-ai-accounts.js";
+import { createHeartbeatAiAccounts, isPersistedNativeRun, isRoutingCheckUnavailable, ownPoolAttribution, type CredentialPlan } from "./heartbeat-ai-accounts.js";
 import { checkNowRateLimitedError, createResourceWaits, isConfigurationRefusal, isResourceWaitDeferral, mergeWakeEpochs, readScheduledRetryResourceWaits, resourceStillUnavailableError, resourceWaitHoldsForIssues, resourceWaitPmNoticeMarkdown, type CheckNowSource, type ResourceWaitWakeFilter, type ResourceWaitWakeOptions } from "./resource-waits/index.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -3453,7 +3453,23 @@ const heartbeatRunListContextColumns = {
   >`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`.as(
     "contextWakeTriggerDetail",
   ),
+  // Fork: the wait a scheduled successor carries, so the run list can name it.
+  contextResourceWait: sql<
+    unknown
+  >`${heartbeatRuns.contextSnapshot} -> 'resourceWait'`.as("contextResourceWait"),
 } as const;
+
+// Fork: the wait a deferred run ended for, so the run list can name it.
+const heartbeatRunListResourceWaitResultColumn = {
+  resultResourceWait: sql<
+    unknown
+  >`${heartbeatRuns.resultJson} -> 'resourceWait'`.as("resultResourceWait"),
+} as const;
+
+/** Fork: a run list row's wait record (an object), or null. */
+function runListResourceWait(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
 
 const heartbeatRunListResultColumns = {
   resultSummary: sql<
@@ -23641,9 +23657,12 @@ export function heartbeatService(
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
       } else if (usePool) {
         // Fork: the realized workspace (scanned on a remote target) must not route the pool credential either.
+        // A scan that could not run on the device is classified like a lease error (spec 7.8), never a refusal.
         await heartbeatAiAccounts.assertRoutingCompatible({
           run, agent, config: { ...resolvedConfig, cwd: executionWorkspace.cwd }, target: executionTarget, checkEnv: false,
-        }).catch(rethrowRefusalAsConfigurationFailure);
+        }).catch(async (error: unknown) => {
+          throw isRoutingCheckUnavailable(error) ? await deviceLeaseError(error) : refusalAsConfigurationFailure(error);
+        });
       }
       const remoteExecution = realizationResult.remoteExecution;
       if (
@@ -31064,6 +31083,7 @@ export function heartbeatService(
                     ...heartbeatRunListColumns,
                     ...heartbeatRunListContextColumns,
                     ...heartbeatRunListResultColumns,
+                    ...heartbeatRunListResourceWaitResultColumn,
                   },
           )
           .from(heartbeatRuns)
@@ -31089,6 +31109,7 @@ export function heartbeatService(
           contextWakeReason,
           contextWakeSource,
           contextWakeTriggerDetail,
+          contextResourceWait,
           resultSummary,
           resultResult,
           resultMessage,
@@ -31096,6 +31117,7 @@ export function heartbeatService(
           resultTotalCostUsd,
           resultCostUsd,
           resultCostUsdCamel,
+          resultResourceWait,
           ...rest
         } = row as typeof row & {
           resultSummary?: string | null;
@@ -31105,32 +31127,37 @@ export function heartbeatService(
           resultTotalCostUsd?: string | null;
           resultCostUsd?: string | null;
           resultCostUsdCamel?: string | null;
+          resultResourceWait?: unknown;
         };
+        const contextSnapshot = summarizeHeartbeatRunContextSnapshot({
+          issueId: contextIssueId,
+          taskId: contextTaskId,
+          taskKey: contextTaskKey,
+          commentId: contextCommentId,
+          wakeCommentId: contextWakeCommentId,
+          wakeReason: contextWakeReason,
+          wakeSource: contextWakeSource,
+          wakeTriggerDetail: contextWakeTriggerDetail,
+        });
+        const resultJson = safeForLegacyEncoding || summary
+          ? null
+          : summarizeHeartbeatRunListResultJson({
+              summary: resultSummary,
+              result: resultResult,
+              message: resultMessage,
+              error: resultError,
+              totalCostUsd: resultTotalCostUsd,
+              costUsd: resultCostUsd,
+              costUsdCamel: resultCostUsdCamel,
+            });
+        // Fork: the waits the run badges name (spec 7.7); the summarizers keep strings only.
+        const waitingFor = runListResourceWait(contextResourceWait);
+        const waitedFor = runListResourceWait(resultResourceWait);
 
         return {
           ...rest,
-          contextSnapshot: summarizeHeartbeatRunContextSnapshot({
-            issueId: contextIssueId,
-            taskId: contextTaskId,
-            taskKey: contextTaskKey,
-            commentId: contextCommentId,
-            wakeCommentId: contextWakeCommentId,
-            wakeReason: contextWakeReason,
-            wakeSource: contextWakeSource,
-            wakeTriggerDetail: contextWakeTriggerDetail,
-          }),
-          resultJson:
-            safeForLegacyEncoding || summary
-              ? null
-              : summarizeHeartbeatRunListResultJson({
-                  summary: resultSummary,
-                  result: resultResult,
-                  message: resultMessage,
-                  error: resultError,
-                  totalCostUsd: resultTotalCostUsd,
-                  costUsd: resultCostUsd,
-                  costUsdCamel: resultCostUsdCamel,
-                }),
+          contextSnapshot: waitingFor ? { ...contextSnapshot, resourceWait: waitingFor } : contextSnapshot,
+          resultJson: waitedFor ? { ...resultJson, resourceWait: waitedFor } : resultJson,
         };
       });
     },

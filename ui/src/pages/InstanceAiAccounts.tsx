@@ -4,13 +4,14 @@ import { ChevronDown, ChevronRight, Plus, ServerCog } from "lucide-react";
 import {
   AI_ACCOUNT_HOST_CREATABLE_KINDS,
   DEVICE_POOL_ACCOUNT_LIMIT,
+  isGoNoGoBlocker,
   isResourceWaitReason,
   type AiAccountHostEnvironmentSummary,
-  type AiAccountHostKind,
   type AiAccountHostSummary,
   type AiAccountMigrationAgentEntry,
   type AiAccountMigrationGoNoGoEntry,
   type AiAccountMigrationReport,
+  type CreateAiAccountHost,
   type ExecutionDeviceDuplicateHint,
   type ExecutionDeviceEnvironmentSummary,
   type InstanceAiAccountSummary,
@@ -1001,7 +1002,9 @@ function MigrationSection({ query }: { query: UseQueryResult<AiAccountMigrationR
 function MigrationReport({ report }: { report: AiAccountMigrationReport }) {
   const summary = report.summary;
   const companyNames = new Map(summary?.agents.map((entry) => [entry.companyId, entry.companyName]) ?? []);
-  const blockers = report.goNoGo.agents.filter((entry) => entry.plan !== "use");
+  const blockers = report.goNoGo.agents.filter(isGoNoGoBlocker);
+  // Fork: an agent whose own account is only at its limit waits for the reset (P7): a warning, not a blocker.
+  const limited = report.goNoGo.agents.filter((entry) => entry.plan !== "use" && !isGoNoGoBlocker(entry));
   const review = summary?.agents.filter((entry) => entry.outcome !== "bound") ?? [];
   const bound = summary?.agents.filter((entry) => entry.outcome === "bound") ?? [];
   return (
@@ -1014,7 +1017,9 @@ function MigrationReport({ report }: { report: AiAccountMigrationReport }) {
           </Badge>
           <span className="text-xs text-muted-foreground">
             {report.goNoGo.go
-              ? "Every Claude agent that ran on the host pool in the last 7 days will use its account."
+              ? limited.length > 0
+                ? "Every Claude agent that ran on the host pool in the last 7 days will use its account; some wait for their account's limit to reset first."
+                : "Every Claude agent that ran on the host pool in the last 7 days will use its account."
               : "Some Claude agents that ran on the host pool in the last 7 days would not use their account."}
           </span>
         </div>
@@ -1030,6 +1035,22 @@ function MigrationReport({ report }: { report: AiAccountMigrationReport }) {
               </li>
             ))}
           </ul>
+        ) : null}
+        {limited.length > 0 ? (
+          <div className="space-y-0.5 text-xs" data-testid="go-no-go-limited">
+            <p className="text-muted-foreground">At their account's limit; they wait for its reset on the same account, which does not block go:</p>
+            <ul className="space-y-0.5">
+              {limited.map((entry) => (
+                <li key={entry.agentId}>
+                  <span className="font-medium">{entry.agentName}</span>
+                  <span className="text-muted-foreground">
+                    {" "}({entry.companyName || companyNames.get(entry.companyId) || "another company"}) {GO_NO_GO_PLAN_TEXT[entry.plan]}
+                    {planReasonText(entry.reason) ? `: ${planReasonText(entry.reason)}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
         ) : null}
       </div>
       {summary ? (
@@ -1205,7 +1226,7 @@ function AddHostDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o
 function AddHostForm({ onDone }: { onDone: () => void }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<AiAccountHostKind>("ssh_host");
+  const [kind, setKind] = useState<CreateAiAccountHost["kind"]>("ssh_host");
   const create = useMutation({
     mutationFn: () => aiAccountHostsApi.createHost({ name: name.trim(), kind }),
     onSuccess: async () => {
@@ -1242,7 +1263,7 @@ function AddHostForm({ onDone }: { onDone: () => void }) {
         <RadioCardGroup
           ariaLabel="Device kind"
           value={kind}
-          onValueChange={(next) => setKind(next as AiAccountHostKind)}
+          onValueChange={(next) => setKind(next as CreateAiAccountHost["kind"])}
           disabled={create.isPending}
           options={AI_ACCOUNT_HOST_CREATABLE_KINDS.map((value) => ({
             value,

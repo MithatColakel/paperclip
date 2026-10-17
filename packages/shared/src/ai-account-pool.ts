@@ -517,8 +517,14 @@ export interface MyAiAccount {
   limitReason: AiAccountLimitReason | null;
   limitSource: AiAccountLimitSource | null;
   lastLimitedAt: string | null;
-  /** Projects the account is reserved for; it is usable only in their companies until the owner clears this. */
+  /**
+   * Projects the account is reserved for, in the caller's companies only; it
+   * is usable only in the companies of its reserved projects until the owner
+   * clears this.
+   */
   reservedProjects: AiAccountProjectSummary[];
+  /** Number of reserved projects in companies the caller is not an active member of. */
+  otherReservedProjects: number;
   /** Bindings in the caller's companies only. */
   usedBy: AiAccountUsedByCompany[];
   /** Number of other companies whose agents use the account. */
@@ -761,6 +767,12 @@ export interface ExecutionDeviceSummary {
   acceptedCredentialTypes: AiAccountCredentialType[] | null;
   duplicateHints: ExecutionDeviceDuplicateHint[];
   waitingCount: number;
+  /**
+   * This company's tasks waiting for the device. The company's device list
+   * carries them, so its page needs no request per device; absent from
+   * servers that predate it.
+   */
+  waits?: ExecutionDeviceWaitSummary[];
 }
 
 export interface ExecutionDeviceDetail extends ExecutionDeviceSummary {
@@ -920,8 +932,9 @@ export interface AiAccountMigrationSummary {
 }
 
 /**
- * Go/no-go: a recently active agent must plan to `use` its account. `none`:
- * its runs would get no pool account and use the device's own login.
+ * Go/no-go: a recently active agent must plan to `use` its account, or only
+ * wait for that account's limit to reset (`isGoNoGoBlocker`). `none`: its runs
+ * would get no pool account and use the device's own login.
  */
 export interface AiAccountMigrationGoNoGoEntry {
   agentId: string;
@@ -931,6 +944,19 @@ export interface AiAccountMigrationGoNoGoEntry {
   companyName?: string;
   plan: "use" | "wait" | "none" | "refuse";
   reason: string | null;
+}
+
+/**
+ * Wait reasons that do not block go: the agent's own account resolved and
+ * passed every other check, and is only at its limit, so its tasks wait for
+ * the reset on that account (P7) and the entry is a warning.
+ */
+export const AI_ACCOUNT_GO_NO_GO_WARNING_REASONS = ["usage_limit", "credit_balance"] as const;
+
+/** True when a go/no-go entry blocks go: any plan but `use`, except a wait for the agent's own account's limit. */
+export function isGoNoGoBlocker(entry: Pick<AiAccountMigrationGoNoGoEntry, "plan" | "reason">): boolean {
+  if (entry.plan === "use") return false;
+  return !(entry.plan === "wait" && (AI_ACCOUNT_GO_NO_GO_WARNING_REASONS as readonly (string | null)[]).includes(entry.reason));
 }
 
 export interface AiAccountMigrationReport {

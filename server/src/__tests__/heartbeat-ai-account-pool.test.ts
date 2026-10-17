@@ -20,7 +20,7 @@ import {
   issues,
   resourceWaitEpisodes,
 } from "@paperclipai/db";
-import { AI_CREDENTIAL_REF_ENV_KEY } from "@paperclipai/shared";
+import { AI_CREDENTIAL_REF_ENV_KEY, readResourceWaitContext } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -30,6 +30,7 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "../adapter
 import { logger } from "../middleware/logger.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { credentialRefForAccount } from "../services/ai-account-credentials.js";
+import { activityService } from "../services/activity.js";
 import { aiAccountPoolService } from "../services/ai-account-pool.js";
 import { aiConnectionPoolService } from "../services/ai-connection-pool.js";
 import { aiConnectionService } from "../services/ai-connections.js";
@@ -73,13 +74,20 @@ vi.mock("@paperclipai/adapter-utils/ssh", async (importOriginal) => ({
 
 // Commands on a remote target never leave this test. The routing guard's
 // settings scans find nothing, and the target's GitHub setup is out of scope.
-const targetStub = vi.hoisted(() => ({ processes: [] as Array<{ command: string; args: string[]; env: unknown }> }));
+// `routingCheck` replaces the routing guard's scan result (an ssh transport failure).
+const targetStub = vi.hoisted(() => ({
+  processes: [] as Array<{ command: string; args: string[]; env: unknown }>,
+  routingCheck: null as { exitCode: number | null; stderr: string } | null,
+}));
 vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@paperclipai/adapter-utils/execution-target")>();
   return {
     ...actual,
     runAdapterExecutionTargetProcess: async (_runId: string, _target: unknown, command: string, args: string[], options?: { env?: unknown }) => {
       targetStub.processes.push({ command, args, env: options?.env });
+      if (targetStub.routingCheck && args[2] === "ai-pool-routing-check") {
+        return { exitCode: targetStub.routingCheck.exitCode, signal: null, timedOut: false, stdout: "", stderr: targetStub.routingCheck.stderr };
+      }
       return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
     },
     prepareGitHubExecutionEnvironment: async (input: Parameters<typeof actual.prepareGitHubExecutionEnvironment>[0]) =>
@@ -167,6 +175,7 @@ describeEmbeddedPostgres("heartbeat Claude account pool (integration)", () => {
     scripts.clear();
     logLines.length = 0;
     targetStub.processes.length = 0;
+    targetStub.routingCheck = null;
     await db.transaction(async (tx) => {
       await tx.execute(sql`set local client_min_messages = warning`);
       await tx.execute(sql`truncate table companies, plugins, ai_account_hosts, ai_accounts, environments, "user" cascade`);
@@ -440,6 +449,37 @@ describeEmbeddedPostgres("heartbeat Claude account pool (integration)", () => {
       expect(targetStub.processes.length).toBeGreaterThan(0);
 
       await expectTokenNowhere(pool.token);
+    }, 60_000);
+
+    it("waits, and never blocks its task, when the routing check on its SSH computer could not connect", async () => {
+      const companyId = await company();
+      const ownerId = await owner(companyId);
+      const pool = await account(ownerId, "Max S");
+      const environment = await sshEnvironment(companyId);
+      const worker = await agent(companyId, { defaultEnvironmentId: environment.id });
+      await bind(worker, pool.id);
+      const task = await issue(companyId, worker.id);
+      // sshd dropped the check's connection in a burst of runs (MaxStartups).
+      targetStub.routingCheck = { exitCode: 255, stderr: "kex_exchange_identification: Connection closed by remote host\r\n" };
+      heartbeat = heartbeatService(db);
+
+      const run = await assign(worker.id, task.id);
+      expect(await finishedRun(run.id)).toMatchObject({ status: "cancelled", errorCode: "environment_unavailable" });
+      const successor = await successorOf(run.id);
+      expect(successor).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "environment_wait" });
+      expect(invocations).toHaveLength(0);
+      const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, task.id));
+      expect(row!.status).not.toBe("blocked");
+      expect((await episodeOf(task.id)).resolution).toBeNull();
+
+      // The run ledger and the agent's run list name the wait (spec 7.7).
+      const throttled = { kind: "environment", reason: "throttled", scope: "admission", environmentId: environment.id };
+      const ledger = await activityService(db).runsForIssue(companyId, task.id);
+      expect(readResourceWaitContext(ledger.find((entry) => entry.runId === run.id)?.resultJson?.resourceWait)).toMatchObject(throttled);
+      expect(readResourceWaitContext(ledger.find((entry) => entry.runId === successor.id)?.contextSnapshot?.resourceWait)).toMatchObject(throttled);
+      const listed = await heartbeat.list(companyId, worker.id);
+      expect(readResourceWaitContext(listed.find((entry) => entry.id === run.id)?.resultJson?.resourceWait)).toMatchObject(throttled);
+      expect(readResourceWaitContext(listed.find((entry) => entry.id === successor.id)?.contextSnapshot?.resourceWait)).toMatchObject(throttled);
     }, 60_000);
 
     it("on the Local environment runs with its pool token and the marker, on the server device", async () => {

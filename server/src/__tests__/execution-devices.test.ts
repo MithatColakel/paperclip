@@ -255,9 +255,9 @@ describeEmbeddedPostgres("execution devices (database)", () => {
 
     it("keys SSH devices as migration 0310 does and names new ones after the environment", async () => {
       // A device whose key the 0310 backfill set.
-      const [mini] = await db.insert(aiAccountHosts).values({ name: "Mini", kind: "mac", externalKey: "ssh:mini.example.com:2222" }).returning();
-      const tunnel = await environment("ssh", { host: " MINI.example.com ", port: "2222", username: "runner" });
-      expect((await deviceForEnvironment(db, tunnel))!.id).toBe(mini!.id);
+      const [tower] = await db.insert(aiAccountHosts).values({ name: "Tower", kind: "mac", externalKey: "ssh:tower.example.com:2222" }).returning();
+      const tunnel = await environment("ssh", { host: " TOWER.example.com ", port: "2222", username: "runner" });
+      expect((await deviceForEnvironment(db, tunnel))!.id).toBe(tower!.id);
 
       const first = await environment("ssh", { host: "Runner.Example.com" });
       const created = await deviceForEnvironment(db, first);
@@ -280,6 +280,25 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       expect(await db.select().from(aiAccountHosts).where(eq(aiAccountHosts.externalKey, "ssh:unseen.example.com:22"))).toEqual([]);
     });
 
+    it("names an SSH device after a shared environment only, so no company sees another's environment name", async () => {
+      const companyA = await company();
+      const companyB = await company();
+      const payroll = await environment("ssh", { host: "shared.example.com" }, { companyId: companyA, name: "Acme payroll box" });
+      const builder = await environment("ssh", { host: "shared.example.com", port: 22 }, { companyId: companyB, name: "B builder" });
+      await agent(companyA, { defaultEnvironmentId: payroll.id });
+      await agent(companyB, { defaultEnvironmentId: builder.id });
+      const created = (await deviceForEnvironment(db, payroll))!;
+      expect(created).toMatchObject({ kind: "ssh_host", externalKey: "ssh:shared.example.com:22", name: "SSH host" });
+      expect((await deviceForEnvironment(db, builder))!.id).toBe(created.id);
+      const forB = await summariesForCompany(db, companyB, { now: new Date() });
+      expect(forB.find((summary) => summary.id === created.id)?.environments.map((entry) => entry.id)).toEqual([builder.id]);
+      expect(JSON.stringify(forB)).not.toContain("Acme payroll box");
+      expect(JSON.stringify(await detailForCompany(db, companyB, created.id, { now: new Date() }))).not.toContain("Acme payroll box");
+      // A second neutral name stays unique with a suffix.
+      const other = await environment("ssh", { host: "second.example.com" }, { companyId: companyA });
+      expect(await deviceForEnvironment(db, other)).toMatchObject({ name: "SSH host (2)" });
+    });
+
     it("lets an explicit mapping win over a derived key", async () => {
       const ssh = await environment("ssh", { host: "runner.example.com" });
       const derived = await deviceForEnvironment(db, ssh);
@@ -297,7 +316,7 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       const result = await upsertPluginTargetByTargetKey(db, {
         pluginId: provider.id,
         provider: "box",
-        target: report({ ownerUserId: ownerId, servedCompanyIds: ["c-1"], aliases: ["Mini.Example.com"] }),
+        target: report({ ownerUserId: ownerId, servedCompanyIds: ["c-1"], aliases: ["Tower.Example.com"] }),
         now,
       });
       expect(result).toMatchObject({ created: true, reclaimed: false });
@@ -311,7 +330,7 @@ describeEmbeddedPostgres("execution devices (database)", () => {
         ownerUserId: ownerId,
         ownerSource: "plugin",
       });
-      expect(result.state).toMatchObject({ state: "available", servedCompanyIds: ["c-1"], aliases: ["mini.example.com"], acceptedCredentialTypes: ["subscription", "api_key"] });
+      expect(result.state).toMatchObject({ state: "available", servedCompanyIds: ["c-1"], aliases: ["tower.example.com"], acceptedCredentialTypes: ["subscription", "api_key"] });
 
       const sandbox = await environment("sandbox", { provider: "box", deviceId: "d-1", reuseLease: true });
       const other = await environment("sandbox", { provider: "box", deviceId: "d-2" });
@@ -511,11 +530,11 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       const companyId = await company();
       const builder = await agent(companyId);
       const provider = await plugin("box");
-      const [tunnel] = await db.insert(aiAccountHosts).values({ name: "Mini", kind: "mac", externalKey: "ssh:mini.example.com:22" }).returning();
+      const [tunnel] = await db.insert(aiAccountHosts).values({ name: "Tower", kind: "mac", externalKey: "ssh:tower.example.com:22" }).returning();
       const external = (await upsertPluginTargetByTargetKey(db, {
         pluginId: provider.id,
         provider: "box",
-        target: report({ aliases: ["mini.example.com"] }),
+        target: report({ aliases: ["tower.example.com"] }),
         now,
       })).device;
       const mappedSandbox = await environment("sandbox", { provider: "box", deviceId: "d-9" });
@@ -541,8 +560,8 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       expect(linked.device).toMatchObject({
         id: tunnel!.id,
         kind: "mac",
-        name: "Mini",
-        externalKey: "ssh:mini.example.com:22",
+        name: "Tower",
+        externalKey: "ssh:tower.example.com:22",
         targetKey: pluginTargetKey(provider.id, "box", "d-1"),
         targetProvider: "box",
         targetMatch: { deviceId: "d-1" },
@@ -597,22 +616,22 @@ describeEmbeddedPostgres("execution devices (database)", () => {
 
     it("flags an external device whose alias or label matches an SSH device as a likely duplicate", async () => {
       const provider = await plugin("box");
-      const [mini] = await db.insert(aiAccountHosts).values({ name: "Mini", kind: "mac", externalKey: "ssh:mini.example.com:22" }).returning();
-      const studioEnvironment = await environment("ssh", { host: "10.0.0.7" }, { name: "Studio" });
-      const studio = (await deviceForEnvironment(db, studioEnvironment))!;
-      const byAlias = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ aliases: ["mini.example.com"] }), now })).device;
-      const byLabel = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ targetKey: "d-2", label: "studio", configMatch: { deviceId: "d-2" } }), now })).device;
-      const gone = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ targetKey: "d-3", label: "Studio", configMatch: { deviceId: "d-3" }, retired: true }), now })).device;
+      const [tower] = await db.insert(aiAccountHosts).values({ name: "Tower", kind: "mac", externalKey: "ssh:tower.example.com:22" }).returning();
+      const workstationEnvironment = await environment("ssh", { host: "10.0.0.7" }, { name: "Workstation" });
+      const workstation = (await deviceForEnvironment(db, workstationEnvironment))!;
+      const byAlias = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ aliases: ["tower.example.com"] }), now })).device;
+      const byLabel = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ targetKey: "d-2", label: "workstation", configMatch: { deviceId: "d-2" } }), now })).device;
+      const gone = (await upsertPluginTargetByTargetKey(db, { pluginId: provider.id, provider: "box", target: report({ targetKey: "d-3", label: "Workstation", configMatch: { deviceId: "d-3" }, retired: true }), now })).device;
       const hints = await likelyDuplicates(db);
-      expect(hints.get(byAlias.id)).toEqual([{ deviceId: mini!.id, deviceName: "Mini", matchedBy: "alias" }]);
-      expect(hints.get(mini!.id)).toEqual([{ deviceId: byAlias.id, deviceName: byAlias.name, matchedBy: "alias" }]);
-      expect(hints.get(byLabel.id)).toEqual([{ deviceId: studio.id, deviceName: studio.name, matchedBy: "label" }]);
+      expect(hints.get(byAlias.id)).toEqual([{ deviceId: tower!.id, deviceName: "Tower", matchedBy: "alias" }]);
+      expect(hints.get(tower!.id)).toEqual([{ deviceId: byAlias.id, deviceName: byAlias.name, matchedBy: "alias" }]);
+      expect(hints.get(byLabel.id)).toEqual([{ deviceId: workstation.id, deviceName: workstation.name, matchedBy: "label" }]);
       expect(hints.get(gone.id)).toBeUndefined();
       // Once linked, the machine is no longer suggested.
-      await linkTarget(db, mini!.id, { pluginId: provider.id, provider: "box", targetKey: "d-1" });
+      await linkTarget(db, tower!.id, { pluginId: provider.id, provider: "box", targetKey: "d-1" });
       const after = await likelyDuplicates(db);
-      expect(after.get(mini!.id)).toBeUndefined();
-      expect(after.get(studio.id)).toEqual([{ deviceId: byLabel.id, deviceName: byLabel.name, matchedBy: "label" }]);
+      expect(after.get(tower!.id)).toBeUndefined();
+      expect(after.get(workstation.id)).toEqual([{ deviceId: byLabel.id, deviceName: byLabel.name, matchedBy: "label" }]);
     });
   });
 
@@ -713,7 +732,7 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       expect(await registry.markUnavailable(deleted, { reason: "offline", source: "lease_error", now })).toBeNull();
       expect(await registry.bumpEpoch([deleted], { now })).toEqual(new Map());
       expect(await registry.markRetired([deleted], { now })).toEqual([]);
-      const [retired] = await registry.markRetired([ssh.id], { label: "Old mini", message: "Removed from the fleet", now });
+      const [retired] = await registry.markRetired([ssh.id], { label: "Old tower", message: "Removed from service", now });
       expect(retired).toMatchObject({ previousState: null, state: "retired", becameRetired: true });
       expect(await registry.markUnavailable(ssh.id, { reason: "offline", source: "lease_error", now })).toBeNull();
       expect(await registry.recordCheckFailure(ssh.id, { now })).toBeNull();
@@ -724,7 +743,7 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       // Only a report brings the target back.
       const [back] = await registry.applyTargetState([ssh.id], { state: "available", acceptedCredentialTypes: ["subscription"] }, { now });
       expect(back).toMatchObject({ previousState: "retired", state: "available", becameAvailable: true, acceptedCredentialTypesChanged: true });
-      expect(back!.row).toMatchObject({ label: "Old mini", acceptedCredentialTypes: ["subscription"], checkFailures: 0, nextCheckAt: null });
+      expect(back!.row).toMatchObject({ label: "Old tower", acceptedCredentialTypes: ["subscription"], checkFailures: 0, nextCheckAt: null });
     });
 
     it("deletes a row only once no open environment wait references it", async () => {
@@ -865,7 +884,8 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       const serverForB = forB.find((summary) => summary.id === server.id)!;
       expect(serverForB).toMatchObject({ inUse: 2, otherCompaniesAccounts: 1, waitingCount: 0 });
       expect(serverForB.accounts.map((entry) => entry.label)).toEqual(["Bravo private label"]);
-      expect(forB.find((summary) => summary.id === bravoDevice.id)).toMatchObject({ name: `SSH · ${bravoHost.name}`, inUse: 0, ownLoginAgents: 1 });
+      // Company B's own environment does not name the device.
+      expect(forB.find((summary) => summary.id === bravoDevice.id)).toMatchObject({ name: "SSH host", inUse: 0, ownLoginAgents: 1 });
       expect(JSON.stringify(forB)).not.toContain("Alpha secret label");
       expect(await detailForCompany(db, companyB, pluginDevice.id, { now })).toBeNull();
 
@@ -880,6 +900,9 @@ describeEmbeddedPostgres("execution devices (database)", () => {
         reason: "slots_full",
         since: now.toISOString(),
       })]);
+      // The list carries each device's waits of the company, so the page needs no request per device.
+      expect(serverForA.waits).toEqual(detail.waits);
+      expect(serverForB.waits).toEqual([]);
 
       const instance = await summariesForInstance(db, { now });
       const serverForInstance = instance.find((summary) => summary.id === server.id)!;

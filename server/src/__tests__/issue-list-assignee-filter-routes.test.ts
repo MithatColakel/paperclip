@@ -4,6 +4,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants } from "@paperclipai/db";
+import { buildResourceWaitContext } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -147,6 +148,86 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.map((issue: { id: string }) => issue.id)).toEqual([unassignedIssueId]);
+  });
+
+  it("puts a waiting task's device wait on its list row, compact and full, and no other retry", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const waitingIssueId = randomUUID();
+    const retryingIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Builder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: waitingIssueId, companyId, title: "Waiting task", status: "in_progress", priority: "medium", assigneeAgentId: agentId },
+      { id: retryingIssueId, companyId, title: "Retrying task", status: "in_progress", priority: "medium", assigneeAgentId: agentId },
+    ]);
+    const wait = buildResourceWaitContext({
+      episodeId: randomUUID(),
+      kind: "environment",
+      reason: "offline",
+      scope: "target",
+      environmentId: randomUUID(),
+      environmentName: "Build env",
+      deviceId: randomUUID(),
+      deviceName: "Build box",
+      accountId: null,
+      accountLabel: null,
+      resumeAt: null,
+      resumeAtSource: null,
+      message: null,
+    });
+    const waitingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: waitingRunId,
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        scheduledRetryReason: "environment_wait",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60_000),
+        contextSnapshot: { issueId: waitingIssueId, resourceWait: wait },
+      },
+      {
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        scheduledRetryReason: "transient_failure",
+        scheduledRetryAt: new Date(Date.now() + 5 * 60_000),
+        contextSnapshot: { issueId: retryingIssueId },
+      },
+    ]);
+
+    const app = createApp(companyId);
+    for (const query of [{ view: "compact", limit: "20" }, { limit: "20" }]) {
+      const res = await request(app).get(`/api/companies/${companyId}/issues`).query(query);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const waiting = res.body.find((issue: { id: string }) => issue.id === waitingIssueId);
+      expect(waiting?.scheduledRetry).toMatchObject({
+        runId: waitingRunId,
+        status: "scheduled_retry",
+        scheduledRetryReason: "environment_wait",
+        resourceWait: { kind: "environment", reason: "offline", deviceName: "Build box" },
+      });
+      const retrying = res.body.find((issue: { id: string }) => issue.id === retryingIssueId);
+      expect(retrying).toBeDefined();
+      expect(retrying).not.toHaveProperty("scheduledRetry");
+    }
   });
 
   it("returns compact issue list rows with recovery chips but without detail-only fields", async () => {

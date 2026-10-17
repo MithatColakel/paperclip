@@ -195,7 +195,7 @@ function DeviceCard({
   const checkNow = useMutation({
     mutationFn: () => executionDevicesApi.checkNow(companyId, device.id),
     onSuccess: async (result) => {
-      queryClient.setQueryData(executionDeviceKeys.detail(companyId, device.id), result.device);
+      queryClient.setQueryData([...executionDeviceKeys.detail(companyId, device.id), result.device.waitingCount], result.device);
       await queryClient.invalidateQueries({ queryKey: executionDeviceKeys.company(companyId), exact: true });
     },
   });
@@ -315,23 +315,26 @@ function DeviceCard({
 }
 
 function DeviceWaits({ companyId, device }: { companyId: string; device: ExecutionDeviceSummary }) {
+  // Fork: the polled device list carries the waits; only a server without them is asked
+  // per device, once, and again when the waiting count changes, never on a timer.
+  const listed = device.waits;
   const detail = useQuery({
-    queryKey: executionDeviceKeys.detail(companyId, device.id),
+    queryKey: [...executionDeviceKeys.detail(companyId, device.id), device.waitingCount],
     queryFn: () => executionDevicesApi.get(companyId, device.id),
     retry: false,
-    refetchInterval: DEVICE_POLL_MS,
+    enabled: listed === undefined,
   });
   const title = `Waiting tasks (${device.waitingCount})`;
   return (
     <div className="space-y-1" aria-label={title} role="group">
       <p className="text-xs font-medium">{title}</p>
-      {detail.isLoading ? (
+      {listed === undefined && detail.isLoading ? (
         <p className="text-xs text-muted-foreground">Loading waiting tasks…</p>
-      ) : detail.error ? (
+      ) : listed === undefined && detail.error ? (
         <p role="alert" className="text-xs text-destructive">{aiAccountPoolErrorMessage(detail.error)}</p>
       ) : (
         <ul className="space-y-0.5 text-xs">
-          {(detail.data?.waits ?? []).map((wait) => <DeviceWaitRow key={wait.runId} wait={wait} />)}
+          {(listed ?? detail.data?.waits ?? []).map((wait) => <DeviceWaitRow key={wait.runId} wait={wait} />)}
         </ul>
       )}
     </div>

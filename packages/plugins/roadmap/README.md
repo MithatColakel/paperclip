@@ -113,7 +113,7 @@ Then open `http://localhost:3100/<COMPANY-PREFIX>/roadmap`. The host watches loc
 
 ## Deploy
 
-The plugin deploys the same way as Mac Fleet: a tarball unpacked into the server's data volume and installed from a local path.
+The plugin deploys the same way as the fork's other local-path plugins: a tarball unpacked into the server's data volume and installed from a local path.
 
 1. Pack it: `packages/plugins/roadmap/scripts/pack-deploy.sh`. This writes `dist-deploy/roadmap-plugin-<version>.tgz`, which contains a top-level `roadmap/` directory.
 2. Copy the tarball to the server and unpack it inside the Paperclip container into `/paperclip/plugin-sources/roadmap`. Keep the previous build as `roadmap.prev`, and make the files readable by the container's `node` user.

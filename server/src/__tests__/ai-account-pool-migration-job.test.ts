@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate as migrateLegacy } from "drizzle-orm/postgres-js/migrator";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -27,6 +27,7 @@ import {
   environments,
   heartbeatRuns,
   issues,
+  plugins,
   projects,
 } from "@paperclipai/db";
 import { AI_ACCOUNT_BINDING_MIGRATION_KEY } from "@paperclipai/shared";
@@ -45,6 +46,7 @@ import {
 } from "../services/ai-account-pool-migration.js";
 import { aiConnectionPoolService } from "../services/ai-connection-pool.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { upsertPluginTargetByTargetKey } from "../services/execution-devices.js";
 
 // Fork: the Claude account binding backfill (spec 15.3, D7), its report and
 // go/no-go, and the read-only pre-deploy report SQL (spec 15.1).
@@ -615,6 +617,67 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
       expect((await summaryOf())?.agents.map((entry) => entry.agentName)).toEqual(["Bound", "Late"]);
     });
 
+    it("gives an account on a re-run to a row boot left unassigned before a plugin reported its device, and leaves touched rows", async () => {
+      const { companyId, server } = await serverWorld();
+      const used = await account("owner", { hostId: server.id, label: "Used" });
+      // A project runs on a sandbox environment whose device only the provider's plugin reports, after boot.
+      const pluginKey = `test.remote-box.${tag()}`;
+      const [plugin] = await db.insert(plugins).values({
+        pluginKey,
+        packageName: pluginKey,
+        version: "1.0.0",
+        status: "ready",
+        manifestJson: { id: pluginKey, displayName: "Remote box", environmentDrivers: [{ driverKey: "remote-box", kind: "sandbox_provider", displayName: "Remote box" }] } as never,
+      }).returning();
+      const [sandbox] = await db.insert(environments).values({ name: "Studio box", driver: "sandbox", config: { provider: "remote-box", deviceId: "d-1" } }).returning();
+      await db.insert(projects).values({ companyId, name: "App", defaultEnvironmentId: sandbox!.id });
+      const unpinned = await agent(companyId, { name: "Unpinned", createdAt: daysAgo(6) });
+      await hostPoolRuns(unpinned, used, server, "shared", 3, { days: 1 });
+      const reviewed = await agent(companyId, { name: "Reviewed", createdAt: daysAgo(5) });
+      await hostPoolRuns(reviewed, used, server, "shared", 1, { days: 1 });
+
+      // Boot: the sandbox environment has no device yet, so the agents wait unassigned.
+      expect(await migrate()).toMatchObject({ status: "completed", added: 2 });
+      expect(await bindingOf(unpinned.id)).toMatchObject({
+        mode: "pool_account",
+        accountId: null,
+        migrationNote: expect.stringContaining("the environment \"Studio box\""),
+      });
+      expect(await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" })).toMatchObject({ go: false });
+      // A company admin reviewed one row as it is: a re-run leaves it.
+      await db.update(aiAccountAgentBindings).set({ reviewedAt: new Date() }).where(eq(aiAccountAgentBindings.agentId, reviewed.id));
+      // Before the plugin reports, a re-run changes nothing.
+      expect(await migrate({ force: true })).toMatchObject({ status: "completed", added: 0 });
+      expect(await bindingOf(unpinned.id)).toMatchObject({ accountId: null });
+
+      // The plugin reports the device; the instance admin runs the job again.
+      await upsertPluginTargetByTargetKey(db, {
+        pluginId: plugin!.id,
+        provider: "remote-box",
+        target: { targetKey: "d-1", label: "Studio", configMatch: { deviceId: "d-1" }, state: "available", acceptedCredentialTypes: ["subscription"] },
+      });
+      const rerun = await migrate({ force: true });
+      expect(rerun).toMatchObject({ status: "completed", added: 1 });
+      expect(await bindingOf(unpinned.id)).toMatchObject({
+        mode: "pool_account",
+        accountId: used.id,
+        source: "migrated_host_pool",
+        reviewedAt: null,
+        migrationNote: "Chosen because this agent used it most in the last 45 days (3 runs).",
+      });
+      expect(await bindingOf(reviewed.id)).toMatchObject({ accountId: null });
+      if (rerun.status !== "completed") throw new Error("the re-run should complete");
+      expect(rerun.summary.agents.map((entry) => [entry.agentName, entry.outcome])).toEqual([["Unpinned", "bound"], ["Reviewed", "unassigned"]]);
+      const [logged] = await db.select().from(activityLog)
+        .where(and(eq(activityLog.entityId, unpinned.id), eq(activityLog.action, "ai_account.binding_updated")))
+        .orderBy(desc(activityLog.createdAt))
+        .limit(1);
+      expect(logged?.details).toMatchObject({ accountId: used.id, previousMode: "pool_account" });
+      expect((await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" })).agents).toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: unpinned.id, plan: "use" }),
+      ]));
+    });
+
     it("marks a failed run and never throws, so boot continues; the next boot completes", async () => {
       const { companyId, server } = await serverWorld();
       const used = await account("owner", { hostId: server.id, label: "Used" });
@@ -794,6 +857,33 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
       });
     });
 
+    it("stays go while a correctly bound agent's account is at its limit, listing it as a wait for the reset", async () => {
+      const { companyId, server } = await serverWorld();
+      const limited = await account("owner", { hostId: server.id, label: "Max B" });
+      const web = await agent(companyId, { name: "Web dev", createdAt: daysAgo(6) });
+      await hostPoolRuns(web, limited, server, "shared", 2, { days: 1 });
+      const credit = await account("owner", { hostId: server.id, label: "API key", credentialType: "api_key" });
+      const billing = await agent(companyId, { name: "Billing", createdAt: daysAgo(5) });
+      await hostPoolRuns(billing, credit, server, "shared", 1, { days: 1 });
+      expect(await migrate()).toMatchObject({ status: "completed", added: 2 });
+      expect(await bindingOf(web.id)).toMatchObject({ accountId: limited.id, source: "migrated_host_pool" });
+      // An hour ago the account hit its 5-hour window, and the API key ran out of credit.
+      await db.update(aiAccounts).set({ exhaustedUntil: new Date(Date.now() + 2 * 60 * 60_000), limitReason: "provider_quota" }).where(eq(aiAccounts.id, limited.id));
+      await db.update(aiAccounts).set({ exhaustedUntil: new Date(Date.now() + 20 * 60 * 60_000), limitReason: "credit_balance" }).where(eq(aiAccounts.id, credit.id));
+
+      const goNoGo = await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" });
+      expect(goNoGo).toEqual({
+        go: true,
+        agents: [
+          { agentId: web.id, agentName: "Web dev", companyId, companyName: "Acme", plan: "wait", reason: "usage_limit" },
+          { agentId: billing.id, agentName: "Billing", companyId, companyName: "Acme", plan: "wait", reason: "credit_balance" },
+        ],
+      });
+      // Any other wait still blocks go.
+      await db.update(aiAccounts).set({ status: "auth_failed" }).where(eq(aiAccounts.id, limited.id));
+      expect((await aiAccountMigrationGoNoGo(db, { deploymentMode: "authenticated" })).go).toBe(false);
+    });
+
     it("lists an agent set to its device's own login as none, never as go, and names every agent's company", async () => {
       const { companyId, server } = await serverWorld();
       const used = await account("owner", { hostId: server.id, label: "Used" });
@@ -873,6 +963,11 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
         await legacy.execute(sql`INSERT INTO ai_accounts (id, host_id, credential_type, label, email_hint, credential_material, credential_fingerprint, created_by_user_id)
           VALUES (${accountId}, ${hostId}, 'subscription', 'Max', 'Shared@Example.com', ${JSON.stringify({ ciphertext: "legacy-cipher-text" })}::jsonb, 'legacy-fingerprint', 'creator')`);
         await legacy.execute(sql`INSERT INTO ai_account_projects (account_id, project_id) VALUES (${accountId}, ${projectId})`);
+        // A project on a plugin's sandbox environment, which has no device until the plugin reports.
+        const sandboxId = randomUUID();
+        await legacy.execute(sql`INSERT INTO environments (id, name, driver, config)
+          VALUES (${sandboxId}, 'Studio box', 'sandbox', ${JSON.stringify({ provider: "remote-box", deviceId: "d-1" })}::jsonb)`);
+        await legacy.execute(sql`INSERT INTO projects (id, company_id, name, default_environment_id) VALUES (${randomUUID()}, ${companyId}, 'App', ${sandboxId})`);
         for (const scope of ["project", "shared", "overflow"]) {
           await legacy.execute(sql`INSERT INTO heartbeat_runs (company_id, agent_id, status, created_at, context_snapshot)
             VALUES (${companyId}, ${agentId}, 'succeeded', now() - interval '2 days',
@@ -895,6 +990,7 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
         expect(sectionRows(before, "5 ")).toEqual([expect.objectContaining({ agent: "Builder", account: "Max", runs: 2 })]);
         // The creator is a member of no company, so the agents using the account would wait.
         expect(sectionRows(before, "8 ")).toEqual([expect.objectContaining({ company: "Acme", account: "Max", problem: "its owner is not an active member of this company" })]);
+        expect(sectionRows(before, "9 ")).toEqual([expect.objectContaining({ provider: "remote-box", environment: "Studio box", pinned_agents: null, project_defaults: "App (Acme)" })]);
         expect(sectionRows(before, "10 ")).toEqual([expect.objectContaining({ agent: "Builder", host_pool_runs: 3 })]);
         expect(JSON.stringify(before)).not.toMatch(/legacy-cipher-text|legacy-fingerprint/);
         // Nothing was written.

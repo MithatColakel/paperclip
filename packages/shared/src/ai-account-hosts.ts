@@ -128,8 +128,6 @@ export interface AiAccountHostsResponse {
   hosts: AiAccountHostSummary[];
   /** Environments not mapped to any host; their runs keep their own env credentials. */
   unmappedEnvironments: AiAccountHostEnvironmentSummary[];
-  /** Every active project on the instance, for reserving accounts. */
-  projects: AiAccountProjectSummary[];
   maxAccountsPerHost: number;
 }
 
@@ -150,11 +148,11 @@ const trimmed = z.string().trim();
 
 export const createAiAccountHostSchema = z.object({
   name: trimmed.min(1).max(80),
-  // Fork: the type keeps every kind so existing callers compile; `external` is refused.
-  kind: z.enum(AI_ACCOUNT_HOST_KINDS).refine(
-    (kind) => (AI_ACCOUNT_HOST_CREATABLE_KINDS as readonly string[]).includes(kind),
-    "Plugin devices come only from their environment driver plugin's reports",
-  ),
+  kind: z.enum(AI_ACCOUNT_HOST_CREATABLE_KINDS, {
+    error: (issue) => issue.input === "external"
+      ? "Plugin devices come only from their environment driver plugin's reports"
+      : undefined,
+  }),
   maxAccounts: z.number().int().min(1).max(MAX_AI_ACCOUNTS_PER_HOST).optional(),
   overflowToOtherAccounts: z.boolean().optional(),
 }).strict();
@@ -171,49 +169,3 @@ export const setAiAccountHostEnvironmentsSchema = z.object({
   environmentIds: z.array(z.string().uuid()).max(200),
 }).strict();
 export type SetAiAccountHostEnvironments = z.infer<typeof setAiAccountHostEnvironmentsSchema>;
-
-/**
- * Add a credential to a host. Exactly one source: a pasted value, the
- * server's own `CLAUDE_CODE_OAUTH_TOKEN`, or the caller's own saved Claude
- * connection in one of their companies. Imports move the value server-side,
- * so it never travels back to the browser.
- */
-export const createAiAccountSchema = z.object({
-  label: trimmed.min(1).max(80),
-  emailHint: trimmed.min(3).max(200).nullable().optional(),
-  plan: trimmed.min(1).max(40).nullable().optional(),
-  poolEnabled: z.boolean().optional(),
-  credentialType: z.enum(AI_ACCOUNT_CREDENTIAL_TYPES),
-  value: z.string().trim().min(20).max(4000).optional(),
-  importFrom: z.union([
-    z.object({ kind: z.literal("server_env") }).strict(),
-    z.object({ kind: z.literal("ai_connection"), companyId: z.string().uuid(), connectionId: z.string().uuid() }).strict(),
-  ]).optional(),
-}).strict().superRefine((value, ctx) => {
-  if (Boolean(value.value) === Boolean(value.importFrom)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Give either a value or an import source", path: ["value"] });
-  }
-  if (value.value && value.credentialType === "subscription" && !value.value.startsWith("sk-ant-oat")) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "A subscription token from `claude setup-token` starts with sk-ant-oat", path: ["value"] });
-  }
-  if (value.value && value.credentialType === "api_key" && !value.value.startsWith("sk-ant-api")) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "A Claude Console API key starts with sk-ant-api", path: ["value"] });
-  }
-});
-export type CreateAiAccount = z.infer<typeof createAiAccountSchema>;
-
-export const updateAiAccountSchema = z.object({
-  label: trimmed.min(1).max(80).optional(),
-  emailHint: trimmed.min(3).max(200).nullable().optional(),
-  plan: trimmed.min(1).max(40).nullable().optional(),
-  poolEnabled: z.boolean().optional(),
-  /** Back to `active` after a sign-in failure was fixed, or `disabled` to keep it out of the pool. */
-  status: z.enum(["active", "disabled"]).optional(),
-}).strict();
-export type UpdateAiAccount = z.infer<typeof updateAiAccountSchema>;
-
-/** Reserve an account for projects; an empty list makes it shared again. */
-export const setAiAccountProjectsSchema = z.object({
-  projectIds: z.array(z.string().uuid()).max(200),
-}).strict();
-export type SetAiAccountProjects = z.infer<typeof setAiAccountProjectsSchema>;

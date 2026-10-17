@@ -709,6 +709,49 @@ describe("IssueRunLedger resource waits (fork)", () => {
     expect(container.textContent).not.toContain("Automatic retry scheduled");
   });
 
+  it("names the wait from the rows the issue runs route sends", () => {
+    // The route keeps only the wait of a deferral's result, with null fields stripped,
+    // and only the wait of a successor's context.
+    const stripped = Object.fromEntries(Object.entries(offline).filter(([, value]) => value !== null));
+    renderLedger({
+      runs: [
+        createRun({
+          runId: "run-waiting",
+          status: "scheduled_retry",
+          startedAt: null,
+          finishedAt: null,
+          createdAt: "2026-04-18T19:50:00.000Z",
+          livenessState: null,
+          livenessReason: null,
+          lastUsefulActionAt: null,
+          retryOfRunId: "run-deferral-1",
+          scheduledRetryAt: "2026-04-18T20:01:00.000Z",
+          scheduledRetryAttempt: 2,
+          scheduledRetryReason: "environment_wait",
+          contextSnapshot: { resourceWait: offline },
+        }),
+        createRun({
+          runId: "run-deferral-1",
+          status: "cancelled",
+          errorCode: "environment_unavailable",
+          startedAt: "2026-04-18T19:30:00.000Z",
+          finishedAt: "2026-04-18T19:30:00.000Z",
+          createdAt: "2026-04-18T19:30:00.000Z",
+          livenessState: null,
+          livenessReason: null,
+          lastUsefulActionAt: null,
+          resultJson: { resourceWait: stripped },
+        }),
+        earlier,
+      ],
+    });
+
+    const entries = container.querySelectorAll('[data-testid="run-ledger-resource-wait"]');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].textContent).toContain("Waiting: device offline");
+    expect(entries[0].textContent).toContain("Waiting for device Build box (offline)");
+  });
+
   it("shows a finished wait as waited, next to the run that resumed", () => {
     renderLedger({
       runs: [

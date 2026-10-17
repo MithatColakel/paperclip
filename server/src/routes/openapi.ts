@@ -11125,7 +11125,7 @@ registerForkRoute({
   tags: ["execution-devices"],
   summary: "Change a company's wait notice settings",
   description:
-    "Company admins only. A partial update: keys left out keep their value, and an empty body changes nothing. Logged " +
+    "Company admins only. A partial update: keys left out keep their value, and an empty body keeps every value. Logged " +
     "as `company.execution_wait_settings_updated`. Answers with the full settings.",
   body: updateExecutionWaitSettingsSchema,
   responses: { 200: sharedBody("ExecutionWaitSettings"), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
@@ -11211,7 +11211,7 @@ registerForkRoute({
   summary: "Add an execution device (instance admin)",
   description:
     "Any kind but `external`: a plugin device comes only from its environment driver plugin's reports. Adding a " +
-    "device logs nothing: no agent uses it before an environment is mapped to it.",
+    "device writes no activity: no agent uses it before an environment is mapped to it.",
   body: createAiAccountHostSchema,
   responses: {
     201: r.ok(),
@@ -11229,7 +11229,7 @@ registerForkRoute({
   summary: "Rename a device or change its account limit (instance admin)",
   description:
     "A changed limit re-checks the device's over-limit flag and wakes its waits. Logged as `execution_device.updated` " +
-    "in the companies whose agents use the device; a request that changes nothing logs nothing. A malformed id " +
+    "in the companies whose agents use the device; a request that changes no field writes no activity. A malformed id " +
     "answers 404.",
   body: updateAiAccountHostSchema,
   responses: {
@@ -11265,7 +11265,7 @@ registerForkRoute({
   description:
     "An environment listed here moves off any other device. Each environment's driver must suit the device kind: the " +
     "server takes `local`, an SSH host `ssh`, a computer `ssh` and `sandbox`, a plugin device `sandbox`. The edit is one locked " +
-    "transaction and writes nothing when it is refused. Logged as `execution_device.updated` in the companies that " +
+    "transaction and is not saved when it is refused. Logged as `execution_device.updated` in the companies that " +
     "used the device before or after; other companies' environments are a count. Answers `{ host, environments }`. " +
     "A malformed id answers 404.",
   body: setAiAccountHostEnvironmentsSchema,

@@ -81,7 +81,7 @@ function seededHarness() {
     issue({ id: "foreign", companyId: OTHER_COMPANY, status: "todo", labelNames: ["v:mvp"] }),
   ];
   harness.seed({
-    projects: [project("project-app", "Cleanio iOS"), project("project-web", "Website"), project("project-old", "Old", { archivedAt: daysAgo(100) } as Partial<Project>)],
+    projects: [project("project-app", "Acme iOS"), project("project-web", "Website"), project("project-old", "Old", { archivedAt: daysAgo(100) } as Partial<Project>)],
     agents,
     issues,
   });
@@ -120,7 +120,7 @@ describe("roadmap.snapshot", () => {
   it("builds the project flow with lanes in order", async () => {
     const snapshot = await harness.getData<RoadmapSnapshot>(DATA_KEYS.snapshot, { companyId: COMPANY, projectId: "project-app" });
     expect(snapshot.mode).toBe("project");
-    expect(snapshot.projects.map((entry) => entry.name)).toEqual(["Cleanio iOS", "Old", "Website"]);
+    expect(snapshot.projects.map((entry) => entry.name)).toEqual(["Acme iOS", "Old", "Website"]);
     const roadmap = snapshot.roadmap;
     expect(roadmap?.lanes.map((lane) => lane.id)).toEqual(["hotfix", "version:mvp", "version:1.0", "ongoing", "release-ops"]);
     const mvp = roadmap?.lanes.find((lane) => lane.id === "version:mvp") as VersionLane;
@@ -145,7 +145,7 @@ describe("roadmap.snapshot", () => {
     expect(snapshot.roadmap).toBeNull();
     const summaries = snapshot.overview?.projects ?? [];
     // The archived project without tasks is left out.
-    expect(summaries.map((summary) => summary.project.name)).toEqual(["Cleanio iOS", "Website"]);
+    expect(summaries.map((summary) => summary.project.name)).toEqual(["Acme iOS", "Website"]);
     expect(summaries[0]).toMatchObject({ currentVersionKey: "mvp", hotfixOpen: 1, ongoingOpen: 1, releaseOpsOpen: 1, epicCount: 1 });
     expect(summaries[0]?.routines).toEqual({ count: 1, failing: 0 });
     expect(summaries[1]?.versions.map((version) => version.key)).toEqual(["web-1.0"]);
@@ -309,7 +309,7 @@ function priorityFirstHost(issues: Issue[], projects: Project[]) {
 }
 
 describe("reading tasks like the host lists them", () => {
-  const projects = [project("project-app", "Cleanio iOS"), project("project-web", "Website"), project("project-wiki", "LLM Wiki")];
+  const projects = [project("project-app", "Acme iOS"), project("project-web", "Website"), project("project-wiki", "LLM Wiki")];
 
   it("leaves plugin operations out of the project view and the overview alike", async () => {
     const issues = [
@@ -405,7 +405,7 @@ describe("task chip and board agree", () => {
       issue({ id: "cross", parentId: "web-parent", status: "todo" }),
       issue({ id: "case", status: "todo", labelNames: ["v:MVP"] }),
     ];
-    const { host } = priorityFirstHost(issues, [project("project-app", "Cleanio iOS"), project("project-web", "Website")]);
+    const { host } = priorityFirstHost(issues, [project("project-app", "Acme iOS"), project("project-web", "Website")]);
     const snapshot = await buildSnapshot(host, { companyId: COMPANY, projectId: "project-app", cardLimit: 40, refreshToken: null });
     const laneOf = new Map<string, string>();
     for (const lane of snapshot.roadmap?.lanes ?? []) {

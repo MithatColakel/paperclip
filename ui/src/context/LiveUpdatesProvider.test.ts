@@ -14,6 +14,8 @@ import { describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
+import { aiAccountPoolKeys } from "../api/ai-account-pool";
+import { executionDeviceKeys } from "../api/execution-devices";
 
 describe("LiveUpdatesProvider issue invalidation", () => {
   it.each([
@@ -1645,4 +1647,38 @@ describe("LiveUpdatesProvider resource waits (fork)", () => {
       runId: "other-run", agentId: "agent-1", status: "cancelled", errorCode: "cancelled_by_user",
     }, () => "Coder")).not.toBeNull();
   });
+});
+
+describe("LiveUpdatesProvider account pool refresh (fork)", () => {
+  const poolKeys = [aiAccountPoolKeys.all, executionDeviceKeys.all, queryKeys.instance.aiAccountHosts];
+  const invalidationsFor = (action: string) => {
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
+      entityType: "company", entityId: "company-1", action, actorType: "user", actorId: "user-2",
+    }, { userId: "user-1", agentId: null });
+    const calls = invalidate.mock.calls.map(([filters]) => filters);
+    client.clear();
+    return calls;
+  };
+
+  it.each([
+    "ai_account.created",
+    "ai_account.binding_updated",
+    "ai_account.limit_reached",
+    "execution_device.updated",
+    "execution_device.over_limit",
+    "company.execution_wait_settings_updated",
+  ])("refreshes accounts, bindings and devices for %s", (action) => {
+    const calls = invalidationsFor(action);
+    for (const queryKey of poolKeys) expect(calls).toContainEqual({ queryKey });
+  });
+
+  it.each(["ai_connection.pool_updated", "company.updated", "environment.updated"])(
+    "leaves them alone for %s",
+    (action) => {
+      const calls = invalidationsFor(action);
+      for (const queryKey of poolKeys) expect(calls).not.toContainEqual({ queryKey });
+    },
+  );
 });

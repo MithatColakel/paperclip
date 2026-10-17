@@ -145,6 +145,13 @@ triggers, untrusted languages, or runtime multi-statement SQL. Runtime
 `ctx.db.query()` is restricted to `SELECT`; runtime `ctx.db.execute()` is
 restricted to namespace-local `INSERT`, `UPDATE`, and `DELETE`.
 
+Fork note: keep quote marks out of migration comments, and do not write
+`<keyword> <schema>.<table>` text in them (for example
+`copied from <schema>.<table>`). The host's keyword scan replaces string
+literals before it strips comments, so an apostrophe in a comment opens a
+string that can swallow real SQL, and it reads table references from the raw
+text, comments included.
+
 ### Scoped plugin API routes
 
 Plugins can expose JSON-only routes under their own namespace:

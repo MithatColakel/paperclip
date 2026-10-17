@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import {
   type Db,
   agents,
@@ -159,13 +159,13 @@ export function aiAccountHostService(db: Db) {
     return map;
   }
 
-  async function projectSummaries(projectIds?: string[]): Promise<AiAccountProjectSummary[]> {
-    if (projectIds && projectIds.length === 0) return [];
+  async function projectSummaries(projectIds: string[]): Promise<AiAccountProjectSummary[]> {
+    if (projectIds.length === 0) return [];
     const rows = await db
       .select({ id: projects.id, name: projects.name, companyId: companies.id, companyName: companies.name, issuePrefix: companies.issuePrefix })
       .from(projects)
       .innerJoin(companies, eq(companies.id, projects.companyId))
-      .where(projectIds ? inArray(projects.id, projectIds) : and(isNull(projects.archivedAt), sql`${companies.status} <> 'archived'`))
+      .where(inArray(projects.id, projectIds))
       .orderBy(asc(companies.name), asc(projects.name));
     return rows.map((row) => ({ ...row, issuePrefix: row.issuePrefix ?? "" }));
   }
@@ -257,7 +257,6 @@ export function aiAccountHostService(db: Db) {
     const usage = await usageByAccount();
     const owners = await ownersOf(accounts);
     const reservations = await reservationsFor(accounts.map((row) => row.id));
-    const allProjects = await projectSummaries();
     const reservedIds = [...new Set([...reservations.values()].flatMap((set) => [...set]))];
     const projectById = new Map((await projectSummaries(reservedIds)).map((project) => [project.id, project]));
     const reservedSummaries = (accountId: string) =>
@@ -280,7 +279,6 @@ export function aiAccountHostService(db: Db) {
         createdAt: host.createdAt.toISOString(),
       })),
       unmappedEnvironments: unmapped.map(environmentSummary),
-      projects: allProjects,
       maxAccountsPerHost: MAX_AI_ACCOUNTS_PER_HOST,
     };
   }

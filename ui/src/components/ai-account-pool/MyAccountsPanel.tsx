@@ -72,6 +72,11 @@ function otherCompaniesText(count: number): string {
   return count === 1 ? "Agents in 1 other company" : `Agents in ${count} other companies`;
 }
 
+/** Reserved projects outside the caller's companies, which the server sends as a count only. */
+function otherReservedProjectsText(count: number): string {
+  return count === 1 ? "+1 project in another company" : `+${count} projects in other companies`;
+}
+
 function usedByAgentText(agent: AiAccountUsedByAgent): string {
   const devices = agent.devices.map((device) => device.name);
   return devices.length > 0 ? `${agent.agentName} (${devices.join(", ")})` : agent.agentName;
@@ -155,6 +160,7 @@ function MyAccountCard({ account, now }: { account: MyAiAccount; now?: Date }) {
   const details = [maskEmail(account.emailHint), account.plan].filter(Boolean).join(" · ");
   const busy = action.isPending;
   const error = action.error ? aiAccountPoolErrorMessage(action.error) : null;
+  const otherReservedProjects = account.otherReservedProjects ?? 0;
 
   return (
     <li aria-label={account.label} className="space-y-3 py-4 first:pt-0 last:pb-0">
@@ -206,7 +212,7 @@ function MyAccountCard({ account, now }: { account: MyAiAccount; now?: Date }) {
 
       {note && <p className={cn("text-xs", NOTE_TONE_CLASS[note.tone])}>{note.text}</p>}
 
-      {account.reservedProjects.length > 0 && (
+      {(account.reservedProjects.length > 0 || otherReservedProjects > 0) && (
         <div className="space-y-1" data-testid="account-restriction">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">Reserved for</span>
@@ -215,6 +221,9 @@ function MyAccountCard({ account, now }: { account: MyAiAccount; now?: Date }) {
                 {projectChipLabel(project)}
               </Badge>
             ))}
+            {otherReservedProjects > 0 && (
+              <span className="text-xs text-muted-foreground">{otherReservedProjectsText(otherReservedProjects)}</span>
+            )}
             <Button
               type="button"
               variant="ghost"

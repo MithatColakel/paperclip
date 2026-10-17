@@ -28,6 +28,8 @@ import {
   aiAccountPoolService,
   assertAccountPoolAllowsManagedBinding,
   checkAccountBinding,
+  eligibleAccountsForCompany,
+  evaluateAccountEligibility,
   isCompanyAdmin,
   maskEmail,
   mayChangeBinding,
@@ -293,6 +295,58 @@ describeEmbeddedPostgres("account pool service (database)", () => {
       expect((await check(signedOut, false)).ok).toBe(true);
       const limited = await account("owner", { exhaustedUntil: new Date(Date.now() + 60_000), limitReason: "provider_quota" });
       expect(await check(limited)).toMatchObject({ ok: true, warnings: ["usage_limit"] });
+    });
+
+    it("lists the eligible accounts in a fixed number of queries, as the per-account predicate decides them", async () => {
+      const companyId = await company();
+      const otherCompanyId = await company();
+      await user("owner");
+      await user("outsider");
+      await member(companyId, "owner");
+      const [here] = await db.insert(projects).values({ companyId, name: "Here" }).returning();
+      const [there] = await db.insert(projects).values({ companyId: otherCompanyId, name: "There" }).returning();
+      const rows = {
+        plain: await account("owner", { label: "A plain" }),
+        signedOut: await account("owner", { label: "B signed out", status: "auth_failed" }),
+        limited: await account("owner", { label: "C limited", exhaustedUntil: new Date(Date.now() + 60_000), limitReason: "provider_quota" }),
+        reservedHere: await account("owner", { label: "D reserved here" }),
+        reservedBoth: await account("owner", { label: "E reserved in both" }),
+        reservedThere: await account("owner", { label: "F reserved elsewhere" }),
+        paused: await account("owner", { label: "G paused", status: "disabled" }),
+        adminDisabled: await account("owner", { label: "H admin disabled", adminDisabledAt: new Date() }),
+        outsiders: await account("outsider", { label: "I outsider's" }),
+      };
+      await db.insert(aiAccountProjects).values([
+        { accountId: rows.reservedHere.id, projectId: here!.id },
+        { accountId: rows.reservedBoth.id, projectId: here!.id },
+        { accountId: rows.reservedBoth.id, projectId: there!.id },
+        { accountId: rows.reservedThere.id, projectId: there!.id },
+      ]);
+
+      let selects = 0;
+      const counting = new Proxy(db, {
+        get(target, property, receiver) {
+          if (property === "select") selects += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const eligible = await eligibleAccountsForCompany(counting, companyId, { deploymentMode: "authenticated" });
+      expect(eligible.map((row) => row.label)).toEqual(["A plain", "B signed out", "C limited", "D reserved here", "E reserved in both"]);
+      expect(selects).toBeLessThanOrEqual(3);
+      // The same set as the per-account predicate.
+      const oneByOne: string[] = [];
+      for (const row of Object.values(rows)) {
+        if ((await evaluateAccountEligibility(db, { companyId, accountId: row.id, deploymentMode: "authenticated" })).eligible) oneByOne.push(row.label);
+      }
+      expect(oneByOne.sort()).toEqual(eligible.map((row) => row.label).sort());
+
+      // An agent of another adapter gets no options, and no eligibility work is done for it.
+      const codex = await agent(companyId, { adapterType: "codex_local" });
+      const detail = await pool.getAgentBinding(ctx(board("owner", [[companyId, "owner"]])), codex.id);
+      expect(detail.options).toEqual([]);
+      const claude = await agent(companyId);
+      expect((await pool.getAgentBinding(ctx(board("owner", [[companyId, "owner"]])), claude.id)).options.map((option) => option.label))
+        .toEqual(eligible.map((row) => row.label));
     });
 
     it("caps a device at three accounts across companies, and honours in-memory bound sets", async () => {
@@ -672,6 +726,28 @@ describeEmbeddedPostgres("account pool service (database)", () => {
         label: "Again", credentialType: "subscription", value: sub(`u-${tag()}`), emailHint: "MOVE@example.com",
       });
       await expect(pool.transferOwner(ctx(admin), duplicate.id, "new-owner")).rejects.toMatchObject({ status: 409, details: { code: "ai_account_duplicate" } });
+    });
+
+    it("lists an owner's reservations in other companies as a count only, after a transfer", async () => {
+      const reservedCompany = await company("Xenon Holdings");
+      const ownCompany = await company();
+      await user("admin");
+      await user("heir");
+      await member(ownCompany, "heir");
+      // A legacy account an instance admin reserved for another company's project.
+      const legacy = await account("admin", { origin: "legacy_host_pool", label: "Legacy" });
+      const [secret] = await db.insert(projects).values({ companyId: reservedCompany, name: "Acquisition plan" }).returning();
+      const [visible] = await db.insert(projects).values({ companyId: ownCompany, name: "Own project" }).returning();
+      await db.insert(aiAccountProjects).values([{ accountId: legacy.id, projectId: secret!.id }, { accountId: legacy.id, projectId: visible!.id }]);
+      await pool.transferOwner(ctx(board("admin", [], { isInstanceAdmin: true })), legacy.id, "heir");
+
+      const [mine] = (await pool.listMine(ctx(board("heir", [[ownCompany, "operator"]])))).accounts;
+      expect(mine!.reservedProjects.map((project) => project.id)).toEqual([visible!.id]);
+      expect(mine!.otherReservedProjects).toBe(1);
+      const text = JSON.stringify(mine);
+      expect(text).not.toContain("Acquisition plan");
+      expect(text).not.toContain("Xenon Holdings");
+      expect(text).not.toContain(reservedCompany);
     });
 
     it("audits a transfer between owners outside every company in the companies using the account, without names", async () => {

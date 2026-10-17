@@ -101,9 +101,11 @@ company-scoped. Their audit is company-scoped too, and nothing fans out to every
 company: a binding change is logged in the agent's company; an account change
 in every company where its owner is an active member (a transfer in the old and
 the new owner's companies), or, when the owner has none, in the companies whose
-agents use the account, without its label; a device change in the companies
-whose agents use the device; and a run's use, limit and sign-in failure in the
-run's own company. See
+agents use the account, without its label; a device change (rename, limit,
+mapping, link or removal) only in the companies whose agents use the device,
+while adding a device logs nothing; a device check in the company that asked
+for it; and a run's use, limit and sign-in failure in the run's own company.
+See
 [AI Connections](doc/connections/AI-CONNECTIONS.md#claude-account-pool-fork).
 
 2. Keep contracts synchronized.

@@ -83,8 +83,17 @@ export type ExecutionEnvironmentRow = typeof environments.$inferSelect;
 
 /** The server device's name when Paperclip creates it. */
 export const SERVER_DEVICE_NAME = "Paperclip server";
-/** A derived SSH device is named after the environment that first reached it. */
+/**
+ * A derived SSH device is named after the environment that first reached it
+ * when that environment is shared by every company: `SSH · <environment name>`.
+ */
 export const SSH_DEVICE_NAME_PREFIX = "SSH · ";
+/**
+ * The name of a derived SSH device that a company's own environment reached
+ * first. A device is instance-level and every company that reaches the host
+ * sees its name, so a company's environment name never becomes it.
+ */
+export const SSH_DEVICE_NEUTRAL_NAME = "SSH host";
 /** A target report older than this is stale: planning and binding then assume subscription only. */
 export const TARGET_STATE_TTL_MS = 15 * 60 * 1000;
 /** What a sandbox target accepts when its report is stale or names no types. */
@@ -112,6 +121,12 @@ export interface DeviceEnvironmentRef {
   name: string;
   driver: string;
   config: Record<string, unknown> | null | undefined;
+  /**
+   * The owning company; null for an environment every company shares. Only a
+   * shared environment's name may name a new SSH device; unknown counts as a
+   * company's own.
+   */
+  companyId?: string | null;
 }
 
 /** How an environment reached its device. `mapping` is an explicit instance-admin mapping. */
@@ -702,7 +717,10 @@ async function resolveEnvironmentDevices(
       }
       let device = byKey.get(key) ?? null;
       if (!device && create) {
-        device = await findOrCreateKeyedDevice(db, { externalKey: key, kind: "ssh_host", name: `${SSH_DEVICE_NAME_PREFIX}${environment.name}` }, true);
+        // Fork: every company that reaches this host sees the device's name, so
+        // only a shared environment names it; a company's own gets a neutral name.
+        const name = environment.companyId === null ? `${SSH_DEVICE_NAME_PREFIX}${environment.name}` : SSH_DEVICE_NEUTRAL_NAME;
+        device = await findOrCreateKeyedDevice(db, { externalKey: key, kind: "ssh_host", name }, true);
         if (device) byKey.set(key, device);
       }
       result.set(environment.id, device ? { device, via: "ssh" } : null);
@@ -727,7 +745,8 @@ async function resolveEnvironmentDevices(
  * 1. an explicit mapping in `ai_account_host_environments`;
  * 2. `local` → the server device (`external_key 'local'`), a pool device;
  * 3. `ssh` → the device keyed `ssh:<host>:<port>` (`sshExecutionDeviceKey`),
- *    created on first use and named `SSH · <environment name>`; a config
+ *    created on first use and named `SSH · <environment name>` after a
+ *    shared environment, or `SSH host` after a company's own; a config
  *    without a usable host or port has no device;
  * 4. `sandbox` → the device whose `target_provider` is `config.provider`,
  *    whose `target_match` the config contains, and which the provider's only
@@ -1708,14 +1727,17 @@ async function companyDeviceView(db: DeviceDb, companyId: string, opts: DeviceSu
  * listed. Accounts appear with labels only where their owner is an active
  * member of the company; every other account is a count. The device owner is
  * shown for display only. An SSH environment's availability carries no label
- * or message here, since those can name its host (instance view only).
+ * or message here, since those can name its host (instance view only). Each
+ * device carries the company's own waits on it (`waits`).
  */
 export async function summariesForCompany(
   db: DeviceDb,
   companyId: string,
   opts: DeviceSummaryOptions = {},
 ): Promise<ExecutionDeviceSummary[]> {
-  return (await companyDeviceView(db, companyId, opts)).summaries;
+  const view = await companyDeviceView(db, companyId, opts);
+  // Fork: the company's waits go with the list, so its page needs no request per device.
+  return view.summaries.map((summary) => ({ ...summary, waits: view.waitsFor(summary.id) }));
 }
 
 /** One device as the company sees it, with the company's waits on it; null when the company cannot see it. */

@@ -7,13 +7,10 @@ import {
   toolConnections,
 } from "@paperclipai/db";
 import {
-  AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS,
-  AI_CONNECTION_POOL_USAGE_THRESHOLD_PERCENT,
   aiConnectionMetadataSchema,
   type AiConnectionPoolMemberSummary,
   type AiConnectionPoolSummary,
   type AiConnectionPoolUsageWindow,
-  type AiConnectionPoolUsageWindowKey,
   type AiConnectionQuotaReason,
   type AiConnectionQuotaSource,
   type AiManagedConnectionSummary,
@@ -33,47 +30,6 @@ export function aiConnectionPoolRetryAt(error: HttpError): Date | null {
   const value = (error.details as { retryAt?: unknown } | undefined)?.retryAt;
   const parsed = typeof value === "string" ? new Date(value) : null;
   return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
-}
-
-const CLAUDE_USAGE_LABEL_KEYS: Record<string, AiConnectionPoolUsageWindowKey> = {
-  "Current session": "five_hour",
-  "Current week (all models)": "seven_day",
-  "Current week (Sonnet only)": "seven_day_sonnet",
-  "Current week (Opus only)": "seven_day_opus",
-};
-
-/** Maps the Claude adapter's labelled usage windows onto stable pool keys; extra usage is ignored. */
-export function claudeUsageToPoolWindows(
-  windows: Array<{ label: string; usedPercent: number | null; resetsAt: string | null }>,
-): AiConnectionPoolUsageWindow[] {
-  return windows.flatMap((window) => {
-    const key = CLAUDE_USAGE_LABEL_KEYS[window.label];
-    return key ? [{ key, usedPercent: window.usedPercent, resetsAt: window.resetsAt }] : [];
-  });
-}
-
-/** Returns when the account may serve this model again, or null when it is below the threshold. */
-export function usageBlockedUntil(
-  windows: AiConnectionPoolUsageWindow[],
-  model: unknown,
-  now: Date,
-): Date | null {
-  const name = typeof model === "string" ? model.toLowerCase() : "";
-  const relevant = new Set<AiConnectionPoolUsageWindowKey>(["five_hour", "seven_day"]);
-  if (name.includes("opus")) relevant.add("seven_day_opus");
-  if (name.includes("sonnet")) relevant.add("seven_day_sonnet");
-  let until: Date | null = null;
-  for (const window of windows) {
-    if (!relevant.has(window.key) || window.usedPercent == null) continue;
-    if (window.usedPercent < AI_CONNECTION_POOL_USAGE_THRESHOLD_PERCENT) continue;
-    const resetsAt = window.resetsAt ? new Date(window.resetsAt) : null;
-    const candidate = resetsAt && !Number.isNaN(resetsAt.getTime())
-      ? resetsAt
-      : new Date(now.getTime() + AI_CONNECTION_POOL_DEFAULT_COOLDOWN_MS);
-    if (candidate.getTime() <= now.getTime()) continue;
-    if (!until || candidate.getTime() > until.getTime()) until = candidate;
-  }
-  return until;
 }
 
 export type AiConnectionPoolMember = {
@@ -112,13 +68,6 @@ export function aiConnectionPoolService(db: Db) {
     }));
   }
 
-  /** True when some pool member is not usage-limited at `now`; health is checked at selection. */
-  async function hasAvailableMember(companyId: string, provider: AiProvider, now = new Date()) {
-    return (await members(companyId, provider)).some(
-      (member) => !member.exhaustedUntil || member.exhaustedUntil.getTime() <= now.getTime(),
-    );
-  }
-
   async function markExhausted(input: {
     companyId: string;
     connectionId: string;
@@ -149,16 +98,6 @@ export function aiConnectionPoolService(db: Db) {
           lastRunId: input.runId ?? null,
           updatedAt: new Date(),
         },
-      });
-  }
-
-  async function recordUsage(companyId: string, connectionId: string, windows: AiConnectionPoolUsageWindow[], checkedAt: Date) {
-    await db
-      .insert(aiConnectionQuotaStates)
-      .values({ companyId, connectionId, usageCheckedAt: checkedAt, usageWindows: windows })
-      .onConflictDoUpdate({
-        target: [aiConnectionQuotaStates.companyId, aiConnectionQuotaStates.connectionId],
-        set: { usageCheckedAt: checkedAt, usageWindows: windows, updatedAt: new Date() },
       });
   }
 
@@ -294,5 +233,5 @@ export function aiConnectionPoolService(db: Db) {
     });
   }
 
-  return { members, hasAvailableMember, markExhausted, recordUsage, summary, replace, clearLimit };
+  return { members, markExhausted, summary, replace, clearLimit };
 }

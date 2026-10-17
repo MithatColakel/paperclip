@@ -65,6 +65,15 @@ async function click(label: string) {
 }
 
 describe("AiAccountPoolCard", () => {
+  // Fork: the retired company pool must not share its name with the new Claude account pool.
+  it("is titled as the retired company account pool", async () => {
+    await mount();
+    const section = document.body.querySelector("section");
+    expect(section?.getAttribute("aria-label")).toBe("Company account pool (retired)");
+    expect(section?.querySelector("h2")?.textContent).toBe("Company account pool (retired)");
+    expect(document.body.textContent).not.toContain("Claude account pool");
+  });
+
   it("shows pool order and usage limits", async () => {
     await mount();
     const text = document.body.textContent ?? "";

@@ -174,7 +174,7 @@ export function acceptedCredentialTypesText(types: readonly AiAccountCredentialT
   return types.length === 1 ? ONLY_CREDENTIAL_TYPE_TEXT[types[0]!] : null;
 }
 
-/** Where an account or a device is used: `Cleanio: 2 agents · Presto: 1 agent`. */
+/** Where an account or a device is used: `Acme: 2 agents · Globex: 1 agent`. */
 export function companyAgentCountsText(companies: ReadonlyArray<{ companyName: string; agentCount: number }>): string | null {
   if (companies.length === 0) return null;
   return companies

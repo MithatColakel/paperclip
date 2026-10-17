@@ -1,5 +1,6 @@
 import type {
   AiAccountHostEnvironmentSummary,
+  AiAccountHostKind,
   AiAccountHostsResponse,
   CreateAiAccountHost,
   UpdateAiAccountHost,
@@ -10,7 +11,8 @@ import { api } from "./client";
 export interface AiAccountHostRecord {
   id: string;
   name: string;
-  kind: CreateAiAccountHost["kind"];
+  /** The update routes also return plugin (`external`) devices. */
+  kind: AiAccountHostKind;
   maxAccounts: number;
   overflowToOtherAccounts: boolean;
   createdAt: string;

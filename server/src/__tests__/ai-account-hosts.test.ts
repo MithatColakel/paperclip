@@ -200,7 +200,7 @@ describe("execution devices on the legacy host routes (database)", () => {
   it("refuses a mapping edit that would put more bound accounts on a device than its cap, and writes nothing", async () => {
     const svc = aiAccountHostService(db);
     const app = appFor(admin);
-    const device = await svc.createHost({ name: "Studio", kind: "mac", maxAccounts: 1 }, "admin");
+    const device = await svc.createHost({ name: "Workstation", kind: "mac", maxAccounts: 1 }, "admin");
     const first = await account({ label: "Max one" });
     const second = await account({ label: "Max two" });
     await boundAgent(companyA, sharedEnvId, first.id);
@@ -212,10 +212,10 @@ describe("execution devices on the legacy host routes (database)", () => {
       .send({ environmentIds: [sharedEnvId, otherSharedEnvId] }).expect(409);
     expect(refused.body).toMatchObject({
       code: "device_account_limit",
-      details: { code: "device_account_limit", deviceId: device.id, deviceName: "Studio", limit: 1, inUse: 2, accounts: ["Max one", "Max two"] },
+      details: { code: "device_account_limit", deviceId: device.id, deviceName: "Workstation", limit: 1, inUse: 2, accounts: ["Max one", "Max two"] },
     });
     expect(refused.body.error).toBe(
-      "With these environments, agents that can run on Studio would use 2 Claude accounts, more than its limit of 1. " +
+      "With these environments, agents that can run on Workstation would use 2 Claude accounts, more than its limit of 1. " +
       "Move some of those agents to another device or give them other accounts first.",
     );
     expect(await mappedEnvironments(device.id)).toEqual([sharedEnvId]);
@@ -398,7 +398,7 @@ describe("execution devices on the legacy host routes (database)", () => {
     const svc = aiAccountHostService(db);
     const app = appFor(admin);
     // Two SSH environments reach one machine, which Paperclip finds by its host.
-    const ssh = { host: "studio.example.com", port: 22, username: "runner" };
+    const ssh = { host: "workstation.example.com", port: 22, username: "runner" };
     const [tunnel] = await db.insert(environments).values({ name: "F tunnel", driver: "ssh", config: ssh }).returning();
     const [second] = await db.insert(environments).values({ name: "E1 tunnel", driver: "ssh", config: ssh }).returning();
     const machine = (await deviceForEnvironment(db, tunnel!))!;
@@ -410,7 +410,7 @@ describe("execution devices on the legacy host routes (database)", () => {
     await boundAgent(companyA, tunnel!.id, first.id);
     await boundAgent(companyA, tunnel!.id, other.id);
     await boundAgent(companyA, second!.id, first.id);
-    const desk = await svc.createHost({ name: "Studio desk", kind: "ssh_host" }, "admin");
+    const desk = await svc.createHost({ name: "Workstation desk", kind: "ssh_host" }, "admin");
 
     await request(app).put(`/api/instance/ai-hosts/${desk.id}/environments`).send({ environmentIds: [second!.id] }).expect(200);
     // Back to the machine: it keeps its accounts and gains none, so the edit stands.

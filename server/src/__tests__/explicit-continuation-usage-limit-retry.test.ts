@@ -372,7 +372,9 @@ describeEmbeddedPostgres("explicit continuation through usage-limit retry lanes"
     // ai_connection_busy wait, which refuses it and strands the task.
     expect(await successorsOf(f.runId)).toHaveLength(0);
     expect(await renewedReceipts(f.issueId)).toHaveLength(0);
-    expect(await pool.hasAvailableMember(f.companyId, "anthropic")).toBe(false);
+    // Both members are still limited.
+    expect((await pool.members(f.companyId, "anthropic"))
+      .map((member) => (member.exhaustedUntil?.getTime() ?? 0) > Date.now())).toEqual([true, true]);
 
     // The recovery sweep parks the task on the provider-quota monitor...
     await heartbeat.sweepStaleIssueLocks();

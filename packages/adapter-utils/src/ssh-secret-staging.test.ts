@@ -58,6 +58,9 @@ exec env -i HOME="$FAKE_REMOTE_HOME" PATH="/usr/bin:/bin" TMPDIR="$FAKE_REMOTE_T
 const SECRET_API_KEY = "sk-test-staged-api-key-value";
 const SECRET_CUSTOM = "custom-secret-value-7f3a";
 const SECRET_BRIDGE = "bridge-token-value-91c2";
+// Company secrets bound to names that do not look secret.
+const SECRET_DATABASE_URL = "postgres://app:S3cr3tPw-4b1d@db.invalid/prod";
+const SECRET_PAT = "pat-value-8e2c";
 
 const LEGACY_PROFILE_STEPS = [
   'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
@@ -159,14 +162,15 @@ describe("ssh secret staging", () => {
   it("keeps secret values off the runSshCommand argv and delivers them", async () => {
     const result = await runSshCommand(
       host.spec,
-      'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$DATABASE_URL" "$VISIBLE_SETTING"',
+      'printf "%s|%s|%s" "$ANTHROPIC_API_KEY" "$PAPERCLIP_TASK_ID" "$PAPERCLIP_RUN_ID"',
       {
         env: {
           ANTHROPIC_API_KEY: SECRET_API_KEY,
-          DATABASE_URL: SECRET_CUSTOM,
-          VISIBLE_SETTING: "plain-value",
+          PAPERCLIP_TASK_ID: SECRET_CUSTOM,
+          PAPERCLIP_RUN_ID: "plain-value",
         },
-        secretEnvKeys: ["DATABASE_URL"],
+        // A name on the non-secret list is staged too when the caller says so.
+        secretEnvKeys: ["PAPERCLIP_TASK_ID"],
       },
     );
 
@@ -175,8 +179,52 @@ describe("ssh secret staging", () => {
     // One staging call, then the command itself.
     expect(calls).toHaveLength(2);
     expectNoSecretInArgv(calls, [SECRET_API_KEY, SECRET_CUSTOM]);
-    // A value that is not secret still rides the command line as before.
-    expect(remoteCommands(calls).filter((command) => command.includes("VISIBLE_SETTING="))).toHaveLength(1);
+    // A value under a known non-secret name still rides the command line as before.
+    expect(remoteCommands(calls).filter((command) => command.includes("PAPERCLIP_RUN_ID="))).toHaveLength(1);
+    expect(await stagedEnvDirs(host)).toEqual([]);
+  });
+
+  it("stages a value whose name does not look secret, with no secret key list", async () => {
+    // A secret bound to DATABASE_URL or GH_PAT: nothing in its name says secret.
+    const env = { DATABASE_URL: SECRET_DATABASE_URL, GH_PAT: SECRET_PAT, PAPERCLIP_RUN_ID: "run-plain" };
+    const script = 'printf "%s|%s|%s" "$DATABASE_URL" "$GH_PAT" "$PAPERCLIP_RUN_ID"';
+    const expected = `${SECRET_DATABASE_URL}|${SECRET_PAT}|run-plain`;
+
+    const target = await buildSshSpawnTarget({ spec: host.spec, command: "sh", args: ["-c", script], env });
+    try {
+      expectNoSecretInArgv([target.args], [SECRET_DATABASE_URL, SECRET_PAT]);
+      expect(target.args.at(-1)).toContain("PAPERCLIP_RUN_ID=");
+      expect(target.discardStagedEnv).toBeDefined();
+      await target.discardStagedEnv?.();
+    } finally {
+      await target.cleanup();
+    }
+
+    const viaSpawn = await runChildProcess("run-staging-unnamed", "sh", ["-c", script], {
+      cwd: host.root,
+      env,
+      timeoutSec: 30,
+      graceSec: 2,
+      onLog: async () => {},
+      remoteExecution: host.spec,
+    });
+    expect(viaSpawn.exitCode).toBe(0);
+    expect(viaSpawn.stdout).toBe(expected);
+
+    expect((await runSshCommand(host.spec, script, { env })).stdout).toBe(expected);
+
+    const runner = createSshCommandManagedRuntimeRunner({ spec: host.spec });
+    const viaScript = await runner.execute({ command: "sh", args: ["-c", script], env, timeoutMs: 30_000 });
+    expect(viaScript.stdout).toBe(expected);
+    const viaExec = await runner.execute({
+      command: "printenv",
+      args: ["DATABASE_URL"],
+      env: { DATABASE_URL: SECRET_DATABASE_URL, GH_PAT: SECRET_PAT },
+      timeoutMs: 30_000,
+    });
+    expect(viaExec.stdout).toBe(`${SECRET_DATABASE_URL}\n`);
+
+    expectNoSecretInArgv(await readSshCalls(host), [SECRET_DATABASE_URL, SECRET_PAT]);
     expect(await stagedEnvDirs(host)).toEqual([]);
   });
 
@@ -370,8 +418,8 @@ describe("ssh secret staging", () => {
     expect(remoteCommands(await readSshCalls(host)).some((command) => command.includes("rm -rf"))).toBe(true);
   }, 20_000);
 
-  it("produces the same scripts as before when nothing is secret or unset", async () => {
-    const env = { FOO: "bar", PAPERCLIP_RUN_ID: "run-9", WITH_QUOTE: "it's" };
+  it("produces the same scripts as before when every name is a known non-secret one and nothing is unset", async () => {
+    const env = { LANG: "C.UTF-8", PAPERCLIP_RUN_ID: "run-9", PAPERCLIP_WAKE_REASON: "it's" };
     const envArgs = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ");
 
     const target = await buildSshSpawnTarget({ spec: host.spec, command: "node", args: ["--version"], env });
@@ -403,10 +451,11 @@ describe("ssh secret staging", () => {
   });
 
   it("removes the staged file when the main ssh call fails before the remote script runs", async () => {
+    // The main call carries the inline value; the staging call does not.
     vi.stubEnv("FAKE_SSH_FAIL_PATTERN", "exec env");
     const result = await runChildProcess("run-staging-3", "sh", ["-c", "true"], {
       cwd: host.root,
-      env: { ANTHROPIC_API_KEY: SECRET_API_KEY, VISIBLE: "1" },
+      env: { ANTHROPIC_API_KEY: SECRET_API_KEY, PAPERCLIP_RUN_ID: "1" },
       timeoutSec: 30,
       graceSec: 2,
       onLog: async () => {},
@@ -417,7 +466,7 @@ describe("ssh secret staging", () => {
     expect(await stagedEnvDirs(host)).toEqual([]);
 
     await expect(
-      runSshCommand(host.spec, "true", { env: { ANTHROPIC_API_KEY: SECRET_API_KEY, VISIBLE: "1" } }),
+      runSshCommand(host.spec, "true", { env: { ANTHROPIC_API_KEY: SECRET_API_KEY, PAPERCLIP_RUN_ID: "1" } }),
     ).rejects.toMatchObject({ code: 255 });
     expect(await stagedEnvDirs(host)).toEqual([]);
   });

@@ -66,7 +66,7 @@ vi.mock("@/api/access", async (importOriginal) => {
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: mocks.setBreadcrumbs }) }));
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
-    companies: [{ id: "company-a", name: "Cleanio", issuePrefix: "CLE" }],
+    companies: [{ id: "company-a", name: "Acme", issuePrefix: "ACM" }],
     selectedCompanyId: "company-a",
   }),
 }));
@@ -136,8 +136,8 @@ const SERVER = device({
     { id: "acc-team", label: "Team", credentialType: "subscription", state: "limited", owner: { userId: "user-bob", name: "Bob", email: "bob@example.com" } },
   ],
   companies: [
-    { companyId: "company-a", companyName: "Cleanio", agentCount: 3 },
-    { companyId: "company-b", companyName: "Presto", agentCount: 1 },
+    { companyId: "company-a", companyName: "Acme", agentCount: 3 },
+    { companyId: "company-b", companyName: "Globex", agentCount: 1 },
   ],
 });
 const SSH_BOX = device({
@@ -214,7 +214,7 @@ const MAX = account({
   plan: "Max 20x",
   emailHint: "ad•••@example.com",
   credentialHint: "…a1b2",
-  companies: [{ companyId: "company-a", companyName: "Cleanio", agentCount: 2 }],
+  companies: [{ companyId: "company-a", companyName: "Acme", agentCount: 2 }],
   lastLimitedAt: LAST_LIMIT,
   usage: {
     lastFiveHours: { runs: 3, inputTokens: 12_300_000, cachedInputTokens: 9_800_000, outputTokens: 840_000, costCents: 0 },
@@ -243,7 +243,7 @@ const LEGACY = account({
   adminDisabledAt: SINCE,
   adminDisabledReason: "Shared outside the team",
   state: "admin_disabled",
-  reservedProjects: [{ id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Cleanio", issuePrefix: "CLE" }],
+  reservedProjects: [{ id: "project-mobile", name: "Mobile app", companyId: "company-a", companyName: "Acme", issuePrefix: "ACM" }],
 });
 const KEY = account({
   id: "acc-key",
@@ -266,9 +266,9 @@ const REPORT: AiAccountMigrationReport = {
     unassigned: 1,
     unbound: 1,
     agents: [
-      { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", companyName: "Cleanio", outcome: "bound", accountId: "acc-max", accountLabel: "Max-2", rule: "agent_history", note: null },
-      { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", companyName: "Cleanio", outcome: "unassigned", accountId: null, accountLabel: null, rule: null, note: "Over the device's account limit" },
-      { agentId: "agent-carol", agentName: "Carol", companyId: "company-a", companyName: "Cleanio", outcome: "unbound", accountId: null, accountLabel: null, rule: null, note: "No host pool runs in 45 days" },
+      { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", companyName: "Acme", outcome: "bound", accountId: "acc-max", accountLabel: "Max-2", rule: "agent_history", note: null },
+      { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", companyName: "Acme", outcome: "unassigned", accountId: null, accountLabel: null, rule: null, note: "Over the device's account limit" },
+      { agentId: "agent-carol", agentName: "Carol", companyId: "company-a", companyName: "Acme", outcome: "unbound", accountId: null, accountLabel: null, rule: null, note: "No host pool runs in 45 days" },
     ],
     overLimitDevices: [{ deviceId: "dev-ssh", deviceName: "SSH · Build tunnel", limit: 3, inUse: 4 }],
   },
@@ -278,7 +278,7 @@ const REPORT: AiAccountMigrationReport = {
       { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", plan: "use", reason: null },
       { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", plan: "wait", reason: "unassigned" },
       // Not in the summary (bound by hand): its company comes with the entry.
-      { agentId: "agent-dave", agentName: "Dave", companyId: "company-b", companyName: "Presto", plan: "none", reason: "no Claude account is assigned" },
+      { agentId: "agent-dave", agentName: "Dave", companyId: "company-b", companyName: "Globex", plan: "none", reason: "no Claude account is assigned" },
       // A server that predates companyName: the company the page cannot name.
       { agentId: "agent-erin", agentName: "Erin", companyId: "company-c", plan: "none", reason: "set explicitly in its Claude account selection" },
     ],
@@ -313,7 +313,6 @@ function legacyAccount(overrides: Partial<AiAccountSummary>): AiAccountSummary {
 
 const HOSTS: AiAccountHostsResponse = {
   maxAccountsPerHost: 3,
-  projects: [],
   unmappedEnvironments: [
     { id: "env-runner-2", name: "Runner 2", driver: "ssh", companyId: "company-a" },
     { id: "env-sandbox", name: "Studio sandbox", driver: "sandbox", companyId: "company-a" },
@@ -461,7 +460,7 @@ describe("InstanceAiAccounts", () => {
     expect(server.querySelector("[data-device-availability]")?.textContent).toBe("Available");
     expect(server.textContent).toContain("Paperclip server");
     expect(server.textContent).toContain("local");
-    expect(server.textContent).toContain("2 of 3 Claude accounts · Cleanio: 3 agents · Presto: 1 agent");
+    expect(server.textContent).toContain("2 of 3 Claude accounts · Acme: 3 agents · Globex: 1 agent");
     expect(server.textContent).toContain("Max-2· Ada");
     expect(server.textContent).toContain("Team· Bob");
     expect(server.textContent).toContain("Limited");
@@ -471,7 +470,7 @@ describe("InstanceAiAccounts", () => {
     expect(ssh.querySelector("[data-device-availability]")?.textContent).toBe(`Unreachable since ${SINCE_TEXT}`);
     // Instance admins see the host and the connection's own words.
     expect(ssh.textContent).toContain("ssh:build.internal:2222");
-    expect(ssh.textContent).toContain("Build tunnel · SSH · Cleanio · mapped by hand");
+    expect(ssh.textContent).toContain("Build tunnel · SSH · Acme · mapped by hand");
     expect(ssh.textContent).toContain(`Unreachable since ${SINCE_TEXT}: Connection timed out during banner exchange`);
     expect(ssh.textContent).toContain("Over limit");
     expect(ssh.textContent).toContain("Likely the same machine as Studio");
@@ -559,7 +558,7 @@ describe("InstanceAiAccounts", () => {
     expect(max.textContent).toContain("Subscription");
     expect(max.textContent).toContain("Active");
     expect(max.textContent).toContain("Owner: Ada · ada@example.com · ad•••@example.com · Max 20x · …a1b2");
-    expect(max.textContent).toContain("Used by Cleanio: 2 agents");
+    expect(max.textContent).toContain("Used by Acme: 2 agents");
     expect(max.textContent).toContain("Last 5 h: 3 runs · 12.3M in · 840.0k out + 9.8M cached");
     expect(max.textContent).toContain(`Last limit: ${formatDateTime(LAST_LIMIT)}`);
     expect(max.textContent).not.toContain("This month");
@@ -578,7 +577,7 @@ describe("InstanceAiAccounts", () => {
     expect(legacy.textContent).toContain("Reason: Shared outside the team");
     expect(legacy.textContent).toContain("From the host pool");
     expect(legacy.textContent).toContain("Added to Paperclip server before accounts had owners.");
-    expect(legacy.textContent).toContain("Reserved forCLE · Mobile app");
+    expect(legacy.textContent).toContain("Reserved forACM · Mobile app");
 
     const key = row("Console key");
     expect(key.textContent).toContain("API key");
@@ -647,7 +646,7 @@ describe("InstanceAiAccounts", () => {
     mocks.pool.removeInstanceAccount
       .mockRejectedValueOnce(new ApiError("Account in use", 409, {
         code: "ai_account_in_use",
-        details: { code: "ai_account_in_use", bindings: [{ agentId: "a", agentName: "Alice", companyId: "company-a", companyName: "Cleanio" }], otherCompanies: 1 },
+        details: { code: "ai_account_in_use", bindings: [{ agentId: "a", agentName: "Alice", companyId: "company-a", companyName: "Acme" }], otherCompanies: 1 },
       }))
       .mockResolvedValueOnce(undefined);
     await renderLoaded();
@@ -670,19 +669,40 @@ describe("InstanceAiAccounts", () => {
     const report = region("Migration report");
     expect(report.textContent).toContain(`Completed ${formatDateTime(REPORT.completedAt!)} · 1 attempt`);
     expect(report.textContent).toContain("No-go");
-    expect(report.textContent).toContain("Bob (Cleanio) would wait: no account chosen");
-    expect(report.textContent).toContain("Dave (Presto) would use its device's own login: no Claude account is assigned");
+    expect(report.textContent).toContain("Bob (Acme) would wait: no account chosen");
+    expect(report.textContent).toContain("Dave (Globex) would use its device's own login: no Claude account is assigned");
     expect(report.textContent).toContain("Erin (another company) would use its device's own login: set explicitly in its Claude account selection");
     expect(report.textContent).not.toContain("would be refused");
-    expect(report.textContent).not.toContain("Alice (Cleanio) would");
+    expect(report.textContent).not.toContain("Alice (Acme) would");
     expect(report.textContent).toContain("1 assigned · 1 waiting for an account · 1 not assigned");
-    expect(report.textContent).toContain("Bob (Cleanio) · Waiting for an account · Over the device's account limit");
-    expect(report.textContent).toContain("Carol (Cleanio) · Not assigned · No host pool runs in 45 days");
+    expect(report.textContent).toContain("Bob (Acme) · Waiting for an account · Over the device's account limit");
+    expect(report.textContent).toContain("Carol (Acme) · Not assigned · No host pool runs in 45 days");
     expect(report.textContent).toContain("Assigned agents (1)");
     expect(report.textContent).toContain("Over their limit: SSH · Build tunnel (4 of 3)");
 
     await click(buttonIn(section("instance-migration-heading"), "Run again"));
     await eventually(() => expect(mocks.pool.runMigration).toHaveBeenCalledTimes(1));
+  });
+
+  it("lists an agent that waits for its own account's limit as a warning, which does not block go", async () => {
+    mocks.pool.getMigrationReport.mockResolvedValue({
+      ...REPORT,
+      goNoGo: {
+        go: true,
+        agents: [
+          { agentId: "agent-alice", agentName: "Alice", companyId: "company-a", plan: "use", reason: null },
+          { agentId: "agent-bob", agentName: "Bob", companyId: "company-a", plan: "wait", reason: "usage_limit" },
+        ],
+      },
+    });
+    await renderLoaded();
+
+    const report = region("Migration report");
+    expect(report.textContent).toContain("Go");
+    expect(report.textContent).not.toContain("No-go");
+    expect(report.textContent).toContain("some wait for their account's limit to reset first");
+    const limited = report.querySelector<HTMLElement>('[data-testid="go-no-go-limited"]');
+    expect(limited?.textContent).toContain("Bob (Acme) would wait");
   });
 
   it("keeps the legacy host pool collapsed until opened, and adds devices of the kinds a person may add", async () => {

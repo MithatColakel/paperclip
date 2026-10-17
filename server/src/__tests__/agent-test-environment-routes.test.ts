@@ -284,10 +284,10 @@ describe("agent test-environment route", () => {
     mockEnvironmentService.getById.mockResolvedValue({
       id: "55555555-5555-4555-8555-555555555555",
       companyId: "company-2",
-      name: "Other company Mac",
+      name: "Other company computer",
       driver: "sandbox",
       status: "active",
-      config: { provider: "mac-fleet" },
+      config: { provider: "fake-plugin" },
     });
     const app = await createApp();
     const res = await request(app)
@@ -305,7 +305,7 @@ describe("agent test-environment route", () => {
       companyDefaultEnvironmentId: companyDefaultId,
     });
     mockEnvironmentService.getById.mockImplementation(async (id) => ({
-      id, name: "Company Mac", driver: "sandbox", status: "active", config: { provider: "fake-plugin" },
+      id, name: "Company computer", driver: "sandbox", status: "active", config: { provider: "fake-plugin" },
     }));
     const target = { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "daytona", runner: { execute: vi.fn() } };
     mockResolveEnvironmentExecutionTarget.mockResolvedValue(target);

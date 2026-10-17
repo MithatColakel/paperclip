@@ -17,7 +17,7 @@ import {
  *
  * In copy mode the server worktree is the only real copy of an issue's work,
  * so every run uploads the history and the tree and pulls them back. On a
- * persistent device (a developer Mac) that moved gigabytes per run and threw
+ * persistent device (a developer machine) that moved gigabytes per run and threw
  * away every build cache. In device mode the device keeps its own clone and
  * one git worktree per execution workspace, which is the authoritative copy:
  *

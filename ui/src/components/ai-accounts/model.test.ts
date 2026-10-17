@@ -126,7 +126,7 @@ describe("project reservations", () => {
     ({ id, name, companyId, companyName, issuePrefix });
 
   it("labels a project with its issue prefix", () => {
-    expect(projectChipLabel(project("p", "Mobile app", "c", "Cleanio", "CLE"))).toBe("CLE · Mobile app");
+    expect(projectChipLabel(project("p", "Mobile app", "c", "Acme", "ACM"))).toBe("ACM · Mobile app");
   });
 });
 
@@ -181,9 +181,9 @@ describe("device and account text", () => {
   it("counts agents per company", () => {
     expect(companyAgentCountsText([])).toBeNull();
     expect(companyAgentCountsText([
-      { companyName: "Cleanio", agentCount: 2 },
-      { companyName: "Presto", agentCount: 1 },
-    ])).toBe("Cleanio: 2 agents · Presto: 1 agent");
+      { companyName: "Acme", agentCount: 2 },
+      { companyName: "Globex", agentCount: 1 },
+    ])).toBe("Acme: 2 agents · Globex: 1 agent");
   });
 
   it("shows the owner, or that a legacy account has none", () => {

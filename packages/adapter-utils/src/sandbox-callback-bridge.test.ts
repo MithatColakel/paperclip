@@ -1453,7 +1453,7 @@ describe("sandbox callback bridge", () => {
       { method: "PATCH", path: "/api/routine-triggers/t-1" },
       { method: "DELETE", path: "/api/routine-triggers/t-1" },
       { method: "GET", path: "/api/agents/me/secrets" },
-      { method: "POST", path: "/api/agents/me/secrets/SECUREZONE_DB/value" },
+      { method: "POST", path: "/api/agents/me/secrets/APP_DB/value" },
     ];
     for (const request of allowed) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
@@ -1495,9 +1495,9 @@ describe("sandbox callback bridge", () => {
       { method: "PATCH", path: "/api/secrets/secret-1" },
       // Only the agent's own granted secrets: no value via GET, no key listing
       // below the value route, and no secret management.
-      { method: "GET", path: "/api/agents/me/secrets/SECUREZONE_DB/value" },
+      { method: "GET", path: "/api/agents/me/secrets/APP_DB/value" },
       { method: "POST", path: "/api/agents/me/secrets" },
-      { method: "POST", path: "/api/agents/me/secrets/SECUREZONE_DB/value/extra" },
+      { method: "POST", path: "/api/agents/me/secrets/APP_DB/value/extra" },
       { method: "GET", path: "/api/agents/agent-1/secrets" },
       { method: "POST", path: "/api/agents/me/secret-proposals" },
     ];

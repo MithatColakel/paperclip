@@ -37,7 +37,7 @@ Every company and project, not Cleanio only (no code path, skill rule or UI stri
 Each is restated where it applies:
 1. Policies never name the executor (F24, §11.2).
 2. Agents cannot park `blocked` tasks (F23); every park is one write, and half-parked tasks go to orphan recovery (F4) (§4.5).
-3. Agents in `error` are still woken (F38); Mac-down mode is now the generic role-down mode (§10.2).
+3. Agents in `error` are still woken (F38); build-computer-down mode is now the generic role-down mode (§10.2).
 4. Epics carry no `v:` label; counting uses the nearest non-epic ancestor; `tasks_closed` covers open descendants (§4.3).
 5. Labels are invisible on core kanban cards (F29): the Tags column in Phase 0, the plugin chip and card in 1a.
 6. Label deletion cascades (F28): mirror and restore (§4.5). Plugin-created tasks skip core repair (F27): one re-wake, then a flag (§12.6).
@@ -88,7 +88,7 @@ Each is restated where it applies:
 | # | Requirement | How it is met | Sections | Phase |
 |---|---|---|---|---|
 | R1 | It is a plugin | Fork-owned `paperclip.roadmap` with its own Postgres namespace; two carried fork changes: seam S6a and the Board-policy lines | §12, §13, §16 | 1 |
-| R2 | Phase 0 starts now on Cleanio | 0a without the Mac agents (labels, CLE-97/98, approval, parking, epics, skill, daily routine); 0b for the code flow | §19 | 0a / 0b |
+| R2 | Phase 0 starts now on Cleanio | 0a without the build-computer agents (labels, CLE-97/98, approval, parking, epics, skill, daily routine); 0b for the code flow | §19 | 0a / 0b |
 | R3 | ReleaseEngineer merges to `main`; no branch protection | Cleanio's merge owners = [ReleaseEngineer] strict + board fallback; merges happen in the approval stage; trailer + daily detection | §11 | 0b |
 | R4 | Single `main`; releases are tags | One trunk per repo; one tag per component, placed by its tag rule on the ready candidate (or its validation commit); no other branch pushed | §6.3, §11.1 | 0b / 2 |
 | R5 | Version visible on every task | `v:` label + Tags column (Phase 0); plugin chip and card in both task views (1a); component chip | §4.2, §12.2 | 0a / 1a |
@@ -154,7 +154,7 @@ Each is restated where it applies:
 | F41 | A task blocked by an unassigned task raises `blocked_by_unassigned_issue` | `recovery/issue-graph-liveness.ts:643-656` |
 | F42 | A human-attributed plugin comment wakes only an agent assignee | `plugin-host-services.ts:2427-2460` |
 | F43 | Reassignment does not stop a live run | `services/issues.ts:10765-10774` |
-| F44 | `packages/plugins/mac-fleet/` is untracked | `git status` |
+| F44 | The environment driver plugin's directory under `packages/plugins/` is untracked | `git status` |
 
 ### 2.2 New facts for revision 4
 
@@ -197,14 +197,14 @@ Each is restated where it applies:
 
 | # | Fact |
 |---|---|
-| P1 | **VPN Platform** has 4 git workspaces: `backend` (VPNProject, primary), `node` (VPN-Node), `ios-securezone` (SecurezoneVPN), `ios-securefield` (SecureField). **Securezone iOS** and **Securefield iOS** bind the same iOS repos as their primary workspaces, so one repo is bound in two projects. |
-| P2 | VPN Platform: 110 tasks, no labels. By workspace: `node` 58 (12 open), `backend` 43 (20 open), `ios-securezone` 5 (1 open), none 4. Routine "Daily Server Check". |
+| P1 | **VPN Platform** has 4 git workspaces: `backend` (VPNProject, primary), `node` (VPN-Node), `ios-app-a` (AppA), `ios-app-b` (AppB). **App A iOS** and **App B iOS** bind the same iOS repos as their primary workspaces, so one repo is bound in two projects. |
+| P2 | VPN Platform: 110 tasks, no labels. By workspace: `node` 58 (12 open), `backend` 43 (20 open), `ios-app-a` 5 (1 open), none 4. Routine "Daily Server Check". |
 | P3 | **Presto VPN**: 16 tasks, all on `presto-monorepo` (mobile, api, admin); `presto-vpn-node` has 0. |
-| P4 | Leads: VPN Platform, Presto VPN and Cleanio iOS → each company's Project Manager. Securezone iOS, Securefield iOS and every Onboarding project have **no lead**. |
-| P5 | Agents. **VPN**: QA (`qa`); BackendEngineer, NodeOps, SecurezoneiOS, SecurefieldiOS (`engineer`; SecurefieldiOS in `error`); Project Manager, SupportTriage, TrelloIntake (`general`). **PRE**: QA Tester (`qa`); iOS Engineer, Backend Engineer (in `error`), VPN Node Engineer (`engineer`); Project Manager. **CLE**: QAEngineer, ReleaseEngineer, FlutterEngineer (all in `error`, Mac); Project Manager, TrelloIntake. Only Cleanio has a release engineer. |
+| P4 | Leads: VPN Platform, Presto VPN and Cleanio iOS → each company's Project Manager. App A iOS, App B iOS and every Onboarding project have **no lead**. |
+| P5 | Agents. **VPN**: QA (`qa`); BackendEngineer, NodeOps, AppAiOS, AppBiOS (`engineer`; AppBiOS in `error`); Project Manager, SupportTriage, TrelloIntake (`general`). **PRE**: QA Tester (`qa`); iOS Engineer, Backend Engineer (in `error`), VPN Node Engineer (`engineer`); Project Manager. **CLE**: QAEngineer, ReleaseEngineer, FlutterEngineer (all in `error`, build computer); Project Manager, TrelloIntake. Only Cleanio has a release engineer. |
 | P6 | Cleanio `main` carries unpublished tags `v1.1.0` and `v1.1.1`; `pubspec` = `1.1.1+74`; nothing was ever uploaded to App Store Connect. MVP is TestFlight-only. |
 | P7 | Presto's `GITHUB_TOKEN` acts as the owner's admin account, so the `RELEASERS` guard in `vpn-node-release.yml` does not stop agents. PRE-8 pushed straight to `presto-vpn-node` `main`; the agent tags (`v2.0.2` after CI `vpn-node.yml` is green) and the user dispatches `vpn-node-release.yml`. Secondary repos on SSH runners arrive without `.git`. |
-| P8 | VPN-Node: the validation verdict names the validated sha, and the tag sits on the commit that adds `.release-validation/<v>.json` on top of it ("HEAD or HEAD^" rule); a squash merge broke 3.0.32. Board rule (VPN-137): release only after a full pass on the release-test host, then canary `nuremberg-01`, then batches of 5. Only that host (users `nodeops`, `backend`) validates node releases. Node versions 3.0.30–3.0.33 came days apart. |
+| P8 | VPN-Node: the validation verdict names the validated sha, and the tag sits on the commit that adds `.release-validation/<v>.json` on top of it ("HEAD or HEAD^" rule); a squash merge broke 3.0.32. Board rule (VPN-137): release only after a full pass on the release-test host, then canary `<canary node>`, then batches of 5. Only that host (its `<release-test users>`) validates node releases. Node versions 3.0.30–3.0.33 came days apart. |
 
 ---
 
@@ -285,7 +285,7 @@ The catalog lives in code (`src/catalog/<type>.ts`) as **data**, versioned (`mob
 - **Fields**: key (immutable after the first version that includes it), kind, `workspace_id` (no FK, F21), normalized `repo_url` (`https://<host>/<owner>/<repo>`, lower case, no `.git`), optional `repo_path`, `versioning` (`lockstep`|`independent`), `tag_pattern` with a generated `tag_prefix`, **`tag_rule`** (`candidate`|`validation_commit`, with `settings.validationPath` such as `.release-validation/{version}.json`), build-ref kind, merge method (`squash`|`merge`|`rebase`), merge window (`strict`|`off`), ship order, state (`pending`|`active`|`retired`|`moved_out`), lineage, **anchor task**.
 - **Repo URL**: required for an active component of a versioned profile. It is prefilled from the workspace when core knows it; otherwise the board enters it in the profile (workspaces default to `local_path` with no URL, G26). A missing URL raises `component_repo_unknown` and blocks Start.
 - **Anchor task**: one board-owned `release-ops` task per component, "Component: <project> · <component>", filed on the component's workspace (the board creates it through core with `projectWorkspaceId`; in a single-component project the project's Roadmap task serves). The plugin creates every component ops task, and every bug report of that component, with `inheritExecutionWorkspaceFromIssueId = <anchor>` plus an explicit execution-workspace preference. The task then lands on the component's repo and does not reuse the anchor's execution workspace (G23; a 1b contract test pins this). In Phase 0 the PM sets `projectWorkspaceId` on component ops tasks directly.
-- **Tag namespace**: a unique index on `(company, repo_url, tag_prefix)` over active components. One project owns a repo's tag namespace. This covers the repo bound in two projects (P1): only the app projects make SecurezoneVPN and SecureField components. VPN Platform's `ios-*` workspaces become **reference workspaces**, ignored by the plugin, and their tasks raise `task_on_reference_workspace`.
+- **Tag namespace**: a unique index on `(company, repo_url, tag_prefix)` over active components. One project owns a repo's tag namespace. This covers the repo bound in two projects (P1): only the app projects make AppA and AppB components. VPN Platform's `ios-*` workspaces become **reference workspaces**, ignored by the plugin, and their tasks raise `task_on_reference_workspace`.
 - **Resolution** (first match wins; stored in `roadmap_items.component_ids` and `component_source`):
   1. `c:` labels of the task's own project (`label`). Several are allowed.
   2. A component confirmed by the PM or the board, or set by the plugin on its own tasks (`manual`). Phase 0: the component column of the PM's classification. Phase 1: `roadmap_update_tasks {component}` or `task.setComponent`.
@@ -317,7 +317,7 @@ The catalog lives in code (`src/catalog/<type>.ts`) as **data**, versioned (`mob
 
 | Label | Format | Max length (limit 48, F7) | Applied by |
 |---|---|---|---|
-| Version (prefixed) | `v:<projectKey>-<versionKey>`, e.g. `v:vpn-1.4`, `v:sz-2.1`, `v:pre-1.3` | 2 + 8 + 1 + 32 = 43 | PM (Phase 0 by hand, Phase 1 by tool), board, plugin |
+| Version (prefixed) | `v:<projectKey>-<versionKey>`, e.g. `v:vpn-1.4`, `v:appa-2.1`, `v:pre-1.3` | 2 + 8 + 1 + 32 = 43 | PM (Phase 0 by hand, Phase 1 by tool), board, plugin |
 | Version (bare) | `v:<versionKey>`; at most one project per company | 34 | Cleanio iOS: `v:mvp`, `v:1.0`, `v:1.1` |
 | Component | `c:<projectKey>-<componentKey>`; every component of a project with a shared workspace (§3.5) | 27 | PM, engineers at creation, plugin |
 | Shared | `type:epic`, `type:bug`, `type:hotfix`, `release-ops`; one set per company | — | as revision 3 |
@@ -327,7 +327,7 @@ The catalog lives in code (`src/catalog/<type>.ts`) as **data**, versioned (`mob
 - **Bare-key guards** (worker): a bare version key must not start with `<any projectKey>-`, and a new project key must not equal the first `-` segment of an existing bare key.
 - **Keys** follow `^[a-z0-9][a-z0-9._-]{0,31}$`. Only the board creates labels (plugins cannot until S4, §16). The profile tab lists missing labels with "Copy name". Every version needs one, including each version of a frequently released independent component (§4.4).
 - **Sub-tasks and follow-ups** copy the parent's `v:` (and `c:`) labels. Counting ignores the copy.
-- **Where the version shows** (F29): Phase 0, the properties panel, the Tags column and label filters. Phase 1a, the plugin chip "Version: Securezone iOS 2.1 · Component: app" and card in both task views and on phones.
+- **Where the version shows** (F29): Phase 0, the properties panel, the Tags column and label filters. Phase 1a, the plugin chip "Version: App A iOS 2.1 · Component: app" and card in both task views and on phones.
 
 ### 4.3 Classification (lanes)
 
@@ -542,7 +542,7 @@ Tags are created only from a "Ready: yes" row. `phase0.import` turns the rows in
 | `qa` (QA owners) | Project, ordered; component override | Review stage; QA verdicts per candidate; integration QA | The single agent with role `qa` (G19) |
 | `merge_owner` | Project, ordered principals; component override | Approval stage; **the only principals that merge**; enforce the window; write the trailer | Configured list, else [company release agent, QA owners…, PM] + always a board user last |
 | `release_manager` | Project, one principal; component override | Tags, release records, release notes, cherry-pick patches, tracking task | First agent merge owner, else the PM; a board user when only a person may tag (`component.recordTag`) |
-| `build_owner` | Component, one principal | Candidates, deployments and store submission in the right environment (Mac, release-test host, staging, store account) | The release manager; for `mobile_app` components the board sets it explicitly to the agent with the build machine |
+| `build_owner` | Component, one principal | Candidates, deployments and store submission in the right environment (build computer, release-test host, staging, store account) | The release manager; for `mobile_app` components the board sets it explicitly to the agent with the build machine |
 | `developer` | Component | Planned-owner suggestions only | Most frequent assignee of closed tasks on the component's workspace in 90 days |
 | `approver` | Project, board users | Board gates, proposals, transitions | The company's `board_user_ids` |
 | Intake agents | Company list | Forward intake to the right project's PM | TrelloIntake, SupportTriage |
@@ -562,7 +562,7 @@ available(a)     = status not in (terminated, paused, error)       -- core route
 ```
 
 - **Only stored values count at runtime**, plus the board fallback. A newly hired `qa` agent never silently changes who merges.
-- **Role-down mode** (generalizes Mac-down): when every agent merge owner is unavailable and the list is `strict`, the builder returns no policy (`merge_owner_unavailable`) and the PM hands out no code tasks for that component. When not strict, the next available principal is used, ending with the board (`merge_owner_is_board`).
+- **Role-down mode** (generalizes build-computer-down): when every agent merge owner is unavailable and the list is `strict`, the builder returns no policy (`merge_owner_unavailable`) and the PM hands out no code tasks for that component. When not strict, the next available principal is used, ending with the board (`merge_owner_is_board`).
 - **Health flags** (Needs-you): `pm_missing`, `role_agent_unavailable`, `merge_owner_unavailable`, `merge_owner_is_board`, `qa_owner_missing`, `role_unfilled` (a gate's approver role is empty), `policy_missing`, `policy_stale` (roles changed; task not yet in review), `policy_names_unavailable_agent`, `merge_by_non_owner`, `skill_not_attached`, `profile_invalid` (the Phase 0 profile block does not parse or fails the schema), `train_owner_missing`.
 
 ### 10.3 Plan-with-PM loop (per project)
@@ -645,8 +645,8 @@ expectedPolicy(task, executor):
 |---|---|---|
 | Cleanio iOS | FlutterEngineer | `[review: QAEngineer] → [approval: ReleaseEngineer, board]` |
 | Cleanio iOS | QAEngineer (test code) | `[approval: ReleaseEngineer, board]` |
-| Securezone iOS (proposed) | SecurezoneiOS | `[approval: QA, PM, board]` (collapsed: QA reviews and merges) |
-| Securezone iOS (proposed) | QA | `[approval: PM, board]` |
+| App A iOS (proposed) | AppAiOS | `[approval: QA, PM, board]` (collapsed: QA reviews and merges) |
+| App A iOS (proposed) | QA | `[approval: PM, board]` |
 | Presto VPN `api` (proposed) | Backend Engineer | `[approval: QA Tester, PM, board]` |
 
 - Core picks the first participant that is not the executor (G15), so ordered lists never 422, and a board user is always last.
@@ -676,7 +676,7 @@ All agents share one managed GitHub identity (`doc/execution-github-identity.md`
 
 ### 12.1 Identity, packaging, capabilities and the v0.1 spike
 
-- Key `paperclip.roadmap`, `displayName: "Roadmap"`, `database.namespaceSlug: "roadmap"` → `plugin_roadmap_d0dfaa84c1` (F22), permanent after the first install. Location `packages/plugins/roadmap/`, packaged and deployed like mac-fleet (commit mac-fleet first or copy its scripts, F44).
+- Key `paperclip.roadmap`, `displayName: "Roadmap"`, `database.namespaceSlug: "roadmap"` → `plugin_roadmap_d0dfaa84c1` (F22), permanent after the first install. Location `packages/plugins/roadmap/`, packaged and deployed like the fork's environment driver plugin (commit that plugin first or copy its scripts, F44).
 - **Capabilities, all declared in the 1a manifest** (F36):
   - read: `companies.read`, `projects.read`, **`project.workspaces.read`** (new, G3), `agents.read`, `issues.read`, `issue.relations.read`, `issue.subtree.read`, `issue.comments.read`, `issue.documents.read`, `approvals.read`, `access.members.read`;
   - write: `issues.create`, `issues.update`, `issues.wakeup`, `issue.comments.create`, `issue.comments.create_human_attributed`, `issue.documents.write`;
@@ -1000,7 +1000,7 @@ Role runbooks cover: the PM's planning loop, classification, parking, hand-out w
    follow that skill: it tells you how to read your project's release profile and which of its
    runbooks apply to you. Do not keep roadmap rules in this file.
    ```
-7. **Board-policy edit** (G30): two lines in the fork's bundled `skills/paperclip/SKILL.md` Board policy, carried as a fork change next to S6a (§16). It ships with the deploy that precedes Phase 0b, which the mac-fleet fix needs anyway: the bundled skills ship inside the server image (the Dockerfile copies the repo), so only a deploy changes them.
+7. **Board-policy edit** (G30): two lines in the fork's bundled `skills/paperclip/SKILL.md` Board policy, carried as a fork change next to S6a (§16). It ships with the deploy that precedes Phase 0b, which the environment driver plugin fix needs anyway: the bundled skills ship inside the server image (the Dockerfile copies the repo), so only a deploy changes them.
    - "If the `roadmap` skill is enabled for you, the roles it resolves apply; a project's PM is that project's coordinator."
    - "When a task carries an execution policy, `in_review` routes it to the stage participant; do not mention the coordinator for that hand-off."
 
@@ -1118,14 +1118,14 @@ The JSON Schema lives in `references/phase0.md` and in the plugin (`src/catalog/
    "roles": {"buildOwner": {"type": "agent", "id": "…", "name": "NodeOps"},
              "releaseManager": {"type": "agent", "id": "…", "name": "NodeOps"}},
    "channels": {"release_test": {"settings": {"host": "release-test"}},
-                "canary": {"settings": {"nodes": ["nuremberg-01"], "minHours": 24}},
+                "canary": {"settings": {"nodes": ["<canary node>"], "minHours": 24}},
                 "fleet": {"ships": true, "settings": {"batchSize": 5}}},
    "gates": ["tasks_closed", "release_test_validated", "qa", "release_checklist"],
    "distribution": ["canary_healthy", "fleet_rollout"]}],
  "projectGates": [{"key": "integration_qa", "approverRole": "qa", "params": {"minComponents": 2}},
                   {"key": "release_checklist", "approverRole": "release_manager"},
                   {"key": "board", "approverRole": "board"}],
- "referenceWorkspaces": ["<ios-securezone id>", "<ios-securefield id>"],
+ "referenceWorkspaces": ["<ios-app-a id>", "<ios-app-b id>"],
  "labels": {"versions": {}, "components": {}, "epic": "type:epic", "bug": "type:bug",
             "hotfix": "type:hotfix", "ops": "release-ops"},
  "versions": [], "repoTags": [], "lineage": null,
@@ -1270,24 +1270,24 @@ Safety for every step: `npx paperclipai` for content-bearing arguments; one writ
 
 | Company · project | Type | Key / labels | Components (repo · path · tag) | Roles (proposed) | Notes |
 |---|---|---|---|---|---|
-| CLE · Cleanio iOS | `mobile_app` | `cle`, **bare**: `v:mvp`, `v:1.0`, `v:1.1` | `app`: `https://github.com/mithatcolakel/cleanio` · — · `v{version}`; tag rule `candidate`; build number; strict window | §19.3 | MVP = milestone; import `v1.1.0`, `v1.1.1` (P6); CLE-97 is the anchor |
+| CLE · Cleanio iOS | `mobile_app` | `cle`, **bare**: `v:mvp`, `v:1.0`, `v:1.1` | `app`: `https://github.com/<owner>/<app>` · — · `v{version}`; tag rule `candidate`; build number; strict window | §19.3 | MVP = milestone; import `v1.1.0`, `v1.1.1` (P6); CLE-97 is the anchor |
 | CLE · Onboarding | `operations` | `onb` | — | — | Ongoing and Routines only |
-| VPN · VPN Platform | `platform` | `vpn`, `v:vpn-<key>`; node versions `v:vpn-node-<x.y>` | `backend`: VPNProject · — · `v{version}` (backend_service, 10, lockstep, `staging` only if one exists, question 8); `node`: VPN-Node · — · `v{version}` (infrastructure, 30, **independent** with its own versions, tag rule `validation_commit`, merge method `merge`; readiness release-test → QA → checklist; distribution canary `nuremberg-01` → fleet in batches of 5) | pm = Project Manager; qa = QA; merge owners [PM, QA] + board; release manager PM (backend) and NodeOps (node); build owners BackendEngineer and NodeOps | Profile: §14.6. `ios-*` workspaces are reference workspaces (§3.5); 1 open task there → `task_on_reference_workspace`. No `c:` labels (separate repos); `backend` is the primary workspace, so the PM confirms components. "Daily Server Check" in Routines. |
-| VPN · Securezone iOS | `mobile_app` | `sz`, `v:sz-<key>` | `app`: SecurezoneVPN · — · `v{version}` | pm set explicitly (no lead, P4); qa = QA; merge owners [PM, QA] + board; release manager PM (tags); build owner SecurezoneiOS (Mac `mac-securezone`: builds, beta uploads, store submission) | — |
-| VPN · Securefield iOS | `mobile_app` | `sf`, `v:sf-<key>` | `app`: SecureField · — · `v{version}` | as Securezone; build owner SecurefieldiOS (in `error` → `owner_unavailable`) | — |
-| VPN · train | — | — | VPN Platform (backend versions) + Securezone iOS + Securefield iOS; `single`, `ordered`: backend (10) → apps (40). A node version joins only when a release needs it (then backend → node → apps) | owner = Project Manager, anchor VPN Platform | Works without restructuring |
-| PRE · Presto VPN | `platform` | `pre`, `v:pre-<key>`; `c:pre-mobile`, `c:pre-api`, `c:pre-admin`, `c:pre-node` | `mobile` / `api` / `admin`: presto-monorepo · `<path>` · `<key>/v{version}` (40 strict / 10 / 20, lockstep); `node`: presto-vpn-node · — · `v{version}` (30, **independent**, pattern from the existing `v2.0.x` tags; readiness `tasks_closed` → `ci_green` (`vpn-node.yml`) → `qa` → `board`; distribution `release_workflow` (the user dispatches `vpn-node-release.yml`) → `fleet_rollout`) | pm = Project Manager; qa = QA Tester; merge owners [PM, QA Tester] + board; release manager PM, for node the VPN Node Engineer (it tags after CI is green, P7); build owners: mobile iOS Engineer (**no Mac environment**, question 9), api/admin Backend Engineer (in `error`), node VPN Node Engineer | All 16 tasks sit on the monorepo (P3), so every version task needs a `c:` label; paths to confirm. A tag made by a person is recorded with `component.recordTag`. |
+| VPN · VPN Platform | `platform` | `vpn`, `v:vpn-<key>`; node versions `v:vpn-node-<x.y>` | `backend`: VPNProject · — · `v{version}` (backend_service, 10, lockstep, `staging` only if one exists, question 8); `node`: VPN-Node · — · `v{version}` (infrastructure, 30, **independent** with its own versions, tag rule `validation_commit`, merge method `merge`; readiness release-test → QA → checklist; distribution canary `<canary node>` → fleet in batches of 5) | pm = Project Manager; qa = QA; merge owners [PM, QA] + board; release manager PM (backend) and NodeOps (node); build owners BackendEngineer and NodeOps | Profile: §14.6. `ios-*` workspaces are reference workspaces (§3.5); 1 open task there → `task_on_reference_workspace`. No `c:` labels (separate repos); `backend` is the primary workspace, so the PM confirms components. "Daily Server Check" in Routines. |
+| VPN · App A iOS | `mobile_app` | `appa`, `v:appa-<key>` | `app`: AppA · — · `v{version}` | pm set explicitly (no lead, P4); qa = QA; merge owners [PM, QA] + board; release manager PM (tags); build owner AppAiOS (its build computer: builds, beta uploads, store submission) | — |
+| VPN · App B iOS | `mobile_app` | `appb`, `v:appb-<key>` | `app`: AppB · — · `v{version}` | as App A; build owner AppBiOS (in `error` → `owner_unavailable`) | — |
+| VPN · train | — | — | VPN Platform (backend versions) + App A iOS + App B iOS; `single`, `ordered`: backend (10) → apps (40). A node version joins only when a release needs it (then backend → node → apps) | owner = Project Manager, anchor VPN Platform | Works without restructuring |
+| PRE · Presto VPN | `platform` | `pre`, `v:pre-<key>`; `c:pre-mobile`, `c:pre-api`, `c:pre-admin`, `c:pre-node` | `mobile` / `api` / `admin`: presto-monorepo · `<path>` · `<key>/v{version}` (40 strict / 10 / 20, lockstep); `node`: presto-vpn-node · — · `v{version}` (30, **independent**, pattern from the existing `v2.0.x` tags; readiness `tasks_closed` → `ci_green` (`vpn-node.yml`) → `qa` → `board`; distribution `release_workflow` (the user dispatches `vpn-node-release.yml`) → `fleet_rollout`) | pm = Project Manager; qa = QA Tester; merge owners [PM, QA Tester] + board; release manager PM, for node the VPN Node Engineer (it tags after CI is green, P7); build owners: mobile iOS Engineer (**no build-computer environment**, question 9), api/admin Backend Engineer (in `error`), node VPN Node Engineer | All 16 tasks sit on the monorepo (P3), so every version task needs a `c:` label; paths to confirm. A tag made by a person is recorded with `component.recordTag`. |
 | VPN, PRE · Onboarding | `operations` | `onb` | — | — | — |
 
 ### 18.6 After the user's restructuring (later rollout step)
 
 | Company | Change | Result |
 |---|---|---|
-| VPN | `node` → new project **VPN Node** | `infrastructure`, key `node`, labels `v:node-<key>` (open `v:vpn-node-*` versions map 1:1, §17), same repo, `v{version}` continues, `lineage` points at VPN Platform; roles NodeOps (build owner, release manager) and a QA owner with release-test access (question 10). VPN Platform keeps `backend` and becomes `backend_service` (or stays `platform` if api/worker/admin deploy separately, question 8). Stray `ios-*` tasks move to the app projects; those workspaces are hidden. Train: VPN Platform (10), VPN Node (30), Securezone iOS (40), Securefield iOS (40). |
+| VPN | `node` → new project **VPN Node** | `infrastructure`, key `node`, labels `v:node-<key>` (open `v:vpn-node-*` versions map 1:1, §17), same repo, `v{version}` continues, `lineage` points at VPN Platform; roles NodeOps (build owner, release manager) and a QA owner with release-test access (question 10). VPN Platform keeps `backend` and becomes `backend_service` (or stays `platform` if api/worker/admin deploy separately, question 8). Stray `ios-*` tasks move to the app projects; those workspaces are hidden. Train: VPN Platform (10), VPN Node (30), App A iOS (40), App B iOS (40). |
 | PRE | `node` → **Presto VPN Node** | `infrastructure`, key `pnode`, labels `v:pnode-<key>`; `c:pre-node` is retired. Presto VPN stays `platform` (mobile, api, admin). Train: Presto VPN (api 10, admin 20, mobile 40) + Presto VPN Node (30). Later, mobile may move to "Presto iOS" the same way. |
 | CLE | none | A future Android app from the same Flutter repo enables the `play_*` channels; a separate backend becomes a new prefixed project. |
 
-**VPN Node gates** (the board rule "tested before proposed" and VPN-137, P8): release-test validation of the candidate (a full pass with the AmneziaWG legs, the stack lock held, evidence attached; the verdict names the validated sha, which may be a task-branch head) → QA verdict by an owner with release-test access → release checklist → board approval → **tag** on the commit that adds `.release-validation/<v>.json` on top of the validated sha (tag rule `validation_commit`, merge method `merge`) → canary on `nuremberg-01` (`canary_healthy`, distribution) → rollout in batches of 5 (`fleet_rollout`). Ship order applies to the fleet channel.
+**VPN Node gates** (the board rule "tested before proposed" and VPN-137, P8): release-test validation of the candidate (a full pass with the AmneziaWG legs, the stack lock held, evidence attached; the verdict names the validated sha, which may be a task-branch head) → QA verdict by an owner with release-test access → release checklist → board approval → **tag** on the commit that adds `.release-validation/<v>.json` on top of the validated sha (tag rule `validation_commit`, merge method `merge`) → canary on `<canary node>` (`canary_healthy`, distribution) → rollout in batches of 5 (`fleet_rollout`). Ship order applies to the fleet channel.
 
 ---
 
@@ -1295,11 +1295,11 @@ Safety for every step: `npx paperclipai` for content-bearing arguments; one writ
 
 ### 19.1 State on 2026-10-07
 
-- Company Cleanio `35f4ebee-b18f-441b-bf5e-f92f5be51c56` (CLE): **Cleanio iOS** `3e7bb400-1fa5-4c96-953f-c283c99be85c` (lead = Project Manager) and **Onboarding** (no lead). One routine, "Trello intake poll" (TrelloIntake). Prod runs `deploymentMode=authenticated`; the board CLI credential is instance admin.
-- Agents: Project Manager and TrelloIntake work; FlutterEngineer, QAEngineer and ReleaseEngineer are in `error` (dead Mac default environment) and still invokable (F38). All five have `canCreateAgents=true`. No protections applied (TrelloIntake forwards by reassigning to the PM).
+- Company Cleanio `<company id>` (CLE): **Cleanio iOS** `<project id>` (lead = Project Manager) and **Onboarding** (no lead). One routine, "Trello intake poll" (TrelloIntake). Prod runs `deploymentMode=authenticated`; the board CLI credential is instance admin.
+- Agents: Project Manager and TrelloIntake work; FlutterEngineer, QAEngineer and ReleaseEngineer are in `error` (dead build-computer default environment) and still invokable (F38). All five have `canCreateAgents=true`. No protections applied (TrelloIntake forwards by reassigning to the PM).
 - **Applied 2026-10-06**: labels `v:mvp`, `v:1.0`, `type:epic`, `type:bug`, `type:hotfix`, `release-ops`; **CLE-97** "Cleanio Roadmap" (board-owned, `release-ops`); **CLE-98** "Draft the Cleanio roadmap with the board (MVP → v1.0)" (PM); **addenda v1** on all five agents (words planning → active → frozen → ready → released, manual QA → RE hand-off, "no release branches").
-- **The PM's draft rev1** is on CLE-97 (`roadmap`), waiting for approval. It measured: `main` carries the CLE-3 merge and unpublished tags `v1.1.0`/`v1.1.1`; 4 branches hold unmerged work; `flutter analyze` on `main` = 873 errors, all from one file deleted on every branch; no TestFlight build ever; the Mac runner is down for all three Mac agents. It proposes MVP (TestFlight-only), v1.0 (first App Store release), v1.1 (needs a label), epics E1–E6, a classification of 30 open tasks, and Q1–Q6 (Mac, version numbers, dates, payments defects placement, `v:1.1`, cancel CLE-1).
-- **Amendment posted by the board on CLE-98 (2026-10-06)**, effective after approval: (1) the PM creates no epics; the board creates E1–E6 and then asks for parents; (2) the PM creates no labels; the board creates `v:1.1`; relabels keep every other label; (3) the PM parks only `todo`/`backlog` tasks (CLE-37, CLE-41) in **one** write with `Planned owner:` and `Rank:` lines; `blocked`/`in_review` future tasks (CLE-38, CLE-40, CLE-39) go on a board parking list; blockers of MVP or ongoing work are not parked; (4) **Mac-down mode**: no assignment, wake or mention of the three Mac agents until the board clears their errors; (5) the word **stabilizing** replaces "frozen", and Ready = all version tasks closed + QA PASS + board TestFlight approval on the same build.
+- **The PM's draft rev1** is on CLE-97 (`roadmap`), waiting for approval. It measured: `main` carries the CLE-3 merge and unpublished tags `v1.1.0`/`v1.1.1`; 4 branches hold unmerged work; `flutter analyze` on `main` = 873 errors, all from one file deleted on every branch; no TestFlight build ever; the build computer's runner is down for all three agents that use it. It proposes MVP (TestFlight-only), v1.0 (first App Store release), v1.1 (needs a label), epics E1–E6, a classification of 30 open tasks, and Q1–Q6 (build computer, version numbers, dates, payments defects placement, `v:1.1`, cancel CLE-1).
+- **Amendment posted by the board on CLE-98 (2026-10-06)**, effective after approval: (1) the PM creates no epics; the board creates E1–E6 and then asks for parents; (2) the PM creates no labels; the board creates `v:1.1`; relabels keep every other label; (3) the PM parks only `todo`/`backlog` tasks (CLE-37, CLE-41) in **one** write with `Planned owner:` and `Rank:` lines; `blocked`/`in_review` future tasks (CLE-38, CLE-40, CLE-39) go on a board parking list; blockers of MVP or ongoing work are not parked; (4) **build-computer-down mode**: no assignment, wake or mention of the three build-computer agents until the board clears their errors; (5) the word **stabilizing** replaces "frozen", and Ready = all version tasks closed + QA PASS + board TestFlight approval on the same build.
 
 ### 19.2 Remaining steps
 
@@ -1312,17 +1312,17 @@ Safety for every step: `npx paperclipai` for content-bearing arguments; one writ
    - MVP is a **milestone**: TestFlight-only, no tag. Its builds still carry a marketing version, so **Q2 must be answered before the first MVP upload**; the candidate and the TestFlight evidence record it (`artifactVersion`);
    - bugs: only the PM files bug tasks; QAEngineer and ReleaseEngineer write them under `Proposals` (§9).
 
-   Answer the question card: Q1 Mac (recommendation (c)), Q2 version numbers (decides the tag registry and the MVP's marketing version, §19.3), Q3 dates, Q4 payments defects.
+   Answer the question card: Q1 build computer (recommendation (c)), Q2 version numbers (decides the tag registry and the MVP's marketing version, §19.3), Q3 dates, Q4 payments defects.
 2. **The PM applies its part** one task at a time: labels (including `release-ops` on the build and QA tasks above), parking of CLE-37 and CLE-41, `Planned owner:`/`Rank:` lines, cancel CLE-1 with a reason, summary on CLE-97. MVP becomes active with the approval, so the PM also creates the tracking task "Release Cleanio MVP" (board-owned, `release-ops` + `v:mvp`, §4.4 Start). Never `suggest_tasks` or plan acceptance for more than 3 assigned tasks (F18).
 3. **The board applies its part**: create `v:1.1` (bare, grandfathered); create E1–E6 ("Epic: <name>", `type:epic`, unassigned, `backlog`, no `v:`), then ask the PM to re-parent; park CLE-38 and CLE-40 with one `PATCH /api/issues/:id {"status":"backlog","assigneeAgentId":null}` each; turn on the Tags column per device.
-4. **Skill migration (replaces revision 3's addenda v2)**: rename CLE-97 to **"Roadmap: Cleanio iOS"** and check that it sits in project Cleanio iOS (discovery needs both, §14.3); create the CLE skill `roadmap` (§14.4); write `release-profile` (§19.3) and `addenda-v1-archive` (the five agents' roadmap sections) on CLE-97; attach the skill to all five agents; replace each addendum with the pointer stanza (5 sequential `PUT …/instructions-bundle/file`; wakes nobody). Mapping: labels, lifecycle words, one active version, parking → `SKILL.md` + profile aliases; PM duties → `roles/pm.md`; "only ReleaseEngineer merges" → `SKILL.md` §3 + profile `mergeOwners` strict + `roles/merge-owner.md`; manual QA → RE hand-off → **replaced** by the generated execution policy (0b); Ready rule → `types/mobile_app.md` + profile gates; RE build and tag duties → `roles/build-owner.md`, `roles/release-manager.md`; QA verdicts → `roles/qa-owner.md`; TrelloIntake's `Proposed flow:` → `roles/intake.md`; Cleanio facts (Mac device, Adapty, simulator-only ruling) stay in that agent's own AGENTS.md or the `roadmap` document. Anything that maps nowhere goes to the board first. Rollback: restore the archived sections and `--mode remove` the skill.
+4. **Skill migration (replaces revision 3's addenda v2)**: rename CLE-97 to **"Roadmap: Cleanio iOS"** and check that it sits in project Cleanio iOS (discovery needs both, §14.3); create the CLE skill `roadmap` (§14.4); write `release-profile` (§19.3) and `addenda-v1-archive` (the five agents' roadmap sections) on CLE-97; attach the skill to all five agents; replace each addendum with the pointer stanza (5 sequential `PUT …/instructions-bundle/file`; wakes nobody). Mapping: labels, lifecycle words, one active version, parking → `SKILL.md` + profile aliases; PM duties → `roles/pm.md`; "only ReleaseEngineer merges" → `SKILL.md` §3 + profile `mergeOwners` strict + `roles/merge-owner.md`; manual QA → RE hand-off → **replaced** by the generated execution policy (0b); Ready rule → `types/mobile_app.md` + profile gates; RE build and tag duties → `roles/build-owner.md`, `roles/release-manager.md`; QA verdicts → `roles/qa-owner.md`; TrelloIntake's `Proposed flow:` → `roles/intake.md`; Cleanio facts (build device, Adapty, simulator-only ruling) stay in that agent's own AGENTS.md or the `roadmap` document. Anything that maps nowhere goes to the board first. Rollback: restore the archived sections and `--mode remove` the skill.
 5. **Roadmap daily**: PM, project Cleanio iOS, 09:00, `skip_if_active`, `skip_missed`, `medium` (§10.4, duties §19.4).
 6. **PM GitHub access check**: one PM run lists the last merged PRs of the Cleanio repo; otherwise merge detection moves to QAEngineer's routine in 0b or to a weekly board CLI check.
 7. **Onboarding**: no profile (shown as operations). Nothing to apply.
 
-**Phase 0b (after the mac-fleet fix is live)**
+**Phase 0b (after the environment driver plugin fix is live)**
 
-8. The deploy that carries the mac-fleet fix also carries the Board-policy lines (§14.4 step 7). Then clear the Mac agents one at a time (`POST /api/agents/:id/clear-error`), checking one small run each.
+8. The deploy that carries the environment driver plugin fix also carries the Board-policy lines (§14.4 step 7). Then clear the build-computer agents one at a time (`POST /api/agents/:id/clear-error`), checking one small run each.
 9. The PM sets execution policies by executor at hand-out (§11.2); at most one version task in `todo`/`in_progress` per engineer, one PATCH at a time.
 10. First MVP epic E1 "Integrate the delivered branches" (CLE-87), after CLE-31 is answered (the branch choice decides it): FlutterEngineer executes one task per branch in the PM's merge order; QA reviews; ReleaseEngineer merges (method `merge`) with the trailer.
 11. MVP end game (§19.5).
@@ -1333,16 +1333,16 @@ The document is one prose line ("Release profile of Cleanio iOS. Edited by the b
 
 ```json
 {"schema": "paperclip.roadmap/release-profile@1", "enabled": true,
- "project": {"id": "3e7bb400-1fa5-4c96-953f-c283c99be85c", "name": "Cleanio iOS", "type": "mobile_app",
+ "project": {"id": "<project id>", "name": "Cleanio iOS", "type": "mobile_app",
              "templateKey": "mobile_app@1", "key": "cle", "labelStyle": "bare", "versionScheme": "semver", "trunk": "main"},
- "roles": {"pm": {"type": "agent", "id": "0cfbad0d-…", "name": "Project Manager"},
+ "roles": {"pm": {"type": "agent", "id": "…", "name": "Project Manager"},
            "qa": [{"type": "agent", "id": "…", "name": "QAEngineer"}],
            "mergeOwners": [{"type": "agent", "id": "…", "name": "ReleaseEngineer"}], "mergeOwnersStrict": true,
            "releaseManager": {"type": "agent", "id": "…", "name": "ReleaseEngineer"},
            "approvers": [{"type": "user", "id": "…", "name": "board"}],
            "intake": [{"type": "agent", "id": "…", "name": "TrelloIntake"}]},
  "components": [{"key": "app", "name": "Cleanio app", "kind": "mobile_app", "workspaceId": "…", "workspaceName": "<workspace name>",
-   "repoUrl": "https://github.com/mithatcolakel/cleanio", "path": null, "versioning": "lockstep",
+   "repoUrl": "https://github.com/<owner>/<app>", "path": null, "versioning": "lockstep",
    "tagPattern": "v{version}", "tagRule": "candidate", "buildRef": "build_number",
    "mergeMethod": "squash", "mergeWindow": "strict", "shipOrder": 40, "anchorTask": "CLE-97",
    "roles": {"buildOwner": {"type": "agent", "id": "…", "name": "ReleaseEngineer"},
@@ -1350,7 +1350,7 @@ The document is one prose line ("Release profile of Cleanio iOS. Edited by the b
    "channels": {"testflight": {"enabled": true, "settings": {"externalTesters": false}}, "app_store": {"enabled": true, "ships": true},
                 "play_internal": {"enabled": false}, "play_store": {"enabled": false}},
    "gates": ["tasks_closed", "qa", "beta_approved"], "advisory": ["release_checklist"], "distribution": ["store_submitted"],
-   "settings": {"buildCommand": "flutter build ipa --build-name=<version> --build-number=<n>", "environment": "Mac"}}],
+   "settings": {"buildCommand": "flutter build ipa --build-name=<version> --build-number=<n>", "environment": "build computer"}}],
  "projectGates": [],
  "labels": {"versions": {"mvp": "v:mvp", "1.0": "v:1.0", "1.1": "v:1.1"}, "components": {},
             "epic": "type:epic", "bug": "type:bug", "hotfix": "type:hotfix", "ops": "release-ops"},
@@ -1359,8 +1359,8 @@ The document is one prose line ("Release profile of Cleanio iOS. Edited by the b
               {"key": "1.0", "kind": "main", "state": "planned", "components": ["app"], "numbers": {"app": "<Q2: 1.0.0 | 1.2.0>"}},
               {"key": "1.1", "kind": "main", "state": "planned", "components": ["app"], "numbers": {}}],
  "referenceWorkspaces": [],
- "repoTags": [{"repoUrl": "https://github.com/mithatcolakel/cleanio", "tag": "v1.1.0", "source": "imported"},
-              {"repoUrl": "https://github.com/mithatcolakel/cleanio", "tag": "v1.1.1", "source": "imported"}],
+ "repoTags": [{"repoUrl": "https://github.com/<owner>/<app>", "tag": "v1.1.0", "source": "imported"},
+              {"repoUrl": "https://github.com/<owner>/<app>", "tag": "v1.1.1", "source": "imported"}],
  "lineage": null,
  "rules": {"wipVersionPerAgent": 1, "wipOngoingPerAgent": 1, "hotfixDailyCap": 3, "ongoingAgingHours": 24},
  "aliases": {"planning": "planned", "frozen": "stabilizing", "ready": "Ready badge"},
@@ -1400,10 +1400,10 @@ Effort is for one engineer working with an AI agent.
 |---|---|---|
 | **0a / 0b** Cleanio | §19 | board time + PM runs |
 | **0** other companies | §18, after the user decides; before or after the restructuring (§17.4) | board time + PM runs |
-| **1a** read-only, every company | mac-fleet committed (F44); **S6a deployed first**; manifest with the full capability set incl. `project.workspaces.read`; **all of migration 001** with the validator CI test and the core-delete test (§13 rule 6); catalog v1 (generic beta and store gates, infrastructure order, tag rules) and invariants as code; `release-profile@1` schema; profile read view and setup wizard; component resolution with confidence levels; snapshots and company summary with `flags`; Overview, Versions pipeline (read-only), Flow, Backlog, Version detail, route sidebar, project tab and chip, task chip and card; trains read-only; label mirror (read and flag); `phase0.import`; token lint | **9–11 days** |
+| **1a** read-only, every company | the environment driver plugin committed (F44); **S6a deployed first**; manifest with the full capability set incl. `project.workspaces.read`; **all of migration 001** with the validator CI test and the core-delete test (§13 rule 6); catalog v1 (generic beta and store gates, infrastructure order, tag rules) and invariants as code; `release-profile@1` schema; profile read view and setup wizard; component resolution with confidence levels; snapshots and company summary with `flags`; Overview, Versions pipeline (read-only), Flow, Backlog, Version detail, route sidebar, project tab and chip, task chip and card; trains read-only; label mirror (read and flag); `phase0.import`; token lint | **9–11 days** |
 | **1b** planning, readiness, editors | lifecycle with the per-component trunk rule and Move-unfinished; move/owner/rank/component; Hand out now; Insert hotfix; notes and bugs; proposals with run-end hand-over and review; Plan-with-PM panel; drift and Re-park; label restore; tick with stranded check, mutex and wake cap; **generic gate engine** (candidates incl. `branch` and cherry-pick refs, deployments, gate results, evidence validation, code-deliverable staleness, supersede, tag rules); component anchors and workspace inheritance (contract test); all tools; board actions; roles and the policy builder; profile, component, channel and gate editors; train create/edit and `single` board gate; managed skill with reset-on-hash; settings page; widget; comment Report bug; contract tests for protections | **13–15 days** |
 | **2** | merge-window automation per component and path; patches in both modes; distribution tools, ship-order enforcement and Live; `auto_repark`; `release` document mirror; company and project Timeline with trains | **6–7 days** |
-| **3** à la carte | component move tool (§17.3) **3–4 days** (less with S10); GitHub verifier filling `repo_tags` (~2 days); assignment protections (2–3 days); automatic feed (~2 days); forecast and burndown; drag-rank; mac-fleet release automation (own plan) | — |
+| **3** à la carte | component move tool (§17.3) **3–4 days** (less with S10); GitHub verifier filling `repo_tags` (~2 days); assignment protections (2–3 days); automatic feed (~2 days); forecast and burndown; drag-rank; environment driver plugin release automation (own plan) | — |
 
 **Total to the full flow (1a–2): about 28–33 engineer-days.** Revision 5 adds about 2 days: the per-component trunk rule, tag rules, anchors and workspace inheritance, the profile schema, and the migration tests.
 
@@ -1426,7 +1426,7 @@ Effort is for one engineer working with an AI agent.
 5. **Component inference is weak**: core defaults the workspace (G4), so a task on the default workspace counts as unconfirmed, and multi-component projects depend on `c:` labels or the PM's confirmations. Unconfirmed code tasks make every candidate of the version stale (rebuild churn). Plugin-created tasks land on the right repo only through anchor tasks (§3.5).
 6. **Configuration surface**: types, gates, channels, roles and tag rules add real complexity. Templates may assume channels that do not exist (staging at VPN/PRE, a canary mechanism), so Ready is never reached until the board edits the gates. Invariants and the wizard contain this.
 7. **Single train approvals churn**: any new candidate in any member invalidates the board approval; `per_member` is the fallback. Ordered shipping lengthens releases (apps wait for backend prod and node fleet; store review adds days).
-8. **Role holders unavailable**: all three Cleanio Mac agents, SecurefieldiOS and the Presto Backend Engineer are in `error`; Securezone/Securefield iOS have no lead; Presto mobile has no Mac environment. Gates stall (`role_unfilled`, `owner_unavailable`).
+8. **Role holders unavailable**: all three Cleanio build-computer agents, AppBiOS and the Presto Backend Engineer are in `error`; App A and App B iOS have no lead; Presto mobile has no build-computer environment. Gates stall (`role_unfilled`, `owner_unavailable`).
 9. **QA as default merge owner** (VPN, PRE) concentrates reviews, merges, tags and QA rounds on one agent with one run slot.
 10. **Skill adoption depends on core import semantics** (match by slug, keep key). A change upstream would force one re-attach per agent. Skill use is model-driven; agents can skip it, which the pointer stanza, tool errors and daily checks detect. Until Phase 1 there are three skill copies to keep in sync by hand, and hand-edited profile blocks can be invalid or stale.
 11. **Two skills can disagree**: the fork's Board policy and the `roadmap` skill. Until the Board-policy lines ship (before 0b), Phase 0 keeps all task creation with the PM; if the edit is declined, every policy-routed hand-off also wakes the PM.
@@ -1444,7 +1444,7 @@ Effort is for one engineer working with an AI agent.
 
 **Cleanio pilot (now)**
 
-1. The PM's Q1–Q4 on CLE-98 (Mac environment; 1.0.0 vs 1.2.0, which also decides whether `v1.1.0`/`v1.1.1` are retired and which marketing version the first MVP TestFlight build carries; dates; payments defects placement), plus the approval note of §19.2 step 1.
+1. The PM's Q1–Q4 on CLE-98 (build-computer environment; 1.0.0 vs 1.2.0, which also decides whether `v1.1.0`/`v1.1.1` are retired and which marketing version the first MVP TestFlight build carries; dates; payments defects placement), plus the approval note of §19.2 step 1.
 2. Revision 3's questions, still open: **protections** opt-in Phase 3 (recommended) or Phase 1; **strict stabilization** (recommended); **PM hotfix authority** up to 3 per version per day (recommended); **cherry-pick patches** onto the base tag (recommended); **TestFlight internal testers only** (recommended); whether Claude performs the board-side Phase 0a steps with the board credential after approval.
 3. **Board-policy edit**: may the fork's bundled `paperclip` skill carry the two lines of §14.4 step 7, shipped with the 0b deploy (recommended)?
 
@@ -1453,14 +1453,14 @@ Effort is for one engineer working with an AI agent.
 4. **Restructure timing**: split `vpn-node` and `presto-vpn-node` with the core-only form before onboarding those companies (cheapest when the restructuring is ready by then), or onboard with components now and move later (§17.4)?
 5. ~~**Merge owners without a release engineer**~~ **Decided 2026-10-07: the project's PM merges** (PM first) in companies with no release engineer (VPNProjects, Presto VPN). Profiles set `mergeOwners` to the PM; expect two PM runs per PR (hand-off and merge).
 6. **Labels for frequent releases**: VPN-Node ships every few days, and each version needs a board-created label until S4. One label per node version (recommended while releases stay a few per week), coarser versions, or carry S4 in the fork so the plugin creates labels?
-7. **Project keys** (permanent once used): `cle` (bare), `vpn`, `sz`, `sf`, `pre`, `onb`, later `node`, `pnode`.
+7. **Project keys** (permanent once used): `cle` (bare), `vpn`, `appa`, `appb`, `pre`, `onb`, later `node`, `pnode`.
 8. **VPN Platform backend**: one deployable, or api/worker/admin deployed separately? Is there a staging environment?
-9. **Presto**: exact monorepo paths; lockstep for mobile/api/admin (recommended at first); who builds and uploads mobile builds without a Mac environment (a Mac Fleet device, the board, or defer mobile versions)?
+9. **Presto**: exact monorepo paths; lockstep for mobile/api/admin (recommended at first); who builds and uploads mobile builds without a build-computer environment (a device of the environment driver plugin, the board, or defer mobile versions)?
 10. **VPN Node**: give QA release-test access, or let BackendEngineer verify NodeOps releases? Canary soak (default 24 h)?
 11. **Trains**: one board approval per train (recommended) or per member; is backend → node → apps the right ship order; should "Start fleet" and "Prod deploy" need a board tap?
 
 **Before Phase 1**
 
-12. ~~**The v0.1 spike**~~ **Decided 2026-10-07: installed on prod now.** Plugin `paperclip.roadmap` 0.1.0 (read-only, 8 capabilities, no namespace) runs from `/paperclip/plugin-sources/roadmap`, plugin id `e7e0f620-d615-4e4c-b373-48c606588d20`. Phase 1a adds capabilities, so its upgrade waits for one operator approval (or a soft uninstall + reinstall like mac-fleet).
+12. ~~**The v0.1 spike**~~ **Decided 2026-10-07: installed on prod now.** Plugin `paperclip.roadmap` 0.1.0 (read-only, 8 capabilities, no namespace) runs from a local plugin source directory on the server's data volume, plugin id `<plugin id>`. Phase 1a adds capabilities, so its upgrade waits for one operator approval (or a soft uninstall + reinstall like the fork's environment driver plugin).
 
 Phase 0 bug filing is no longer a question: the fork's Board policy decides it (§9).

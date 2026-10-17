@@ -89,8 +89,8 @@ describe("classifyEnvironmentError: driver envelopes", () => {
 describe("classifyEnvironmentError: SSH", () => {
   it.each([
     ["refused", "ssh: connect to host 10.0.0.5 port 22: Connection refused"],
-    ["timed out", "ssh: connect to host mini.local port 2222: Operation timed out"],
-    ["connection timed out", "ssh: connect to host mini.local port 2222: Connection timed out"],
+    ["timed out", "ssh: connect to host tower.local port 2222: Operation timed out"],
+    ["connection timed out", "ssh: connect to host tower.local port 2222: Connection timed out"],
     ["no route", "ssh: connect to host 10.0.0.5 port 22: No route to host"],
     ["unresolved host", "ssh: Could not resolve hostname nowhere.invalid: nodename nor servname provided, or not known"],
     ["banner timeout", "Connection timed out during banner exchange\r\nConnection to 127.0.0.1 port 2222 timed out"],
@@ -132,7 +132,7 @@ describe("classifyEnvironmentError: SSH", () => {
 describe("classifyEnvironmentError: provider plugin lifecycle", () => {
   it("waits 30 s while the provider plugin's worker restarts", () => {
     const error = new Error(
-      'Failed to acquire lease for environment "Mini" (sandbox): Sandbox provider "box" is installed via plugin "acme.box", but its worker is not running.',
+      'Failed to acquire lease for environment "Tower" (sandbox): Sandbox provider "box" is installed via plugin "acme.box", but its worker is not running.',
     );
     expect(classifyEnvironmentError(error, { now })).toMatchObject({
       action: "wait",

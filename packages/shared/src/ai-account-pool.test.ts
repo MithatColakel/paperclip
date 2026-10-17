@@ -11,6 +11,7 @@ import {
   deriveAiAccountState,
   findPoolRunForbiddenEnvKeys,
   findPoolRunSettingsConflicts,
+  isGoNoGoBlocker,
   isPoolRunForbiddenEnvKey,
   LOCAL_EXECUTION_DEVICE_KEY,
   linkDeviceTargetSchema,
@@ -137,10 +138,10 @@ describe("binding, device and wait-settings validators", () => {
 
   it("links a device to a plugin target", () => {
     const pluginId = "00000000-0000-4000-8000-000000000004";
-    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "fleet-provider", targetKey: "device:abc-123" }).success).toBe(true);
-    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "Fleet Provider", targetKey: "abc" }).success).toBe(false);
-    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "fleet", targetKey: "a/b" }).success).toBe(false);
-    expect(linkDeviceTargetSchema.safeParse({ pluginId: "plugin", provider: "fleet", targetKey: "abc" }).success).toBe(false);
+    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "box-provider", targetKey: "device:abc-123" }).success).toBe(true);
+    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "Box Provider", targetKey: "abc" }).success).toBe(false);
+    expect(linkDeviceTargetSchema.safeParse({ pluginId, provider: "box", targetKey: "a/b" }).success).toBe(false);
+    expect(linkDeviceTargetSchema.safeParse({ pluginId: "plugin", provider: "box", targetKey: "abc" }).success).toBe(false);
   });
 
   it("knows external devices", () => {
@@ -152,7 +153,11 @@ describe("binding, device and wait-settings validators", () => {
     for (const kind of AI_ACCOUNT_HOST_CREATABLE_KINDS) {
       expect(createAiAccountHostSchema.safeParse({ name: "Build box", kind }).success).toBe(true);
     }
-    expect(createAiAccountHostSchema.safeParse({ name: "Build box", kind: "external" }).success).toBe(false);
+    const external = createAiAccountHostSchema.safeParse({ name: "Build box", kind: "external" });
+    expect(external.success).toBe(false);
+    expect(external.error?.issues).toMatchObject([
+      { path: ["kind"], message: "Plugin devices come only from their environment driver plugin's reports" },
+    ]);
     expect(createAiAccountHostSchema.safeParse({ name: "Build box", kind: "laptop" }).success).toBe(false);
   });
 });
@@ -161,21 +166,21 @@ describe("execution device keys", () => {
   it.each([
     [{ host: "Runner.Example.COM", port: 22 }, "ssh:runner.example.com:22"],
     [{ host: " runner.example.com " }, "ssh:runner.example.com:22"],
-    [{ host: "mini.example.com", port: "0022" }, "ssh:mini.example.com:22"],
-    [{ host: "mini.example.com", port: " 2222 " }, "ssh:mini.example.com:2222"],
-    [{ host: "mini.example.com", port: "" }, "ssh:mini.example.com:22"],
-    [{ host: "mini.example.com", port: null }, "ssh:mini.example.com:22"],
-    [{ host: "mini.example.com", port: 65535 }, "ssh:mini.example.com:65535"],
+    [{ host: "tower.example.com", port: "0022" }, "ssh:tower.example.com:22"],
+    [{ host: "tower.example.com", port: " 2222 " }, "ssh:tower.example.com:2222"],
+    [{ host: "tower.example.com", port: "" }, "ssh:tower.example.com:22"],
+    [{ host: "tower.example.com", port: null }, "ssh:tower.example.com:22"],
+    [{ host: "tower.example.com", port: 65535 }, "ssh:tower.example.com:65535"],
     // Only spaces are trimmed, as Postgres btrim does.
     [{ host: "\tTabbed.example" }, "ssh:\ttabbed.example:22"],
     [{ host: "   " }, null],
     [{ host: 42, port: 22 }, null],
     [{ port: 22 }, null],
-    [{ host: "mini.example.com", port: "22a" }, null],
-    [{ host: "mini.example.com", port: 22.5 }, null],
-    [{ host: "mini.example.com", port: 123456 }, null],
-    [{ host: "mini.example.com", port: -22 }, null],
-    [{ host: "mini.example.com", port: true }, null],
+    [{ host: "tower.example.com", port: "22a" }, null],
+    [{ host: "tower.example.com", port: 22.5 }, null],
+    [{ host: "tower.example.com", port: 123456 }, null],
+    [{ host: "tower.example.com", port: -22 }, null],
+    [{ host: "tower.example.com", port: true }, null],
   ])("derives the key of %j", (config, expected) => {
     expect(sshExecutionDeviceKey((config as { host?: unknown }).host, (config as { port?: unknown }).port)).toBe(expected);
   });
@@ -392,5 +397,19 @@ describe("readResourceWaitContext", () => {
     });
     expect(built).toMatchObject({ version: 1, environmentName: "e".repeat(200), deviceName: null, message: "m".repeat(300) });
     expect(readResourceWaitContext(built)).toEqual(built);
+  });
+});
+
+describe("isGoNoGoBlocker", () => {
+  it("blocks go for every plan but use, except a wait for the agent's own account's limit", () => {
+    expect(isGoNoGoBlocker({ plan: "use", reason: null })).toBe(false);
+    // The account resolved and passed every other check: its tasks wait for the reset (P7).
+    expect(isGoNoGoBlocker({ plan: "wait", reason: "usage_limit" })).toBe(false);
+    expect(isGoNoGoBlocker({ plan: "wait", reason: "credit_balance" })).toBe(false);
+    for (const reason of ["unassigned", "signed_out", "device_unknown", "owner_not_member", null]) {
+      expect(isGoNoGoBlocker({ plan: "wait", reason })).toBe(true);
+    }
+    expect(isGoNoGoBlocker({ plan: "none", reason: "usage_limit" })).toBe(true);
+    expect(isGoNoGoBlocker({ plan: "refuse", reason: "ai_connection_changed" })).toBe(true);
   });
 });

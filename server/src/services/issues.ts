@@ -105,6 +105,7 @@ import {
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
+  isResourceWaitRetryReason,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
@@ -8163,6 +8164,7 @@ export function issueService(db: Db) {
         archiveRows,
         blockedByMap,
         liveDescendantCountByIssueId,
+        scheduledRetryByIssueId,
       ] = await Promise.all([
         contextUserId
           ? userCommentStatsForIssues(db, companyId, contextUserId, issueIds)
@@ -8180,7 +8182,16 @@ export function issueService(db: Db) {
         includeLiveDescendantSummary
           ? liveDescendantCountMapForIssues(db, companyId, issueIds)
           : Promise.resolve(new Map<string, number>()),
+        // Fork: a task row's resource-wait chip (spec 7.7, 13) reads its waiting retry.
+        getCurrentScheduledRetriesForIssues(issueIds, companyId),
       ]);
+      // Only a device, account or slot wait goes on a row; other retries keep the upstream row as it was.
+      const resourceWaitRetryFields = (issueId: string) => {
+        const current = scheduledRetryByIssueId.get(issueId);
+        return current && current.status === "scheduled_retry" && isResourceWaitRetryReason(current.scheduledRetryReason)
+          ? { scheduledRetry: current }
+          : {};
+      };
       const statsByIssueId = new Map(
         statsRows.map((row) => [row.issueId, row]),
       );
@@ -8234,6 +8245,7 @@ export function issueService(db: Db) {
                     liveDescendantCountByIssueId.get(row.id) ?? 0,
                 }
               : {}),
+            ...resourceWaitRetryFields(row.id),
           };
         });
       }
@@ -8277,6 +8289,7 @@ export function issueService(db: Db) {
                   liveDescendantCountByIssueId.get(row.id) ?? 0,
               }
             : {}),
+          ...resourceWaitRetryFields(row.id),
           ...deriveIssueUserContext(row, contextUserId, {
             myLastCommentAt:
               statsByIssueId.get(row.id)?.myLastCommentAt ?? null,

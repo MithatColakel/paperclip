@@ -8,12 +8,12 @@ Claude subscriptions are company-scoped today. A connection, its grant, the
 owner's vault secret, the fork's `company_pool` members and their quota
 states all carry `company_id`, and the server refuses another company's
 account on purpose. A new company (LumineAI) therefore lists nothing, and
-the "from a Mac" token source lists only Macs enrolled in that company.
+the "from a computer" token source lists only computers enrolled in that company.
 
 Meanwhile the real constraint the operator manages is per **machine**: the
 Paperclip server container runs every Local-environment agent of every
-company, and the `aidevops-runner` host runs every runner SSH environment of
-every company. Account S is used on both hosts today.
+company, and the runner host runs every runner SSH environment of every
+company. Account S is used on both hosts today.
 
 ## Operator decisions (2026-10-14)
 
@@ -27,8 +27,9 @@ every company. Account S is used on both hosts today.
   fill-first.
 - When an account reaches its usage limit, the run moves to another account
   of the same host at once; the limited account rests until its reset.
-- Macs come in a second step (the Mac agent currently replaces any token
-  Paperclip sends with the Mac's own login).
+- Computers managed by an environment driver plugin come in a second step
+  (the plugin's device agent currently replaces any token Paperclip sends
+  with the computer's own login).
 - Stay within Anthropic's terms (see "Policy notes").
 
 ## Model
@@ -42,7 +43,7 @@ announcement dismissals; see AGENTS.md §5):
   which host an environment runs on (a separate table, so the upstream
   `environments` table is unchanged). The single Local environment maps to the
   server host; the runner SSH environments map to the runner host. SSH
-  environments that tunnel to a Mac (ports 2201/2202) stay unmapped.
+  environments that tunnel to a user's own computer stay unmapped.
 - `ai_accounts`: `id`, `host_id`, `provider` (`anthropic`), `label`,
   `email_hint`, `plan`, `pool_enabled`, `status` (`active` | `auth_failed` |
   `disabled`), `credential_material` (local_encrypted material, instance
@@ -102,7 +103,7 @@ Instance settings → "Claude accounts": one card per host with its
 environments and up to three account rows (label, masked email, plan,
 state: available / limited until … / sign-in failed, pool switch, clear
 limit, remove) and "Add account" (paste setup token, import the server
-token, import my existing subscription, or get one from a Mac in any
+token, import my existing subscription, or get one from a computer in any
 company you manage).
 
 ## Policy notes (checked 2026-10-14)
@@ -123,8 +124,9 @@ company you manage).
 - Operator decision: support both credential types; the operator chooses per
   account. Recommendation recorded: API keys on shared hosts.
 
-## Phase 2 (Macs)
+## Phase 2 (plugin-managed computers)
 
-Mac Fleet hosts: map each Mac Fleet environment to a `mac` host; Mac agent
-uses the token Paperclip sends for host-pool runs instead of its own vault
-login; plugin import of a Mac's token for the instance page.
+Environment driver plugin hosts: map each of the plugin's environments to a
+`mac` host; the plugin's device agent uses the token Paperclip sends for
+host-pool runs instead of its own vault login; plugin import of a device's
+token for the instance page.

@@ -1,8 +1,9 @@
 # Claude account pool, execution devices and waiting states
 
-Date: 2026-10-16. Status: implementation in progress on the fork. The contract
-is in [AI Connections](../connections/AI-CONNECTIONS.md#claude-account-pool-fork)
-and the release notes are in
+Date: 2026-10-16. Status: implemented on the fork; the rollout below follows
+the release notes. The contract is in
+[AI Connections](../connections/AI-CONNECTIONS.md#claude-account-pool-fork)
+and the release notes, with the upgrade steps, are in
 [releases/fork-claude-account-pool.md](../../releases/fork-claude-account-pool.md).
 
 This plan replaces, for everything it covers, the balanced selection, the
@@ -177,9 +178,10 @@ themselves.
   hours, marks the account signed out. A first untyped failure waits 10 minutes
   for that run only.
 - **Company pool:** the member is marked limited and the task waits for that
-  member's reset in its own lane. The pool stays pinned to the member the agent
-  used last; a pinned member that fails a check fails the run instead of
-  handing it to another member.
+  member's reset in its own lane. The pool stays pinned to the member of the
+  agent's latest started pool run; a pinned member that fails a check fails the
+  run instead of handing it to another member. Marks the retired usage probe
+  left are no limit.
 
 ### Waiting
 
@@ -192,14 +194,17 @@ themselves.
 - Each scheduler tick holds due waits with database reads only, re-checks the
   task's dispatch gate at most every 5 minutes, re-arms with a compare-and-set,
   and lets device slots go first in, first out.
-- Events wake waits: plugin reports, checks, plugin restarts, account changes,
-  binding changes, environment changes and Check now.
+- Events wake waits: plugin reports, checks, a sandbox provider plugin that
+  starts again (installed, enabled, upgraded or loaded), account changes,
+  binding changes, environment changes and Check now. A person's comment on a
+  waiting task checks the resource too, with a once-a-minute slot of its own.
 - A sweep runs availability checks, releases stale probes, prunes slots, ends
   orphaned episodes and sends notices.
 - Notices go to the task (immediately for limits and for problems a person must
   fix; after the notify-after hours for device outages; once more when a notified
   wait ends), to the manager agent as one summary wake per resource and outage,
-  and to the inbox.
+  and to the inbox as one item per resource episode, shared by the tasks that
+  wait on it.
 - `PAPERCLIP_ENVIRONMENT_WAITS=off` switches device waits off after a restart.
   Account waits always stay, because they replace failover.
 
@@ -223,14 +228,19 @@ into one device; hostname aliases and matching labels flag likely duplicates.
 
 ## Existing data
 
-1. **Before deploy:** run the read-only report script, restore a snapshot into
-   a scratch database, rehearse the boot job on it with the heartbeat scheduler
-   off (`HEARTBEAT_SCHEDULER_ENABLED=false`) on a host that cannot reach the
-   devices or outside services, and pass the go/no-go: every Claude agent with a
-   host-pool run in the last 7 days must plan to use its account. Fixes on the
-   copy do not carry over: fix what the current image can fix on production,
-   and pause each agent that still needs a deliberate binding, to bind it right
-   after boot.
+1. **Before deploy:** run the read-only report script, restore a fresh dump into
+   a throwaway database, and run the rehearsal script
+   (`server/dist/scripts/ai-account-pool-rehearsal.js --snapshot`) from the new
+   image against it. It applies the migrations and the binding backfill to the
+   copy and prints the report and the go/no-go (exit 0 go, 2 no-go, 1 error or
+   refusal), without starting a scheduler, heartbeat, plugin worker or HTTP
+   server. Go means every Claude agent with a host-pool run in the last 7 days
+   plans to use its account, or only waits for that account's limit to reset
+   (listed as a warning). Fixes on the copy do not carry over: fix what the
+   current image can fix on production, and pause each agent that still needs
+   a deliberate binding, to bind it right after boot. Booting a copy of the new
+   image with the heartbeat scheduler off on an isolated host remains an
+   optional extra check.
 2. **`0310`:** owner = creator; origin `legacy_host_pool`; "Not in pool" becomes
    paused, which the owner can resume; device keys for hosts whose environments
    agree on one host and port, and `local` for the server host.
@@ -245,25 +255,29 @@ into one device; hostname aliases and matching labels flag likely duplicates.
    review; agents over a cap, and agents with history whose account fails a
    check, wait as unassigned with a notice; the rest stay as they are and are
    listed. A failure never blocks boot, and an instance admin can re-run the
-   job.
+   job. A re-run adds missing bindings and gives an account to the rows it left
+   unassigned that nobody has changed or reviewed since, once their checks pass.
 4. **After deploy:** admins bind and resume the agents paused before the deploy,
-   review migrated bindings, pin agents whose project defaults have no device
-   and then choose their accounts (a re-run of the backfill skips agents that
-   already have a binding row), transfer accounts that were added for someone
-   else, and link duplicate devices.
+   review migrated bindings, transfer accounts that were added for someone
+   else, and link duplicate devices. An unpinned agent whose company has a
+   project on a plugin's sandbox environment waits unassigned until that plugin
+   reports the environment's device (the backfill runs before plugin workers
+   start); after the report, a re-run of the backfill binds it. Pinning such an
+   agent would move the project's work, so it is not the fix.
 
 ## Rollout
 
-1. **Preparation.** Run the report, rehearse on an isolated snapshot with the
-   scheduler off and the go/no-go, and run the local checks: `pnpm -r typecheck`, the
-   affected vitest suites, the OpenAPI coverage test, `pnpm check:token-gates`
-   and `drizzle-kit check`. No npm dependencies are added, so `pnpm-lock.yaml`
-   stays unchanged.
+1. **Preparation.** Run the report, run the rehearsal script on a fresh
+   snapshot and pass its go/no-go, and run the local checks: `pnpm -r typecheck`,
+   the affected vitest suites, the OpenAPI coverage test,
+   `pnpm check:token-gates` and `drizzle-kit check`. No npm dependencies are
+   added, so `pnpm-lock.yaml` stays unchanged.
 2. **Core release**, with the security fixes (remote-safe adapter environments,
    SSH secret staging and terminal-only classification) in the same release.
-   Deploy in a quiet window; migrations and the boot job run at startup. Right
-   after boot, bind and resume the paused agents, review bindings and run the
-   go/no-go on production.
+   Deploy in a quiet window while no runs are active; migrations and the boot
+   job run at startup. Right after boot, read the migration report, bind and
+   resume the paused agents, review bindings and run the go/no-go on
+   production.
 3. **Smoke checks.** A bound agent on the Paperclip server and one on an SSH host
    run with their accounts ("Using Claude account …", and no secret in the ssh
    command line). A stopped tunnel and a port that never sends a banner both
@@ -279,8 +293,11 @@ into one device; hostname aliases and matching labels flag likely duplicates.
    runs for unreachable SSH hosts, and no legacy reconciliation actions caused by
    waits.
 6. **Environment driver plugins** that report targets upgrade after the core,
-   with an upgrade-and-enable runbook when the new version adds a capability.
-   Then admins link duplicate devices and bind accounts on plugin devices.
+   with a disable-and-enable activation when the new version adds a capability
+   (the upgrade route refuses a new capability). Then admins link duplicate
+   devices, re-run the binding backfill for the agents boot left unassigned for
+   want of a plugin device, read the go/no-go, and bind accounts on plugin
+   devices.
 7. **After one stable release**, remove the legacy `host_pool` slot counting, the
    `ai_connection_failover` handling and the 410 routes. At the next upstream
    rebase, renumber `0309` and `0310` with byte-identical SQL.
@@ -295,10 +312,12 @@ balanced host-pool selection and failover for mapped hosts.
   cannot see accounts without a host.
 - Deleting a host no longer deletes its accounts. A duplicate e-mail hint from
   the same creator returns 500 instead of 409. Plugin devices show a raw kind.
-- Driver plugins get `METHOD_NOT_FOUND` from the new host methods and fall back
-  to creating environments through the admin REST API.
-- Back on the new image, re-run the binding backfill, which binds only agents
-  without a binding row (for example ones created meanwhile), and the go/no-go.
+- Driver plugins get `METHOD_NOT_FOUND` from the new host methods and no
+  `projectId`, and fall back to creating environments through the admin REST
+  API.
+- Back on the new image, re-run the binding backfill, which binds agents
+  without a binding row (for example ones created meanwhile) and rows it left
+  unassigned that nobody has changed or reviewed, and the go/no-go.
   An account switched out of the pool on the previous image is active again:
   its owner pauses it, or an instance admin disables it.
 

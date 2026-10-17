@@ -117,10 +117,16 @@ export function activityService(db: Db) {
         'effectiveTimeoutMs', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs',
         'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
         'timeoutSource', ${heartbeatRuns.resultJson} -> 'timeoutSource',
-        'timeoutFired', ${heartbeatRuns.resultJson} -> 'timeoutFired'
+        'timeoutFired', ${heartbeatRuns.resultJson} -> 'timeoutFired',
+        'resourceWait', ${heartbeatRuns.resultJson} -> 'resourceWait'
       ))
     end
   `.as("resultJson");
+  // Fork: the wait a scheduled successor carries, so the run ledger can name it (spec 7.7).
+  const resourceWaitContextSnapshot = sql<Record<string, unknown> | null>`
+    case when ${heartbeatRuns.contextSnapshot} -> 'resourceWait' is not null
+      then jsonb_build_object('resourceWait', ${heartbeatRuns.contextSnapshot} -> 'resourceWait') end
+  `.as("contextSnapshot");
 
   function countValue(value: unknown) {
     const parsed = Number(value ?? 0);
@@ -422,6 +428,7 @@ export function activityService(db: Db) {
           wakeCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
           contextCommentId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
           contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+          contextSnapshot: resourceWaitContextSnapshot,
         })
         .from(heartbeatRuns)
         .innerJoin(
@@ -516,7 +523,7 @@ export function activityService(db: Db) {
         }
       }
 
-      return runs.map((run) => {
+      return runs.map(({ contextSnapshot, ...run }) => {
         const leaseRow = leaseByRunId.get(run.runId);
         const leaseMetadata = leaseRow?.lease.metadata ?? null;
         const workspacePath =
@@ -527,6 +534,8 @@ export function activityService(db: Db) {
               : null;
         return {
           ...run,
+          // Fork: only a waiting successor carries a context, and only its wait.
+          ...(contextSnapshot ? { contextSnapshot } : {}),
           resultJson: run.resultJson ? {
             ...run.resultJson,
             ...(Object.hasOwn(run.resultJson, "workspaceRestorePath") ? {

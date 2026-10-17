@@ -77,7 +77,7 @@ const SOURCE_LABELS: Record<InheritedEnvironmentSource, string> = {
   local: "Default",
 };
 
-/** "Company default: Mac mini · sandbox" — the label of a picker's inherit option. */
+/** "Company default: Build computer · sandbox" — the label of a picker's inherit option. */
 export function inheritedEnvironmentLabel(resolved: {
   environment: Environment | null;
   source: InheritedEnvironmentSource;

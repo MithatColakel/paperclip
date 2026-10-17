@@ -30,6 +30,7 @@ import type {
   LiveEvent,
 } from "@paperclipai/shared";
 import { isResourceWaitErrorCode } from "@paperclipai/shared";
+import { invalidateAiAccountPoolQueries } from "@/api/ai-account-pool";
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
@@ -1280,6 +1281,16 @@ function invalidateActivityQueries(
 
   if (action?.startsWith("ai_connection.") || action?.startsWith("connection_grant.")) {
     queryClient.invalidateQueries({ queryKey: ["ai-connections", companyId] });
+  }
+
+  // Fork: a pool account, device or wait-settings change refreshes the account
+  // lists, agent bindings and cards, and the device pages.
+  if (
+    action?.startsWith("ai_account.") ||
+    action?.startsWith("execution_device.") ||
+    action === "company.execution_wait_settings_updated"
+  ) {
+    void invalidateAiAccountPoolQueries(queryClient);
   }
 
   if (action?.startsWith("resource_membership.")) {

@@ -17,11 +17,12 @@ kadar atlansın ve sonra kendiliğinden havuza geri dönsün.
 1. **Geçiş yalnızca şirket içinde olur.** Bir şirketin run'ı başka bir şirketin
    hesabını hiçbir koşulda kullanmaz. Havuz kayıtları şirkete bağlıdır ve sunucu
    bunu her seçimde zorunlu kılar.
-2. **Hangi Mac'te çalışılacağı ile hangi hesabın kullanılacağı birbirinden
-   bağımsızdır.** Mac seçimi bugünkü gibi agent'ın ortamıyla
-   (`defaultEnvironmentId`) yapılır; Apple hesabı ve imza o Mac'te kalır. Claude
-   hesabı Paperclip'ten run başına enjekte edilir. Kota devri Mac'i değiştirmez.
-3. **Hesaplar Paperclip'te tutulur, Mac'lerde değil.** Her hesap için
+2. **Hangi bilgisayarda çalışılacağı ile hangi hesabın kullanılacağı birbirinden
+   bağımsızdır.** Bilgisayar seçimi bugünkü gibi agent'ın ortamıyla
+   (`defaultEnvironmentId`) yapılır; geliştirici hesabı ve imza o bilgisayarda
+   kalır. Claude hesabı Paperclip'ten run başına enjekte edilir. Kota devri
+   bilgisayarı değiştirmez.
+3. **Hesaplar Paperclip'te tutulur, bilgisayarlarda değil.** Her hesap için
    `claude setup-token` ile alınan uzun ömürlü token, mevcut "AI connections"
    altyapısında şirket genelinde paylaşılan bağlantı olarak saklanır.
    Token'ları board kullanıcısı arayüzden girer.
@@ -35,16 +36,16 @@ kadar atlansın ve sonra kendiliğinden havuza geri dönsün.
 
 | Şirket | Claude hesapları (bilinen) | Not |
 |---|---|---|
-| VPNProjects | Max `m***l@gmail` (MacBook Pro), Max `y***k@gmail` (Mac mini), Pro `b***v@icloud` (MacBook Air), sunucu token'ı (`claude_subscription_token` secret) | Linux runner ortamları sunucu token'ını kullanıyor |
-| Cleanio | Max `e***h@gmail` (TECHNOGRADE MacBook Air) | Tek hesap — ikinci hesap eklenmezse devredecek hesap yok |
+| VPNProjects | Max hesap 1 (bilgisayar A), Max hesap 2 (bilgisayar B), Pro hesap 3 (bilgisayar C), sunucu token'ı (`claude_subscription_token` secret) | Linux runner ortamları sunucu token'ını kullanıyor |
+| Cleanio | Max hesap 4 (bilgisayar D) | Tek hesap — ikinci hesap eklenmezse devredecek hesap yok |
 | SkyNet Labs | — | Aktif agent yok |
 
 - Hiçbir agent'ta `runtimeConfig.aiConnection` tanımlı değil ve hiç AI
   connection yok. Kimlik bilgileri ortam `envVars` içindeki
   `CLAUDE_CODE_OAUTH_TOKEN` üzerinden ya da uzak makinenin kendi
   `~/.claude` girişinden geliyor.
-- Mac'ler Mac Fleet sandbox sürücüsüyle değil, **SSH ortamlarıyla** bağlı
-  (`bernamanavmac`, `mac-securezone`; host `10.114.0.2`). Mac SSH ortamlarında
+- Bilgisayarlar bir sandbox sağlayıcısı eklentisiyle değil, **SSH
+  ortamlarıyla** bağlı (iki SSH ortamı). Bu SSH ortamlarında
   `CLAUDE_CODE_OAUTH_TOKEN` tanımlı değil.
 - Bugün bir run (VPNProjects / TrelloIntake) `provider_quota` ile düştü ve
   `retryNotBefore=16:00` aldı. Mevcut davranışta run aynı hesapla 16:00'yı
@@ -198,25 +199,25 @@ z.object({ provider: aiProviderSchema, method: aiAuthMethodSchema, mode: z.liter
 Şirket erişim kontrolü, aktör izinleri ve 400/403/404/409/422 hataları mevcut
 AI connection rotalarıyla aynı kalıpta olur.
 
-## Ortamlar ve Mac'ler
+## Ortamlar ve bilgisayarlar
 
-- **SSH ortamları (bugünkü Mac bağlantısı):**
+- **SSH ortamları (bugünkü bilgisayar bağlantısı):**
   - Yönetilen AI çalışma ortamı token'ı run env'i ile uzak tarafa iletir ve
     `CLAUDE_CONFIG_DIR` değerini özel bir dizine çevirir.
-  - **Faz 0'da doğrulanacak:** macOS'ta SSH ile açılan oturumda keychain
-    kilitli olduğu için `CLAUDE_CODE_OAUTH_TOKEN` ile çalışmanın sorunsuz
-    olduğu (beklenen) ve ACP motorunun uzak auth dizinini SSH hedefinde
-    kurduğu.
+  - **Faz 0'da doğrulanacak:** uzak bilgisayarda SSH ile açılan oturumda
+    anahtar zinciri kilitli olduğu için `CLAUDE_CODE_OAUTH_TOKEN` ile
+    çalışmanın sorunsuz olduğu (beklenen) ve ACP motorunun uzak auth dizinini
+    SSH hedefinde kurduğu.
 - **Linux runner ortamları** (`runner: vpn-*`):
   - Ortam `envVars` içindeki `CLAUDE_CODE_OAUTH_TOKEN`, yönetilen modda zaten
     temizleniyor (`stripAiAuthBindings`).
   - Havuza geçen agent'larda bu değişken ortamdan kaldırılacak; kaldırılmasa
     da etkisi olmaz.
-- **Mac Fleet sürücüsü** (ileride kullanılırsa): Mac uygulaması
-  (`CommandExecutor.swift`, `anthropicVars`) Mac'te kayıtlı token varsa
-  sunucunun gönderdiği token'ı eziyor; bu, devri boşa düşürür. O sürücüye
-  geçilirse Mac uygulamasında öncelik tersine çevrilecek: sunucu token
-  gönderdiyse o kullanılacak. Bu değişiklik bu planın kapsamı dışında.
+- **Sandbox sağlayıcısı eklentisi** (ileride kullanılırsa): cihazdaki
+  yardımcı uygulama, cihazda kayıtlı token varsa sunucunun gönderdiği token'ı
+  eziyor; bu, devri boşa düşürür. O sürücüye geçilirse cihaz uygulamasında
+  öncelik tersine çevrilecek: sunucu token gönderdiyse o kullanılacak. Bu
+  değişiklik bu planın kapsamı dışında.
 
 ## Fazlar
 
@@ -250,9 +251,9 @@ AI connection rotalarıyla aynı kalıpta olur.
    için `PAPERCLIP_IMAGE_ROLLBACK` ve `deploy-image.sh` aynen korunur.
 2. **Migration geri dönüşü.** Yeni tablolar yalnızca eklemedir. Eski imaja
    dönülürse eski kod bu tabloları okumaz, yani geri dönüş güvenlidir.
-3. **SSH Mac denemesi.** VPNProjects'te tek bir test agent'ı, bir Mac SSH
-   ortamında mevcut `shared` modla bir AI connection kullanarak çalıştırılır.
-   Token enjeksiyonu doğrulanır.
+3. **SSH bilgisayar denemesi.** VPNProjects'te tek bir test agent'ı, bir
+   bilgisayarın SSH ortamında mevcut `shared` modla bir AI connection
+   kullanarak çalıştırılır. Token enjeksiyonu doğrulanır.
 
 ### Faz 1 — Sunucu ve sözleşmeler
 
@@ -266,7 +267,7 @@ AI connection rotalarıyla aynı kalıpta olur.
 
 ### Faz 3 — Kurulum (kullanıcı tarafı)
 
-1. Her hesap için ilgili Mac'te (ya da herhangi bir terminalde o hesapla)
+1. Her hesap için ilgili bilgisayarda (ya da herhangi bir terminalde o hesapla)
    `claude setup-token` çalıştırılır ve token Paperclip'te ilgili şirketin AI
    hesabı olarak eklenir.
 2. Havuz sırası belirlenir. Örneğin VPNProjects için: Max → Max → sunucu Max →

@@ -48,9 +48,9 @@ export function AiAccountPoolCard({ companyId }: { companyId: string }) {
   const error = pool.error ?? replace.error ?? clearLimit.error;
   const now = Date.now();
   return (
-    <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Claude account pool">
+    <section className="space-y-3 rounded-lg border border-border p-4" aria-label="Company account pool (retired)">
       <div className="space-y-1">
-        <h2 className="text-sm font-semibold">Claude account pool</h2>
+        <h2 className="text-sm font-semibold">Company account pool (retired)</h2>
         <p className="text-xs text-muted-foreground">
           Agents already on the company pool stay on the account they used last and wait for its reset when it reaches
           its usage limit; an agent that has used none starts on the top account. Paperclip never moves a task to another

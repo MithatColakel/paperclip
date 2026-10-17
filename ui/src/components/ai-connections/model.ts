@@ -112,7 +112,7 @@ export function bindingProblem(
     return connections.some((item) =>
       item.ownership === "shared" && item.provider === binding.provider && !aiConnectionProblem(item))
       ? null
-      : "Connect a company-shared account and add it to the AI account pool.";
+      : "Connect a company-shared account and add it to the company account pool.";
   const connection = connections.find(
     (item) =>
       item.id === binding.connectionId &&

@@ -216,8 +216,8 @@ describe("SSH device workspaces", () => {
   });
 
   it("names device paths predictably", () => {
-    expect(deviceRepoKey("https://github.com/MithatColakel/SecurezoneVPN.git", "x")).toBe("github.com__MithatColakel__SecurezoneVPN");
-    expect(deviceRepoKey("git@github.com:MithatColakel/SecurezoneVPN.git", "x")).toBe("github.com__MithatColakel__SecurezoneVPN");
+    expect(deviceRepoKey("https://github.com/ExampleOrg/ExampleApp.git", "x")).toBe("github.com__ExampleOrg__ExampleApp");
+    expect(deviceRepoKey("git@github.com:ExampleOrg/ExampleApp.git", "x")).toBe("github.com__ExampleOrg__ExampleApp");
     expect(deviceRepoKey(null, "/srv/repo")).toMatch(/^local-[0-9a-f]{16}$/);
     expect(deviceRuntimeDir("/Users/me/PaperclipDevice", "run-1")).toBe("/Users/me/PaperclipDevice/.paperclip-device/runtime/run-1");
     expect(isDeviceWorktreePath("/Users/me/Projects/.paperclip-runtime/runs/x/workspace")).toBe(false);

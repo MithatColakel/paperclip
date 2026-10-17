@@ -281,7 +281,7 @@ describe("approval routes idempotent retries", () => {
       companyId: "company-1",
       driver: "sandbox",
       status: "active",
-      config: { provider: "mac-fleet" },
+      config: { provider: "fake-plugin" },
     });
     mockApprovalService.approve.mockResolvedValue({
       approval: { id: "approval-env", companyId: "company-1", type: "hire_agent", status: "approved", payload: {} },
@@ -313,7 +313,7 @@ describe("approval routes idempotent retries", () => {
       companyId: "company-2",
       driver: "sandbox",
       status: "active",
-      config: { provider: "mac-fleet" },
+      config: { provider: "fake-plugin" },
     });
     const foreign = await request(await createApp())
       .post("/api/approvals/approval-env/approve")

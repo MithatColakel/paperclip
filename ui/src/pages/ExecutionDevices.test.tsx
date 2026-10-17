@@ -52,7 +52,7 @@ vi.mock("@/api/access", async (importOriginal) => {
 });
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: mocks.setBreadcrumbs }) }));
 
-const COMPANY = { id: "company-a", name: "Cleanio", issuePrefix: "CLE" };
+const COMPANY = { id: "company-a", name: "Acme", issuePrefix: "ACM" };
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({ companies: [COMPANY], selectedCompanyId: COMPANY.id, selectedCompany: COMPANY }),
 }));
@@ -150,7 +150,7 @@ const BUILD_BOX_DETAIL: ExecutionDeviceDetail = {
       agentId: "agent-alice",
       agentName: "Alice",
       issueId: "issue-12",
-      issueIdentifier: "CLE-12",
+      issueIdentifier: "ACM-12",
       issueTitle: "Fix the login form",
       kind: "environment",
       reason: "offline",
@@ -237,7 +237,7 @@ async function renderPage() {
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/CLE/company/settings/devices"]}>
+        <MemoryRouter initialEntries={["/ACM/company/settings/devices"]}>
           <ExecutionDevices />
         </MemoryRouter>
       </QueryClientProvider>,
@@ -344,17 +344,37 @@ describe("ExecutionDevices", () => {
 
   it("lists the waiting tasks of a device from its detail", async () => {
     await renderLoaded();
-    await eventually(() => expect(region("Build box").textContent).toContain("CLE-12 Fix the login form"));
+    await eventually(() => expect(region("Build box").textContent).toContain("ACM-12 Fix the login form"));
 
     const build = region("Build box");
     expect(build.textContent).toContain("Waiting tasks (2)");
     expect(build.textContent).toContain(`Alice · device offline · since ${SINCE_TEXT}`);
     expect(build.textContent).toContain(`Eve`);
     expect(build.textContent).toContain(`device unreachable · since ${SINCE_TEXT}`);
-    expect(build.querySelector('a[href="/CLE/issues/CLE-12"]')).toBeTruthy();
+    expect(build.querySelector('a[href="/ACM/issues/ACM-12"]')).toBeTruthy();
     expect(mocks.get).toHaveBeenCalledWith(COMPANY.id, BUILD_BOX.id);
     // Devices without waits are not fetched one by one.
     expect(mocks.get).not.toHaveBeenCalledWith(COMPANY.id, SERVER.id);
+  });
+
+  it("reads the waiting tasks from the device list, with no request per device", async () => {
+    mocks.list.mockResolvedValue({
+      limitPerDevice: 3,
+      devices: [{ ...SERVER, waits: [] }, { ...BUILD_BOX, waits: BUILD_BOX_DETAIL.waits }, { ...STUDIO, waits: [] }],
+    });
+    await renderLoaded();
+    await eventually(() => expect(region("Build box").textContent).toContain("ACM-12 Fix the login form"));
+    expect(region("Build box").textContent).toContain(`Alice · device offline · since ${SINCE_TEXT}`);
+    expect(mocks.get).not.toHaveBeenCalled();
+  });
+
+  it("never polls a device's detail on a timer when the list has no waits", async () => {
+    await renderLoaded();
+    await eventually(() => expect(region("Build box").textContent).toContain("ACM-12 Fix the login form"));
+    const detailIntervals = client.getQueryCache().findAll({ queryKey: ["execution-devices", "company", COMPANY.id, "device"] })
+      .flatMap((query) => query.observers.map((observer) => observer.options.refetchInterval));
+    expect(detailIntervals.length).toBeGreaterThan(0);
+    expect(detailIntervals.every((interval) => interval === undefined || interval === false)).toBe(true);
   });
 
   it("answers Check now in place, including 404 and 429", async () => {
@@ -462,7 +482,7 @@ describe("ExecutionDevices", () => {
       return { ...detail, waits: detail.waits.map((wait) => ({ ...wait, ...leak })) } as ExecutionDeviceDetail;
     });
     await renderLoaded(INSTANCE_ADMIN);
-    await eventually(() => expect(region("Build box").textContent).toContain("CLE-12"));
+    await eventually(() => expect(region("Build box").textContent).toContain("ACM-12"));
     expect(region("Paperclip server").textContent).toContain("Alice · Max-2");
     expect(document.body.textContent).not.toMatch(/sk-ant-[a-z]{3}/i);
     expect(document.body.textContent).not.toMatch(/\bmacs?\b/i);

@@ -229,24 +229,24 @@ describe("environment instance routes", () => {
       isInstanceAdmin: false,
     };
     mockEnvironmentService.getById.mockResolvedValue(createEnvironment({
-      id: "env-mac",
-      name: "Build Mac",
+      id: "env-device",
+      name: "Build computer",
       driver: "sandbox",
       companyId: "company-1",
-      config: { provider: "mac-fleet", deviceId: "device-1", apiKey: "secret" },
+      config: { provider: "fake-plugin", deviceId: "device-1", apiKey: "secret" },
       metadata: { note: "private" },
     }));
-    const own = await request(createApp(member)).get("/api/environments/env-mac");
+    const own = await request(createApp(member)).get("/api/environments/env-device");
     expect(own.status).toBe(200);
     // Pickers need the provider to know an adapter can run there; nothing else leaks.
-    expect(own.body.config).toEqual({ provider: "mac-fleet" });
+    expect(own.body.config).toEqual({ provider: "fake-plugin" });
     expect(own.body.metadata).toBeNull();
 
     mockEnvironmentService.getById.mockResolvedValue(createEnvironment({
       id: "env-other",
       driver: "sandbox",
       companyId: "company-2",
-      config: { provider: "mac-fleet" },
+      config: { provider: "fake-plugin" },
     }));
     const other = await request(createApp(member)).get("/api/environments/env-other");
     expect(other.status).toBe(404);
@@ -332,11 +332,11 @@ describe("environment instance routes", () => {
 
   it("creates a company-only environment and logs it only to that company", async () => {
     mockEnvironmentService.create.mockResolvedValue(createEnvironment({
-      id: "env-mac",
-      name: "Build Mac",
+      id: "env-device",
+      name: "Build computer",
       driver: "ssh",
       companyId: OWNER_COMPANY_ID,
-      config: { host: "mac.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
+      config: { host: "builder.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
       metadata: null,
     }));
     const app = createApp({ type: "board", userId: "board-1", source: "local_implicit", isInstanceAdmin: true });
@@ -344,10 +344,10 @@ describe("environment instance routes", () => {
     const res = await request(app)
       .post(`/api/companies/${OWNER_COMPANY_ID}/environments`)
       .send({
-        name: "Build Mac",
+        name: "Build computer",
         driver: "ssh",
         companyId: OWNER_COMPANY_ID,
-        config: { host: "mac.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
+        config: { host: "builder.local", username: "builder", remoteWorkspacePath: "/Users/builder/work" },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
@@ -364,7 +364,7 @@ describe("environment instance routes", () => {
 
     const foreign = await request(app)
       .post(`/api/companies/${OWNER_COMPANY_ID}/environments`)
-      .send({ name: "Build Mac", driver: "ssh", companyId: "22222222-2222-4222-8222-222222222222", config: {} });
+      .send({ name: "Build computer", driver: "ssh", companyId: "22222222-2222-4222-8222-222222222222", config: {} });
     expect(foreign.status).toBe(422);
 
     const local = await request(app)

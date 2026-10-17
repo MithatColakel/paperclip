@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, sql, type SQL } from "drizzle-orm";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import {
   type Db,
@@ -429,25 +429,40 @@ export async function evaluateAccountEligibility(
   return { eligible: plan.account !== null && ELIGIBLE_PLAN_REASONS.has(plan.reason), reason: plan.reason, account: plan.account };
 }
 
-/** The accounts eligible in a company, by label. */
+/**
+ * The accounts eligible in a company, by label: `evaluateAccountEligibility`
+ * for every account at once, in three queries whatever the pool's size. The
+ * owner is an active member (the members filter), neither the owner nor an
+ * admin switched the account off, and no reservation excludes the company.
+ * Signed-out and limited accounts stay eligible with their state.
+ */
 export async function eligibleAccountsForCompany(
   db: DeviceDb,
   companyId: string,
   opts: { deploymentMode?: DeploymentMode; now?: Date } = {},
 ): Promise<AiAccountRow[]> {
-  const now = opts.now ?? new Date();
   const members = await activeMemberUserIds(db, companyId, opts.deploymentMode);
   if (members.size === 0) return [];
-  // Only accounts of members can pass; the plan predicate then decides each one.
-  const owned = await db.select({ id: aiAccounts.id }).from(aiAccounts)
-    .where(inArray(sql`coalesce(${aiAccounts.ownerUserId}, ${aiAccounts.createdByUserId})`, [...members]))
+  const owned = await db.select().from(aiAccounts)
+    .where(and(
+      inArray(sql`coalesce(${aiAccounts.ownerUserId}, ${aiAccounts.createdByUserId})`, [...members]),
+      isNull(aiAccounts.adminDisabledAt),
+      ne(aiAccounts.status, "disabled"),
+    ))
     .orderBy(asc(aiAccounts.label), asc(aiAccounts.createdAt));
-  const result: AiAccountRow[] = [];
-  for (const { id } of owned) {
-    const eligibility = await evaluateAccountEligibility(db, { companyId, accountId: id, deploymentMode: opts.deploymentMode, now });
-    if (eligibility.eligible && eligibility.account) result.push(eligibility.account);
-  }
-  return result;
+  if (owned.length === 0) return [];
+  // Reserved elsewhere: reserved for projects, none of them this company's.
+  const reservations = await db
+    .select({
+      accountId: aiAccountProjects.accountId,
+      inCompany: sql<boolean | null>`bool_or(${projects.companyId} = ${companyId})`,
+    })
+    .from(aiAccountProjects)
+    .leftJoin(projects, eq(projects.id, aiAccountProjects.projectId))
+    .where(inArray(aiAccountProjects.accountId, owned.map((row) => row.id)))
+    .groupBy(aiAccountProjects.accountId);
+  const reservedElsewhere = new Set(reservations.filter((row) => row.inCompany !== true).map((row) => row.accountId));
+  return owned.filter((row) => !reservedElsewhere.has(row.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1021,8 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     })), { create: false });
     return rows.map((row): MyAiAccount => {
       const accountUses = uses.filter((use) => use.accountId === row.id);
+      // Fork: a reservation in a company the caller is not a member of shows as a count only.
+      const reserved = reservations.get(row.id) ?? [];
       return {
         id: row.id,
         provider: "anthropic",
@@ -1024,7 +1041,8 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
         limitReason: row.limitReason,
         limitSource: row.limitSource,
         lastLimitedAt: iso(row.lastLimitedAt),
-        reservedProjects: reservations.get(row.id) ?? [],
+        reservedProjects: reserved.filter((project) => callerCompanies.has(project.companyId)),
+        otherReservedProjects: reserved.filter((project) => !callerCompanies.has(project.companyId)).length,
         usedBy: summarizeUsedBy(accountUses.filter((use) => callerCompanies.has(use.companyId)), devicesByAgent),
         otherCompanies: unique(accountUses.filter((use) => !callerCompanies.has(use.companyId)).map((use) => use.companyId)).length,
         usage: usage.get(row.id) ?? EMPTY_USAGE,
@@ -1554,7 +1572,8 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     if (ctx.actor.type !== "board") return { ...summary!, options: [], canBindAny: false };
     return {
       ...summary!,
-      options: await companyOptions(ctx.actor, agent.companyId, agent),
+      // Fork: another adapter can take no account, so its options would all be `adapter_unsupported`.
+      options: agent.adapterType === POOL_ACCOUNT_ADAPTER_TYPE ? await companyOptions(ctx.actor, agent.companyId, agent) : [],
       canBindAny: isCompanyAdmin(ctx.actor, agent.companyId),
     };
   }

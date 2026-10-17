@@ -47,15 +47,19 @@ export interface SshRemoteExecutionSpec extends SshConnectionConfig {
 }
 
 /**
- * How a remote command receives its environment. Secret values never ride
- * the ssh command line: a separate ssh call writes them over stdin into a
- * 0600 file, which the command sources after the login profiles and removes
- * before it starts.
+ * How a remote command receives its environment. Only values under a short
+ * list of known non-secret names (`SSH_INLINE_ENV_KEYS`: system settings such
+ * as PATH and HOME, and Paperclip's run identifiers) ride the ssh command
+ * line. Every other value is staged: a separate ssh call writes it over stdin
+ * into a 0600 file, which the command sources after the login profiles and
+ * removes before it starts. A secret can be bound to any name, so a value is
+ * never judged by a name that merely does not look secret.
  */
 export interface SshRemoteEnvOptions {
   /**
-   * More keys to treat as secret. Keys matching `SENSITIVE_ENV_KEY`
-   * (sensitive-env.ts) always count as secret.
+   * More keys to stage even when their name is on the non-secret list. Keys
+   * matching `SENSITIVE_ENV_KEY` (sensitive-env.ts) and every name off that
+   * list are always staged.
    */
   secretEnvKeys?: readonly string[] | null;
   /**
@@ -71,6 +75,27 @@ export interface SshRemoteEnvOptions {
    * name at least one character besides `*`.
    */
   unsetEnvPatterns?: readonly string[] | null;
+}
+
+// Fork: the env names whose values may ride the ssh command line, which every
+// local user can list (as can every user on the host while the login
+// profiles run): system settings and Paperclip's run identifiers, none of
+// them secret. Every other value is staged, because a company secret bound to
+// DATABASE_URL or GH_PAT does not look secret by its name.
+const SSH_INLINE_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PATH", "HOME", "PWD", "SHELL", "USER", "LOGNAME", "TERM", "LANG", "LANGUAGE", "TZ", "TMPDIR", "NVM_DIR",
+  "NODE_OPTIONS", "NODE_PATH",
+  "CLAUDE_CONFIG_DIR",
+  "PAPERCLIP_RUN_ID", "PAPERCLIP_AGENT_ID", "PAPERCLIP_COMPANY_ID", "PAPERCLIP_TASK_ID",
+  "PAPERCLIP_WAKE_REASON", "PAPERCLIP_WAKE_COMMENT_ID", "PAPERCLIP_APPROVAL_ID", "PAPERCLIP_APPROVAL_STATUS",
+  "PAPERCLIP_LINKED_ISSUE_IDS", "PAPERCLIP_AI_CREDENTIAL_REF",
+]);
+const SSH_INLINE_ENV_KEY_PREFIXES = ["LC_", "XDG_"] as const;
+
+/** True when a value may ride the ssh command line: a known non-secret name that does not look secret. */
+function isSshInlineEnvKey(key: string): boolean {
+  if (isSensitiveEnvKey(key)) return false;
+  return SSH_INLINE_ENV_KEYS.has(key) || SSH_INLINE_ENV_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
 /**
@@ -99,10 +124,11 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const cwd = commandInput.cwd?.trim() || defaultCwd;
       const allEnvEntries = Object.entries(commandInput.env ?? {})
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-      // Secret values go through runSshCommand's staged env file instead of
-      // the command string, which the ssh argv carries.
-      const secretEnv = Object.fromEntries(allEnvEntries.filter(([key]) => isSensitiveEnvKey(key)));
-      const envEntries = allEnvEntries.filter(([key]) => !isSensitiveEnvKey(key));
+      // Values go through runSshCommand's staged env file instead of the
+      // command string, which the ssh argv carries; only known non-secret
+      // names stay in the command string (SSH_INLINE_ENV_KEYS).
+      const secretEnv = Object.fromEntries(allEnvEntries.filter(([key]) => !isSshInlineEnvKey(key)));
+      const envEntries = allEnvEntries.filter(([key]) => isSshInlineEnvKey(key));
       const envPrefix = envEntries.length > 0
         ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
         : "";
@@ -1497,9 +1523,9 @@ export class SshEnvStagingError extends Error {
 }
 
 interface SshRemoteEnvPlan {
-  /** Values that may ride the command line. */
+  /** Values under a known non-secret name (`SSH_INLINE_ENV_KEYS`), which may ride the command line. */
   inline: Array<[string, string]>;
-  /** Secret values, staged through a file. */
+  /** Every other value, staged through a file. */
   staged: Array<[string, string]>;
   unset: string[];
   unsetPatterns: string[];
@@ -1512,7 +1538,7 @@ function planSshRemoteEnv(
   const secretKeys = new Set(options.secretEnvKeys ?? []);
   const plan: SshRemoteEnvPlan = { inline: [], staged: [], unset: [], unsetPatterns: [] };
   for (const entry of entries) {
-    if (isSensitiveEnvKey(entry[0]) || secretKeys.has(entry[0])) plan.staged.push(entry);
+    if (!isSshInlineEnvKey(entry[0]) || secretKeys.has(entry[0])) plan.staged.push(entry);
     else plan.inline.push(entry);
   }
   for (const key of options.unsetEnvKeys ?? []) {
@@ -1638,8 +1664,9 @@ export async function runSshCommand(
     // .bash_profile typically sources .bashrc itself; only source .bashrc
     // directly when no .bash_profile exists, so a host that adds nvm in
     // .bashrc still resolves node without a double-run of the setup.
-    // Secret values never ride the ssh argv: they arrive through the staged
-    // file, loaded after the profiles (buildSshEnvLoadSteps).
+    // Only known non-secret values ride the ssh argv (SSH_INLINE_ENV_KEYS):
+    // every other value arrives through the staged file, loaded after the
+    // profiles (buildSshEnvLoadSteps).
     const envArgs = envPlan.inline.map(([key, value]) => `${key}=${shellQuote(value)}`);
     const remoteScript = stagedEnvExitTrap(stagedDir) + [
       ...SSH_LOGIN_PROFILE_STEPS,
@@ -1683,7 +1710,7 @@ export async function buildSshSpawnTarget(input: {
   args: string[];
   cleanup: () => Promise<void>;
   /**
-   * Present when secret values were staged on the host. Best effort: removes
+   * Present when env values were staged on the host. Best effort: removes
    * the staged file. Call it when the ssh process failed to start, exited
    * with 255, or was killed or timed out, because the remote script may never
    * have consumed the file. Calling it after the script removed the file is
@@ -1724,8 +1751,9 @@ export async function buildSshSpawnTarget(input: {
   // .bash_profile typically sources .bashrc itself; only source .bashrc
   // directly when no .bash_profile exists, so a host that adds nvm in
   // .bashrc still resolves node without a double-run of the setup.
-  // Secret values never ride the ssh argv, which every local user can list:
-  // they arrive through the staged file, loaded after the profiles.
+  // Only known non-secret values ride the ssh argv, which every local user
+  // can list (SSH_INLINE_ENV_KEYS): every other value arrives through the
+  // staged file, loaded after the profiles.
   const remoteScript = stagedEnvExitTrap(stagedDir) + [
     ...SSH_LOGIN_PROFILE_STEPS,
     ...buildSshEnvLoadSteps({ stagedDir, unsetEnvKeys: envPlan.unset, unsetEnvPatterns: envPlan.unsetPatterns }),

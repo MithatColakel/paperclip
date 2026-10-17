@@ -251,8 +251,6 @@ export function aiConnectionService(db: Db) {
     binding: AiConnectionBinding;
     /** company_pool: re-validate only this account (the second read of one preparation). */
     pinnedGrantId?: string;
-    /** company_pool: ignored. Fork: usage readings never drive the choice (P7). */
-    probeUsage?: boolean;
     now?: Date;
   };
   type AccountRow = Awaited<ReturnType<typeof rows>>[number];

@@ -131,12 +131,11 @@ describe("pinned company pool", () => {
   it("waits for its own member's reset when that member is limited, and never moves to another member", async () => {
     await usedPool(accounts.second, at(-30));
     await aiConnectionPoolService(db).markExhausted({ companyId, connectionId: accounts.second.connectionId, until: at(90), reason: "provider_quota", source: "run_failure" });
-    // An earlier reset elsewhere in the pool changes nothing: the wait is for this member.
+    // A free member (the first) or an earlier reset elsewhere in the pool changes nothing: the wait is for this member.
     await aiConnectionPoolService(db).markExhausted({ companyId, connectionId: accounts.third.connectionId, until: at(10), reason: "provider_quota", source: "run_failure" });
     const error = await aiConnectionService(db).select({ ...input, now }).catch((e: unknown) => e);
     expect(isAiConnectionPoolExhausted(error)).toBe(true);
     expect(aiConnectionPoolRetryAt(error as never)?.toISOString()).toBe(at(90).toISOString());
-    expect((await aiConnectionPoolService(db).hasAvailableMember(companyId, "anthropic", now))).toBe(true);
     // Still waiting just before the reset, back on the same member after it.
     await expect(aiConnectionService(db).select({ ...input, now: at(89) })).rejects.toMatchObject({ details: { code: "ai_connection_pool_exhausted" } });
     expect(await selectedConnection({ now: at(91) })).toBe(accounts.second.connectionId);
@@ -176,7 +175,7 @@ describe("pinned company pool", () => {
       { label: "Current week (all models)", usedPercent: 98, resetsAt: at(5000).toISOString(), valueLabel: null, detail: null },
     ]);
     expect(await selectedConnection()).toBe(accounts.first.connectionId);
-    expect(await selectedConnection({ probeUsage: true, now: at(10) })).toBe(accounts.first.connectionId);
+    expect(await selectedConnection({ now: at(10) })).toBe(accounts.first.connectionId);
     expect(fetchClaudeQuota).not.toHaveBeenCalled();
     expect(await db.select().from(aiConnectionQuotaStates)).toHaveLength(0);
   });

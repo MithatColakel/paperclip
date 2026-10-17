@@ -70,7 +70,7 @@ describeEmbeddedPostgres("environment company scope", () => {
       companyId: input.companyId ?? null,
       driver: input.driver ?? "sandbox",
       status: input.status ?? "active",
-      config: input.config ?? { provider: "mac-fleet", deviceId: input.name },
+      config: input.config ?? { provider: "fake-plugin", deviceId: input.name },
     });
     return id;
   }
@@ -79,21 +79,21 @@ describeEmbeddedPostgres("environment company scope", () => {
     const acme = await seedCompany("Acme");
     const other = await seedCompany("Other");
     const shared = await seedEnvironment({ name: "shared-runner" });
-    const acmeMac = await seedEnvironment({ name: "acme-mac", companyId: acme });
-    const otherMac = await seedEnvironment({ name: "other-mac", companyId: other });
+    const acmeDevice = await seedEnvironment({ name: "acme-device", companyId: acme });
+    const otherDevice = await seedEnvironment({ name: "other-device", companyId: other });
 
     const listed = (await svc.list(acme, {})).map((environment) => environment.id);
     const listedForOther = (await svc.list(other, {})).map((environment) => environment.id);
     const listedForInstance = (await svc.list({})).map((environment) => environment.id);
 
-    expect(listed).toEqual(expect.arrayContaining([shared, acmeMac]));
-    expect(listed).not.toContain(otherMac);
-    expect(listedForOther).toEqual(expect.arrayContaining([shared, otherMac]));
-    expect(listedForOther).not.toContain(acmeMac);
+    expect(listed).toEqual(expect.arrayContaining([shared, acmeDevice]));
+    expect(listed).not.toContain(otherDevice);
+    expect(listedForOther).toEqual(expect.arrayContaining([shared, otherDevice]));
+    expect(listedForOther).not.toContain(acmeDevice);
     // Without a company (instance-level callers) every environment is listed.
-    expect(listedForInstance).toEqual(expect.arrayContaining([shared, acmeMac, otherMac]));
+    expect(listedForInstance).toEqual(expect.arrayContaining([shared, acmeDevice, otherDevice]));
     const listedRows = await svc.list(acme, {});
-    expect(listedRows.find((environment) => environment.id === acmeMac)?.companyId).toBe(acme);
+    expect(listedRows.find((environment) => environment.id === acmeDevice)?.companyId).toBe(acme);
   });
 
   it("counts what still points at an environment from outside a company", async () => {
@@ -118,12 +118,12 @@ describeEmbeddedPostgres("environment company scope", () => {
   it("resolves project and company defaults, skipping ones the agent cannot use", async () => {
     const acme = await seedCompany("Acme");
     const other = await seedCompany("Other");
-    const acmeMac = await seedEnvironment({ name: "acme-mac", companyId: acme });
-    const otherMac = await seedEnvironment({ name: "other-mac", companyId: other });
+    const acmeDevice = await seedEnvironment({ name: "acme-device", companyId: acme });
+    const otherDevice = await seedEnvironment({ name: "other-device", companyId: other });
     const archived = await seedEnvironment({ name: "archived-runner", status: "archived" });
     const [project] = await db
       .insert(projects)
-      .values({ companyId: acme, name: "iOS", defaultEnvironmentId: acmeMac })
+      .values({ companyId: acme, name: "iOS", defaultEnvironmentId: acmeDevice })
       .returning();
     await db.update(companies).set({ defaultEnvironmentId: archived }).where(eq(companies.id, acme));
 
@@ -133,10 +133,10 @@ describeEmbeddedPostgres("environment company scope", () => {
         adapterType: "claude_local",
         projectId: project!.id,
       }),
-    ).toEqual({ projectDefaultEnvironmentId: acmeMac, companyDefaultEnvironmentId: null });
+    ).toEqual({ projectDefaultEnvironmentId: acmeDevice, companyDefaultEnvironmentId: null });
 
     // Another company's device never becomes an inherited default.
-    await db.update(projects).set({ defaultEnvironmentId: otherMac });
+    await db.update(projects).set({ defaultEnvironmentId: otherDevice });
     expect(
       await resolveInheritedEnvironmentDefaults(db, svc, {
         companyId: acme,
@@ -146,22 +146,22 @@ describeEmbeddedPostgres("environment company scope", () => {
     ).toEqual({ projectDefaultEnvironmentId: null, companyDefaultEnvironmentId: null });
 
     // A local-only adapter skips a remote company default.
-    await db.update(companies).set({ defaultEnvironmentId: acmeMac }).where(eq(companies.id, acme));
+    await db.update(companies).set({ defaultEnvironmentId: acmeDevice }).where(eq(companies.id, acme));
     expect(
       await resolveInheritedEnvironmentDefaults(db, svc, { companyId: acme, adapterType: "http" }),
     ).toEqual({ projectDefaultEnvironmentId: null, companyDefaultEnvironmentId: null });
     expect(
       await resolveInheritedEnvironmentDefaults(db, svc, { companyId: acme, adapterType: "claude_local" }),
-    ).toEqual({ projectDefaultEnvironmentId: null, companyDefaultEnvironmentId: acmeMac });
+    ).toEqual({ projectDefaultEnvironmentId: null, companyDefaultEnvironmentId: acmeDevice });
   });
 
   it("clears company and project defaults when their environment is deleted", async () => {
     const acme = await seedCompany("Acme");
-    const mac = await seedEnvironment({ name: "acme-mac", companyId: acme });
-    await db.insert(projects).values({ companyId: acme, name: "iOS", defaultEnvironmentId: mac });
-    await db.update(companies).set({ defaultEnvironmentId: mac }).where(eq(companies.id, acme));
+    const device = await seedEnvironment({ name: "acme-device", companyId: acme });
+    await db.insert(projects).values({ companyId: acme, name: "iOS", defaultEnvironmentId: device });
+    await db.update(companies).set({ defaultEnvironmentId: device }).where(eq(companies.id, acme));
 
-    await svc.remove(mac);
+    await svc.remove(device);
 
     const [company] = await db.select().from(companies);
     const [project] = await db.select().from(projects);
