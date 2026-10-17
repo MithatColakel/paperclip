@@ -700,6 +700,8 @@ describe("AgentClaudeAccountCard", () => {
 });
 
 describe("AgentClaudeAccountOverviewRows", () => {
+  const RUNTIME_HREF = "/agents/coder/runtime";
+
   function Row({ label, children }: { label: string; children: ReactNode }) {
     return <div data-row={label}>{children}</div>;
   }
@@ -742,6 +744,44 @@ describe("AgentClaudeAccountOverviewRows", () => {
     await render(<AgentClaudeAccountOverviewRows agent={CODEX_AGENT} Row={Row} />);
     expect(container.innerHTML).toBe("");
     expect(poolApi.getAgentBinding).not.toHaveBeenCalled();
+  });
+
+  it("links the Claude account row to where the account is chosen, for those who may change it", async () => {
+    poolApi.getAgentBinding.mockResolvedValue(binding(ON_TEAM));
+    await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
+    const account = container.querySelector("[data-row='Claude account']");
+    expect(account?.textContent).toBe("Team Max·Change");
+    const change = account?.querySelector("a");
+    expect(change?.getAttribute("href")).toBe(RUNTIME_HREF);
+    expect(change?.textContent).toBe("Change");
+    expect(change?.getAttribute("aria-label")).toBe("Change the Claude account");
+    // The device is not chosen here, so its row has no link.
+    expect(container.querySelector("[data-row='Device'] a")).toBeNull();
+  });
+
+  it("offers no Change link without a target, to those who may not change the account, or before the binding loads", async () => {
+    poolApi.getAgentBinding.mockResolvedValue(binding(ON_TEAM));
+    await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Team Max");
+    expect(container.querySelector("a")).toBeNull();
+    await act(async () => root?.unmount());
+
+    poolApi.getAgentBinding.mockResolvedValue(binding({ ...ON_TEAM, canChange: false }));
+    await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Team Max");
+    expect(container.querySelector("a")).toBeNull();
+    await act(async () => root?.unmount());
+
+    poolApi.getAgentBinding.mockReturnValue(new Promise(() => {}));
+    await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Loading…");
+    expect(container.querySelector("a")).toBeNull();
+    await act(async () => root?.unmount());
+
+    poolApi.getAgentBinding.mockRejectedValue(new ApiError("Not found", 404, { error: "Not found" }));
+    await render(<AgentClaudeAccountOverviewRows agent={AGENT} Row={Row} changeHref={RUNTIME_HREF} now={NOW} />);
+    expect(container.querySelector("[data-row='Claude account']")?.textContent).toBe("Could not load");
+    expect(container.querySelector("a")).toBeNull();
   });
 });
 

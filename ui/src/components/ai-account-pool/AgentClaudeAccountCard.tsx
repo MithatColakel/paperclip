@@ -430,14 +430,18 @@ export interface AgentClaudeAccountOverviewRowsProps {
   agent: Pick<Agent, "id" | "adapterType">;
   /** The page's own summary row, so these rows match their neighbours. */
   Row: ComponentType<{ label: string; children: ReactNode }>;
+  /** Where the account is chosen: the agent's runtime view, which opens on the Claude account card. */
+  changeHref?: string;
   now?: Date;
 }
 
 /**
  * Fork: the overview's Device and Claude account rows for a Claude agent. A
- * device that is not available says so, e.g. `Offline since 13:02`.
+ * device that is not available says so, e.g. `Offline since 13:02`. Someone
+ * who may change the account gets a Change link to `changeHref`. The account
+ * row wraps on a narrow card, so the link never widens it past the card.
  */
-export function AgentClaudeAccountOverviewRows({ agent, Row, now }: AgentClaudeAccountOverviewRowsProps) {
+export function AgentClaudeAccountOverviewRows({ agent, Row, changeHref, now }: AgentClaudeAccountOverviewRowsProps) {
   const isClaude = usesPoolAccounts(agent.adapterType);
   const bindingQuery = useAgentBinding(agent.id, isClaude);
   const binding = bindingQuery.data;
@@ -466,14 +470,28 @@ export function AgentClaudeAccountOverviewRows({ agent, Row, now }: AgentClaudeA
         ))}
       </Row>
       <Row label="Claude account">
-        {account ? (
-          <>
-            <span className="max-w-48 truncate text-sm">{account.label}</span>
-            {account.state !== "active" ? <AiAccountStateBadge display={aiAccountStateDisplay(account, now)} /> : null}
-          </>
-        ) : (
-          <span className="text-sm">{AI_ACCOUNT_BINDING_STATE_SHORT_TEXT[binding.state]}</span>
-        )}
+        <span className="flex min-w-0 flex-wrap items-center justify-end gap-1">
+          {account ? (
+            <>
+              <span className="max-w-48 truncate text-sm">{account.label}</span>
+              {account.state !== "active" ? <AiAccountStateBadge display={aiAccountStateDisplay(account, now)} /> : null}
+            </>
+          ) : (
+            <span className="text-sm">{AI_ACCOUNT_BINDING_STATE_SHORT_TEXT[binding.state]}</span>
+          )}
+          {changeHref && binding.canChange ? (
+            <span className="flex items-center gap-1">
+              <span aria-hidden="true" className="text-xs text-muted-foreground">·</span>
+              <Link
+                to={changeHref}
+                aria-label="Change the Claude account"
+                className="text-xs text-muted-foreground hover:text-foreground"
+              >
+                Change
+              </Link>
+            </span>
+          ) : null}
+        </span>
       </Row>
     </>
   );

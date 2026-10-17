@@ -1769,7 +1769,7 @@ export function AgentOverview({
             <SummaryRow label="Adapter"><span className="text-sm">{adapterLabels[agent.adapterType] ?? agent.adapterType}</span></SummaryRow>
             <SummaryRow label="Model"><span className="max-w-64 truncate text-sm font-mono">{configuredModel}</span></SummaryRow>
             {/* Fork: Device and Claude account rows for a Claude agent. */}
-            <AgentClaudeAccountOverviewRows agent={agent} Row={SummaryRow} />
+            <AgentClaudeAccountOverviewRows agent={agent} Row={SummaryRow} changeHref={agentDetailHref(agentRouteId, "runtime")} />
             <SummaryRow label="Session"><span className="max-w-64 truncate text-sm font-mono">{runtimeState?.sessionDisplayId ?? runtimeState?.sessionId ?? "No session"}</span></SummaryRow>
             <SummaryRow label="Last run">
               <span className="text-sm">{lastRun ? `${lastRun.status} · ${relativeTime(lastRun.createdAt)}` : "No runs"}</span>

@@ -138,6 +138,8 @@ describe("AgentOverview", () => {
     expect(markup).toContain("Build box — owner ada@example.com");
     expect(markup).toContain("Claude account");
     expect(markup).toContain("Team Max");
+    // The row links to where the account is chosen; Configure has the same href, so match the label.
+    expect(markup).toMatch(/<a href="\/agents\/claudecoder\/runtime"[^>]*aria-label="Change the Claude account"[^>]*>Change<\/a>/);
   });
 });
 
