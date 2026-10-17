@@ -302,7 +302,8 @@ describe("plugin-worker-manager stderr failure context", () => {
       });
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
-        { invocationScope: { companyId: "company-a" } },
+        // Fork: plus the host-derived method and actor (spec 9.6).
+        { invocationScope: { companyId: "company-a", method: "performAction", actor: { type: "agent", userId: null } } },
       );
     } finally {
       await handle.stop().catch(() => undefined);
@@ -339,7 +340,8 @@ describe("plugin-worker-manager stderr failure context", () => {
 
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-1" },
-        { invocationScope: { companyId: "company-1" } },
+        // Fork: plus the host-derived method (spec 9.6).
+        { invocationScope: { companyId: "company-1", method: "getData" } },
       );
     } finally {
       await handle.stop().catch(() => undefined);

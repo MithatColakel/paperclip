@@ -50,6 +50,7 @@ import { logger } from "../middleware/logger.js";
 import { environmentService } from "./environments.js";
 import type { ManagedSandboxEnvironmentReconcileAction } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { recheckDeviceLimitsAfterChange } from "./ai-account-pool.js";
 import type { ManagedInstanceConfig } from "./managed-config.js";
 import type { ManagedResourceStockStatus } from "./managed-resource-drift.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -161,6 +162,8 @@ export async function applyManagedEnvironments(
         ((await settings.get()).defaultEnvironmentId ?? null) === managedRow.id
       ) {
         await settings.update({ defaultEnvironmentId: null });
+        // Fork: the instance default can push an execution device over its Claude account limit (spec 5.6).
+        recheckDeviceLimitsAfterChange(db, "managed_instance_default_reverted");
         const { managedDefaultStamped: _cleared, ...remainingMetadata } = managedRow.metadata ?? {};
         await environments.update(managedRow.id, { metadata: remainingMetadata });
         logger.info(
@@ -245,6 +248,8 @@ export async function applyManagedEnvironments(
         metadata: { ...(managedEnvironment.metadata ?? {}), managedDefaultStamped: true },
       });
       await settings.update({ defaultEnvironmentId: managedEnvironment.id });
+      // Fork: the instance default can push an execution device over its Claude account limit (spec 5.6).
+      recheckDeviceLimitsAfterChange(db, "managed_instance_default_set");
       logger.info(
         { environmentId: managedEnvironment.id, previousDefaultEnvironmentId: current },
         "instance default environment set to the managed sandbox environment",

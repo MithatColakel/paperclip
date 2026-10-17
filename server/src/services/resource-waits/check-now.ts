@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { type Db, environments, heartbeatRuns, resourceWaitEpisodes, resourceWaitNotices } from "@paperclipai/db";
 import {
   isEnvironmentAvailableToCompany,
@@ -82,7 +82,8 @@ export function checkNowRateLimitedError(retryAfterMs: number = RESOURCE_WAIT_TI
  * context plus its episode's start and immediate-notice times. Runs that are
  * not lane runs, or whose context is unreadable, are left out. A run that
  * joined another agent's episode for another resource gets no start or notice
- * time from it.
+ * time from it; once it took the issue's wait over (an open episode of its
+ * own), the times are that episode's.
  */
 export async function readScheduledRetryResourceWaits(
   db: Db,
@@ -102,18 +103,25 @@ export async function readScheduledRetryResourceWaits(
       resourceKey: resourceWaitEpisodes.resourceKey,
       since: resourceWaitEpisodes.since,
       notifiedAt: resourceWaitEpisodes.notifiedAt,
+      currentRunId: resourceWaitEpisodes.currentRunId,
+      resolvedAt: resourceWaitEpisodes.resolvedAt,
     })
     .from(resourceWaitEpisodes)
-    .where(inArray(resourceWaitEpisodes.id, [...new Set(contexts.map((entry) => entry.context.episodeId))]));
+    .where(or(
+      inArray(resourceWaitEpisodes.id, [...new Set(contexts.map((entry) => entry.context.episodeId))]),
+      and(isNull(resourceWaitEpisodes.resolvedAt), inArray(resourceWaitEpisodes.currentRunId, contexts.map((entry) => entry.run.id))),
+    ));
   const byId = new Map(episodes.map((episode) => [episode.id, episode]));
   for (const { run, context } of contexts) {
-    const episode = byId.get(context.episodeId);
-    const owned = episode && episode.companyId === run.companyId
+    const forResource = (episode: (typeof episodes)[number] | undefined) => episode && episode.companyId === run.companyId
       && episode.kind === context.kind && episode.resourceKey === resourceKeyOf(context)
       ? episode
       : null;
+    const adopted = forResource(episodes.find((episode) => episode.currentRunId === run.id && !episode.resolvedAt));
+    const owned = adopted ?? forResource(byId.get(context.episodeId));
     result.set(run.id, {
       ...context,
+      ...(owned ? { episodeId: owned.id } : {}),
       since: owned ? owned.since.toISOString() : null,
       notifiedAt: owned?.notifiedAt ? owned.notifiedAt.toISOString() : null,
     });

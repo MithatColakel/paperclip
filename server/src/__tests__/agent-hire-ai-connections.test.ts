@@ -118,7 +118,8 @@ describe("agent-created hires use managed AI connections", () => {
     await db.update(agents).set({ runtimeConfig: { aiConnection: p.binding } }).where(eq(agents.id, f.agentId));
     const response = await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({ name: "Incompatible teammate", role: "engineer", adapterType: "claude_local" });
     expect(response.status, JSON.stringify(response.body)).toBe(422);
-    expect(response.body.error).toContain("no compatible harness");
+    // Fork: a Claude agent takes no router at all (account pool spec 4.1), so that refusal comes first.
+    expect(response.body.code).toBe("ai_connection_router_unsupported");
     expect(await db.select().from(agents).where(eq(agents.companyId, f.companyId))).toHaveLength(1);
   });
 
@@ -203,9 +204,11 @@ describe("agent-created hires use managed AI connections", () => {
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
     await db.update(agents).set({ runtimeConfig: { aiConnection: p.binding } }).where(eq(agents.id, f.agentId));
     const response = await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-5" } });
-    expect(response.status, JSON.stringify(response.body)).toBe(compatible ? 200 : 422);
+    // Fork: a router is refused for a Claude agent whatever its members (account pool spec 4.1).
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(response.body.code).toBe("ai_connection_router_unsupported");
     const [saved] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    expect(saved.adapterType).toBe(compatible ? "claude_local" : "codex_local");
+    expect(saved.adapterType).toBe("codex_local");
     expect(saved.runtimeConfig.aiConnection).toEqual(p.binding);
   });
 

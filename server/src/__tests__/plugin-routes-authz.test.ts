@@ -744,6 +744,7 @@ describe("plugin tool and bridge authz", () => {
         agentId: null,
         runId: null,
         companyId: null,
+        isInstanceAdmin: true, // Fork: host-derived (spec 9.6).
       },
       renderEnvironment: null,
     });
@@ -781,9 +782,38 @@ describe("plugin tool and bridge authz", () => {
         agentId: null,
         runId: runA,
         companyId: companyA,
+        isInstanceAdmin: false, // Fork: host-derived (spec 9.6).
       },
       renderEnvironment: null,
     });
+  });
+
+  // Fork: the performAction actor's host-derived isInstanceAdmin (spec 9.6).
+  it("sets the host-derived isInstanceAdmin on board actors only, whatever the request says", async () => {
+    readyPlugin();
+    const call = vi.fn().mockResolvedValue({ ok: true });
+    const actorContextFor = async (actor: Record<string, unknown>) => {
+      call.mockClear();
+      const { app } = await createApp(actor, {}, { bridgeDeps: { workerManager: { call } } });
+      const res = await request(app)
+        .post(`/api/plugins/${pluginId}/actions/sync`)
+        .send({
+          companyId: companyA,
+          params: { isInstanceAdmin: true },
+          actorContext: { type: "user", userId: "spoofed-admin", isInstanceAdmin: true },
+          isInstanceAdmin: true,
+        });
+      expect(res.status).toBe(200);
+      return call.mock.calls[0]![2].actorContext as Record<string, unknown>;
+    };
+
+    expect(await actorContextFor(boardActor({ userId: "admin-1", isInstanceAdmin: true })))
+      .toMatchObject({ type: "user", userId: "admin-1", isInstanceAdmin: true });
+    expect(await actorContextFor(boardActor({ userId: "local-board", source: "local_implicit", isInstanceAdmin: undefined, companyIds: undefined })))
+      .toMatchObject({ type: "user", userId: "local-board", isInstanceAdmin: true });
+    expect(await actorContextFor(boardActor()))
+      .toMatchObject({ type: "user", userId: "user-1", isInstanceAdmin: false });
+    expect(await actorContextFor(agentActor())).not.toHaveProperty("isInstanceAdmin");
   });
 
   it("uses null for board actor userId when no authenticated user id is present", async () => {

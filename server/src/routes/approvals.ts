@@ -24,6 +24,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactEventPayload } from "../redaction.js";
 import { unprocessable } from "../errors.js";
 import { environmentService } from "../services/environments.js";
+import { aiAccountPoolService } from "../services/ai-account-pool.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
@@ -58,6 +59,8 @@ export function approvalRoutes(
   const issueApprovalsSvc = issueApprovalService(db);
   const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
+  // Fork: the Claude account pool's placement rules (spec 5.6).
+  const aiAccountPool = aiAccountPoolService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   async function lostReviewPathIssueIds(
@@ -320,6 +323,8 @@ export function approvalRoutes(
         environmentId,
         { allowedDrivers: supportedEnvironmentDriversForAdapter(adapterType) },
       );
+      // Fork: a pool-bound hire's environment pick passes the placement checks (spec 5.6).
+      await aiAccountPool.placeHireForApproval(req.actor, pending, req.body.defaultEnvironmentId);
       if (req.body.defaultEnvironmentId !== undefined) {
         payloadPatch = { defaultEnvironmentId: req.body.defaultEnvironmentId };
       }

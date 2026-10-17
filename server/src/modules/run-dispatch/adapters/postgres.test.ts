@@ -401,12 +401,36 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         .where(eq(heartbeatRuns.id, waitingId));
       expect(await gate()).toEqual({ allowed: true });
 
-      // A task moved to blocked ends the wait.
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      // A task moved to blocked while the run waited ends the wait; a task that
+      // was blocked before the run was created (a reply woke it) does not.
+      const [waiting] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, waitingId));
+      await db.update(issues)
+        .set({ status: "blocked", blockedTransitionAt: new Date(waiting!.createdAt.getTime() - 3_600_000) })
+        .where(eq(issues.id, issueId));
+      expect(await gate()).toEqual({ allowed: true });
+      await db.update(issues).set({ blockedTransitionAt: new Date(waiting!.createdAt.getTime() + 1_000) }).where(eq(issues.id, issueId));
       expect(await gate()).toMatchObject({ allowed: false, errorCode: "issue_blocked" });
 
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
       expect(await gate()).toMatchObject({ allowed: false, errorCode: "issue_terminal_status" });
+    });
+
+    // Fork: the queued-run staleness check of a lane run reads the same block facts.
+    it.each(["environment_wait", "ai_account_wait", "device_slot_wait"])("cancels a queued %s run only when its task was blocked after the run was created", async (lane) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const createdAt = new Date();
+      const runId = await seedRun({ companyId, agentId, status: "queued", scheduledRetryReason: lane, contextSnapshot: { issueId, retryReason: lane }, now: createdAt });
+      await db.update(issues)
+        .set({ executionRunId: runId, status: "blocked", blockedTransitionAt: new Date(createdAt.getTime() - 3_600_000) })
+        .where(eq(issues.id, issueId));
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const check = () => adapter.cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() });
+      expect(await check()).toEqual({ outcome: "not_stale" });
+      await db.update(issues).set({ blockedTransitionAt: new Date(createdAt.getTime() + 1_000) }).where(eq(issues.id, issueId));
+      expect(await check()).toMatchObject({ outcome: "cancelled", errorCode: "issue_blocked" });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.executionRunId).toBeNull();
     });
 
     it("maps a disabled on-demand wake into a blocked scheduled-retry gate decision", async () => {

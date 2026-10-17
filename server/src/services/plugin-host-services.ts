@@ -51,6 +51,7 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
+import { pluginEnvironmentTargetsService } from "./plugin-environment-targets.js";
 import {
   assertConfiguredLocalFolder,
   assertWritableConfiguredLocalFolder,
@@ -3029,6 +3030,9 @@ export function buildHostServices(
         return redactInvite(revoked);
       },
     },
+
+    // Fork: target reports and company environments of environment driver plugins (spec 9.4-9.5).
+    environments: pluginEnvironmentTargetsService(db, { pluginId, pluginKey }),
 
     authorization: {
       async listGrants(params) {

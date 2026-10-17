@@ -77,6 +77,8 @@ type LoadGateFactsInput = {
   scheduledRetryReason: string | null;
   retryReasonOverride?: string | null;
   wakeupRequestId: string | null;
+  /** Fork: a resource wait ends only on a block after the run was created. */
+  runCreatedAt?: Date | null;
 };
 type LoadGateFactsResult =
   | { agentFound: true; facts: ScheduledRetryFacts }
@@ -88,6 +90,8 @@ type LoadStalenessFactsInput = {
   issueId: string;
   contextSnapshot: Record<string, unknown>;
   scheduledRetryReason: string | null;
+  /** Fork: a resource wait ends only on a block after the run was created. */
+  runCreatedAt?: Date | null;
 };
 type CancelSuppressedRetryInput = {
   runId: string;
@@ -293,8 +297,10 @@ export function createPostgresRunDispatchAdapter(
       retryReasonKind,
       enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
-      // Fork: device, account and slot waits end when the task is blocked.
+      // Fork: device, account and slot waits end when the task is blocked while they wait.
       isResourceWaitLane: isResourceWaitRetryReason(retryReason),
+      runCreatedAt: input.runCreatedAt ?? null,
+      issueBlockedTransitionAt: null,
       budgetBlock: null,
       agentInvokable: true,
       agentInvokabilityDetails: {},
@@ -345,6 +351,7 @@ export function createPostgresRunDispatchAdapter(
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
+        blockedTransitionAt: issues.blockedTransitionAt,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -360,6 +367,7 @@ export function createPostgresRunDispatchAdapter(
     if (!facts.issueFound) return { agentFound: true, facts };
 
     facts.issueStatus = issue.status;
+    facts.issueBlockedTransitionAt = issue.blockedTransitionAt ?? null;
     facts.issueAssigneeAgentId = issue.assigneeAgentId;
     facts.issueExecutionRunId = issue.executionRunId;
     facts.issueCheckoutRunId = issue.checkoutRunId;
@@ -468,6 +476,7 @@ export function createPostgresRunDispatchAdapter(
         scheduledRetryReason: run.scheduledRetryReason,
         retryReasonOverride: input.retryReasonOverride,
         wakeupRequestId: run.wakeupRequestId,
+        runCreatedAt: run.createdAt,
       },
       input.now,
     );
@@ -524,6 +533,7 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        blockedTransitionAt: issues.blockedTransitionAt,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -611,8 +621,10 @@ export function createPostgresRunDispatchAdapter(
       isInteractionWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
-      // Fork: device, account and slot waits end when the task is blocked.
+      // Fork: device, account and slot waits end when the task is blocked while they wait.
       isResourceWaitLane: isResourceWaitRetryReason(retryReason),
+      issueBlockedTransitionAt: issue?.blockedTransitionAt ?? null,
+      runCreatedAt: input.runCreatedAt ?? null,
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),
       isCompletedOnboardingHandoffWake: await isCompletedOnboardingHandoffWake(dbOrTx, {
@@ -771,6 +783,7 @@ export function createPostgresRunDispatchAdapter(
           scheduledRetryReason: run.scheduledRetryReason,
           retryReasonOverride: run.scheduledRetryReason,
           wakeupRequestId: run.wakeupRequestId,
+          runCreatedAt: run.createdAt,
         },
         now,
         tx,
@@ -974,6 +987,7 @@ export function createPostgresRunDispatchAdapter(
         issueId,
         contextSnapshot,
         scheduledRetryReason: run.scheduledRetryReason,
+        runCreatedAt: run.createdAt,
       },
       now,
       tx,

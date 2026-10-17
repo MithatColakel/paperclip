@@ -2,8 +2,10 @@ import { and, asc, eq, isNull, notInArray, sql, type SQL } from "drizzle-orm";
 import { type Db, heartbeatRuns, resourceWaitEpisodes } from "@paperclipai/db";
 import {
   RESOURCE_WAIT_LANE_BY_KIND,
+  RESOURCE_WAIT_NOTICE_POLICY,
   readResourceWaitContext,
   type ResourceWaitContext,
+  type ResourceWaitReason,
   type ResourceWaitResolution,
 } from "@paperclipai/shared";
 import type { HeartbeatRunRow, ResourceWaitDb, ResourceWaitEpisodeRow, ResourceWaitTarget } from "./types.js";
@@ -19,13 +21,29 @@ import type { HeartbeatRunRow, ResourceWaitDb, ResourceWaitEpisodeRow, ResourceW
  * comment mentioned). The episode belongs to its current run: a deferral of
  * another agent's run never takes it from a live waiting run, unless that
  * deferral ran as the issue's assignee. The other run joins it unchanged
- * (`shared`) and waits from its own `contextSnapshot.resourceWait`.
+ * (`shared`) and waits from its own `contextSnapshot.resourceWait`; when the
+ * episode ends, the oldest joined wait for another resource takes the issue's
+ * wait over with an episode of its own (`adoptEpisode`, episode-end.ts).
  *
  * Environment, device, account and current-run ids have no foreign keys:
  * readers tolerate ids that no longer resolve.
  */
 
 const LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
+
+function isLimitReason(reason: string | null | undefined): boolean {
+  return reason === "usage_limit" || reason === "credit_balance";
+}
+
+/**
+ * A reused episode whose reason changed to one a person must act on gets its
+ * own immediate notice (spec 8): another limit is still the same limit.
+ */
+export function needsNewImmediateNotice(previousReason: string, reason: string): boolean {
+  if (previousReason === reason) return false;
+  if (RESOURCE_WAIT_NOTICE_POLICY[reason as ResourceWaitReason] !== "immediate") return false;
+  return !(isLimitReason(previousReason) && isLimitReason(reason));
+}
 
 /** `environment:<id>`, `account:<id>` (`account:none` while unassigned) or `device:<id>`. */
 export function resourceKeyOf(wait: Pick<ResourceWaitTarget | ResourceWaitContext, "kind" | "environmentId" | "accountId" | "deviceId">): string {
@@ -78,13 +96,22 @@ export async function getEpisode(db: Db, episodeId: string): Promise<ResourceWai
 }
 
 /**
- * The episode a lane run waits in: the one its `contextSnapshot.resourceWait`
- * names, else the episode whose current run it is.
+ * The episode a lane run waits in: the open episode whose current run it is
+ * (a run that took over a chain's wait), else the one its
+ * `contextSnapshot.resourceWait` names, else the last one it was the current
+ * run of.
  */
 export async function episodeForRun(
   db: Db,
   run: Pick<HeartbeatRunRow, "id" | "companyId" | "contextSnapshot">,
 ): Promise<ResourceWaitEpisodeRow | null> {
+  const [owned] = await db
+    .select()
+    .from(resourceWaitEpisodes)
+    .where(and(eq(resourceWaitEpisodes.currentRunId, run.id), eq(resourceWaitEpisodes.companyId, run.companyId)))
+    .orderBy(sql`${resourceWaitEpisodes.resolvedAt} is null desc`, sql`${resourceWaitEpisodes.createdAt} desc`)
+    .limit(1);
+  if (owned && !owned.resolvedAt) return owned;
   const context = readResourceWaitContext(run.contextSnapshot?.resourceWait);
   if (context) {
     const [row] = await db
@@ -93,13 +120,7 @@ export async function episodeForRun(
       .where(and(eq(resourceWaitEpisodes.id, context.episodeId), eq(resourceWaitEpisodes.companyId, run.companyId)));
     if (row) return row;
   }
-  const [current] = await db
-    .select()
-    .from(resourceWaitEpisodes)
-    .where(and(eq(resourceWaitEpisodes.currentRunId, run.id), eq(resourceWaitEpisodes.companyId, run.companyId)))
-    .orderBy(sql`${resourceWaitEpisodes.resolvedAt} is null desc`, sql`${resourceWaitEpisodes.createdAt} desc`)
-    .limit(1);
-  return current ?? null;
+  return owned ?? null;
 }
 
 export interface OpenEpisodeResult {
@@ -116,6 +137,12 @@ export interface OpenEpisodeResult {
    * the episode's current run, writes no bookkeeping and sends no notice.
    */
   shared: boolean;
+  /**
+   * The episode's current run before this call. A reuse (or takeover) makes
+   * the deferring run current inside the locked transaction, so a deferral
+   * that ends up without a successor can give the episode back.
+   */
+  previousCurrentRunId?: string | null;
 }
 
 /** The run that defers, so an episode is never taken from another agent's live waiting run. */
@@ -148,9 +175,12 @@ async function mayTakeOver(tx: ResourceWaitDb, open: ResourceWaitEpisodeRow, run
  * Opens, reuses or supersedes the chain's episode for a deferral (spec 7.3
  * step 3), in one transaction. On reuse `checks` counts consecutive
  * deferrals with the same reason (it drives admission backoff) and starts
- * over at 0 when the reason changes. With `run`, an episode whose current
- * run is another agent's live run is joined unchanged (`shared`), unless
- * `run` executed as the issue's assignee.
+ * over at 0 when the reason changes; a new reason a person must act on
+ * clears `notified_at`, so its own notice goes out (and is retried). With
+ * `run`, an episode whose current run is another agent's live run is joined
+ * unchanged (`shared`), unless `run` executed as the issue's assignee; a
+ * reuse or takeover makes `run` the current run under the row lock, so a
+ * concurrent hand-over or abandonment that read the old current run fails.
  */
 export async function openEpisode(
   db: Db,
@@ -167,7 +197,7 @@ export async function openEpisode(
         .where(and(chainCondition(chain), isNull(resourceWaitEpisodes.resolvedAt)))
         .for("update");
       if (open && input.run && !(await mayTakeOver(tx, open, input.run))) {
-        return { episode: open, created: false, superseded, reasonChanged: false, shared: true };
+        return { episode: open, created: false, superseded, reasonChanged: false, shared: true, previousCurrentRunId: open.currentRunId };
       }
       if (open && open.kind === wait.kind && open.resourceKey === resourceKey) {
         const sameReason = open.reason === wait.reason;
@@ -184,11 +214,20 @@ export async function openEpisode(
             resumeAtSource: wait.resumeAtSource,
             checks: sameReason ? sql`${resourceWaitEpisodes.checks} + 1` : 0,
             nextCheckAt: null,
+            ...(input.run ? { currentRunId: input.run.id } : {}),
+            ...(needsNewImmediateNotice(open.reason, wait.reason) ? { notifiedAt: null } : {}),
             updatedAt: now,
           })
           .where(eq(resourceWaitEpisodes.id, open.id))
           .returning();
-        return { episode: episode!, created: false, superseded, reasonChanged: !sameReason, shared: false };
+        return {
+          episode: episode!,
+          created: false,
+          superseded,
+          reasonChanged: !sameReason,
+          shared: false,
+          previousCurrentRunId: open.currentRunId,
+        };
       }
       if (open) {
         const [closed] = await tx
@@ -215,7 +254,7 @@ export async function openEpisode(
       const id = inserted[0]?.id;
       if (id) {
         const [episode] = await tx.select().from(resourceWaitEpisodes).where(eq(resourceWaitEpisodes.id, id));
-        return { episode: episode!, created: true, superseded, reasonChanged: false, shared: false };
+        return { episode: episode!, created: true, superseded, reasonChanged: false, shared: false, previousCurrentRunId: null };
       }
       // A concurrent deferral of the same chain opened one first: reuse or supersede it.
     }
@@ -223,40 +262,58 @@ export async function openEpisode(
   });
 }
 
+/** The episode's current run is still the one the caller observed. */
+function currentRunIs(runId: string | null): SQL {
+  return runId ? eq(resourceWaitEpisodes.currentRunId, runId) : isNull(resourceWaitEpisodes.currentRunId);
+}
+
 /**
  * Ends an open episode. Returns the resolved row only for the call that
- * resolved it, so the caller's notice and activity run once.
+ * resolved it, so the caller's notice and activity run once. With
+ * `currentRunId`, only while that run is still the episode's current run (a
+ * wait another run took over in the meantime is left alone).
  */
 export async function resolveEpisode(
   db: Db,
   episodeId: string,
   resolution: ResourceWaitResolution,
   now: Date,
+  guard: { currentRunId?: string | null } = {},
 ): Promise<ResourceWaitEpisodeRow | null> {
   const [row] = await db
     .update(resourceWaitEpisodes)
     .set({ resolvedAt: now, resolution, updatedAt: now })
-    .where(and(eq(resourceWaitEpisodes.id, episodeId), isNull(resourceWaitEpisodes.resolvedAt)))
+    .where(and(
+      eq(resourceWaitEpisodes.id, episodeId),
+      isNull(resourceWaitEpisodes.resolvedAt),
+      guard.currentRunId !== undefined ? currentRunIs(guard.currentRunId) : undefined,
+    ))
     .returning();
   return row ?? null;
 }
 
-/** Makes `runId` the episode's current run; `nextCheckAt` records an admission wait's next attempt. */
+/**
+ * Makes `runId` the current run of an episode that is still open;
+ * `nextCheckAt` records an admission wait's next attempt. False when the
+ * episode ended in the meantime.
+ */
 export async function setEpisodeCurrentRun(
   db: Db,
   episodeId: string,
   runId: string,
   now: Date,
   bookkeeping: { nextCheckAt?: Date | null } = {},
-): Promise<void> {
-  await db
+): Promise<boolean> {
+  const rows = await db
     .update(resourceWaitEpisodes)
     .set({
       currentRunId: runId,
       ...(bookkeeping.nextCheckAt !== undefined ? { nextCheckAt: bookkeeping.nextCheckAt } : {}),
       updatedAt: now,
     })
-    .where(eq(resourceWaitEpisodes.id, episodeId));
+    .where(and(eq(resourceWaitEpisodes.id, episodeId), isNull(resourceWaitEpisodes.resolvedAt)))
+    .returning({ id: resourceWaitEpisodes.id });
+  return rows.length > 0;
 }
 
 /**
@@ -292,8 +349,11 @@ export async function coWaiterOf(
  * chain that waits for the same resource takes the episode over (its `since`
  * and notice state carry on, and its gate runs at its next check);
  * otherwise the episode is abandoned. `excludeRunIds` are runs that end too
- * (the ended run, and runs the gate suppresses with it). Returns the
- * abandoned row, for the caller's cleanup, only for the call that abandoned it.
+ * (the ended run, and runs the gate suppresses with it). Both writes require
+ * the episode to still be open with the current run the caller observed: a
+ * deferral that took the episode over in the meantime keeps it, and nothing
+ * happens. Returns the abandoned row, for the caller's cleanup, only for the
+ * call that abandoned it.
  */
 export async function handOverOrAbandon(
   db: Db,
@@ -309,10 +369,83 @@ export async function handOverOrAbandon(
       .where(and(
         eq(resourceWaitEpisodes.id, episode.id),
         isNull(resourceWaitEpisodes.resolvedAt),
-        episode.currentRunId ? eq(resourceWaitEpisodes.currentRunId, episode.currentRunId) : isNull(resourceWaitEpisodes.currentRunId),
+        currentRunIs(episode.currentRunId),
       ))
       .returning({ id: resourceWaitEpisodes.id });
-    if (moved.length > 0) return { handedOverTo: heir.id, abandoned: null };
+    return { handedOverTo: moved.length > 0 ? heir.id : null, abandoned: null };
   }
-  return { handedOverTo: null, abandoned: await resolveEpisode(db, episode.id, "abandoned", now) };
+  return {
+    handedOverTo: null,
+    abandoned: await resolveEpisode(db, episode.id, "abandoned", now, { currentRunId: episode.currentRunId }),
+  };
+}
+
+/**
+ * Opens an episode for a waiting run that has none of its own (it joined
+ * another agent's wait on the issue, and that wait ended): the run's own
+ * resource, with the run as current run, only while the chain has no open
+ * episode. Null when the chain has one.
+ */
+export async function adoptEpisode(
+  db: Db,
+  input: {
+    run: Pick<HeartbeatRunRow, "id" | "companyId" | "agentId" | "contextSnapshot">;
+    context: ResourceWaitContext;
+    since: Date;
+    checks: number;
+    nextCheckAt: Date | null;
+    now: Date;
+  },
+): Promise<ResourceWaitEpisodeRow | null> {
+  const { context, now } = input;
+  const chain = chainOfRun(input.run);
+  const iso = (date: Date | null) => (date ? date.toISOString() : null);
+  const inserted = await db.execute<{ id: string }>(sql`
+    insert into ${resourceWaitEpisodes} (
+      company_id, agent_id, issue_id, kind, reason, scope, resource_key,
+      environment_id, device_id, account_id, since, current_run_id, resume_at, resume_at_source,
+      next_check_at, checks, created_at, updated_at
+    ) values (
+      ${chain.companyId}::uuid, ${chain.agentId}::uuid, ${chain.issueId}::uuid, ${context.kind}, ${context.reason}, ${context.scope}, ${resourceKeyOf(context)},
+      ${context.environmentId}::uuid, ${context.deviceId}::uuid, ${context.accountId}::uuid, ${input.since.toISOString()}::timestamptz,
+      ${input.run.id}::uuid, ${context.resumeAt}::timestamptz, ${context.resumeAtSource},
+      ${iso(input.nextCheckAt)}::timestamptz, ${Math.max(0, Math.floor(input.checks))}, ${now.toISOString()}::timestamptz, ${now.toISOString()}::timestamptz
+    )
+    on conflict (company_id, (coalesce(issue_id::text, 'agent:' || agent_id::text))) where resolved_at is null do nothing
+    returning id
+  `);
+  const id = inserted[0]?.id;
+  if (!id) return null;
+  const [episode] = await db.select().from(resourceWaitEpisodes).where(eq(resourceWaitEpisodes.id, id));
+  return episode ?? null;
+}
+
+/**
+ * A wait that has to give the episode back after `openEpisode` made its run
+ * current (the deferral got no successor or never happened): the previous
+ * current run (and its agent) gets it again while the episode still points
+ * at `runId`.
+ */
+export async function restoreEpisodeCurrentRun(
+  db: Db,
+  episodeId: string,
+  runId: string,
+  previousCurrentRunId: string,
+  now: Date,
+): Promise<boolean> {
+  const [previous] = await db
+    .select({ agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, previousCurrentRunId));
+  const rows = await db
+    .update(resourceWaitEpisodes)
+    .set({ currentRunId: previousCurrentRunId, ...(previous ? { agentId: previous.agentId } : {}), updatedAt: now })
+    .where(and(
+      eq(resourceWaitEpisodes.id, episodeId),
+      isNull(resourceWaitEpisodes.resolvedAt),
+      currentRunIs(runId),
+      ...(previous ? [eq(resourceWaitEpisodes.companyId, previous.companyId)] : []),
+    ))
+    .returning({ id: resourceWaitEpisodes.id });
+  return rows.length > 0;
 }

@@ -66,6 +66,7 @@ import {
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
+import { withHostInvocationFacts } from "./plugin-invocation-facts.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -3304,7 +3305,8 @@ export function createPluginWorkerHandle(
 
       const id = nextRequestId++;
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
-      const invocationScope = deriveInvocationScope(method, params);
+      // Fork: plus the host-derived method and performAction actor (spec 9.6).
+      const invocationScope = withHostInvocationFacts(deriveInvocationScope(method, params), method, params);
       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
@@ -3459,7 +3461,8 @@ export function createPluginWorkerHandle(
 
     notify(method: string, params: unknown) {
       if (status !== "running") return;
-      const invocationScope = deriveInvocationScope(method, params);
+      // Fork: plus the host-derived method (spec 9.6).
+      const invocationScope = withHostInvocationFacts(deriveInvocationScope(method, params), method, params);
       // Notifications have no response to settle on, so the invocation scope
       // is GC'd by TTL. Call-path invocations are registered without a TTL and
       // cleared on settlement, so they survive arbitrarily long call timeouts.

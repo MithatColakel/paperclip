@@ -91,7 +91,7 @@ export function createPreflight(runtime: PreflightRuntime) {
         isNull(resourceWaitEpisodes.resolvedAt),
       ));
     if (!episode) return { episodeId: null };
-    const ended = await resolveEpisode(db, episode.id, "refused", runtime.clock());
+    const ended = await resolveEpisode(db, episode.id, "refused", runtime.clock(), { currentRunId: run.id });
     if (ended) await runtime.onEpisodeEnded(ended).catch(() => undefined);
     return { episodeId: episode.id };
   }
@@ -310,7 +310,8 @@ export function createPreflight(runtime: PreflightRuntime) {
     if (input.step === "credentials" && episode.kind === "environment") return { resolved: false, episodeId: episode.id };
     if (input.step !== "succeeded" && await isLimitProbe(episode, run)) return { resolved: false, episodeId: episode.id };
     const now = runtime.clock();
-    const resolved = await resolveEpisode(db, episode.id, "resolved", now);
+    // Only while this run still holds the episode: a wait another run took over goes on.
+    const resolved = await resolveEpisode(db, episode.id, "resolved", now, { currentRunId: run.id });
     if (!resolved) return { resolved: false, episodeId: episode.id };
     const waited = formatWaitDuration(now.getTime() - resolved.since.getTime());
     const fullRun = run as HeartbeatRunRow;

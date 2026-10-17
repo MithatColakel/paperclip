@@ -46,6 +46,7 @@ import { appendWithCap } from "../adapters/utils.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { environmentService } from "../services/environments.js";
 import { secretService } from "../services/secrets.js";
+import { recheckDeviceLimitsAfterChange } from "../services/ai-account-pool.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
@@ -350,6 +351,8 @@ export function projectRoutes(db: Db) {
     if (result.publication) publishActivity(result.publication);
     if (result.project.env) await secretsSvc.syncEnvBindingsForTarget?.(companyId, { targetType: "project", targetId: result.project.id }, result.project.env);
     if (result.duplicate) { res.status(200).json(result.project); return; }
+    // Fork: a project default can push an execution device over its Claude account limit (spec 5.6).
+    if (result.project.defaultEnvironmentId) recheckDeviceLimitsAfterChange(db, "project_created");
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
       trackProjectCreated(telemetryClient);
@@ -385,6 +388,8 @@ export function projectRoutes(db: Db) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
+    // Fork: a project default can push an execution device over its Claude account limit (spec 5.6).
+    if (body.defaultEnvironmentId !== undefined || body.archivedAt !== undefined) recheckDeviceLimitsAfterChange(db, "project_updated");
     if (body.env !== undefined) {
       await secretsSvc.syncEnvBindingsForTarget?.(
         project.companyId,

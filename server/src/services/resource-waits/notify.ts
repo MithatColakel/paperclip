@@ -40,17 +40,21 @@ import type { ResourceWaitDeps, ResourceWaitEpisodeRow } from "./types.js";
  * `resource_wait_notices` (`INSERT … ON CONFLICT DO NOTHING RETURNING`), and
  * only the inserter acts:
  *
- * - `issue:<issueId>:<episodeId>:immediate`: a person has to act, or an account
- *   reached its limit (once per episode, so a failed probe never repeats it);
+ * - `issue:<issueId>:<episodeId>:immediate`: an account reached its limit (once
+ *   per episode, so a failed probe or a credit limit after a usage limit never
+ *   repeats it); `issue:<issueId>:<episodeId>:immediate:<reason>`: a person has
+ *   to act (once per reason, so a wait whose reason changes, e.g. a limit that
+ *   turns into a sign-out, names the new fix);
  * - `issue:<issueId>:<episodeId>:long`: a device wait passed the company's
  *   notify-after hours;
  * - `issue:<issueId>:<episodeId>:resolved`: "Started after waiting …", only
  *   for an episode that was notified;
  * - `pm:<pmAgentId>:<kind>:<resourceKey>:<resourceEpisodeKey>`: one PM wake
- *   per resource episode, without an issue id (an issue-scoped wake would wait
- *   behind the waiting run's issue lock), skipped when the PM would only wait
- *   too: it shares the account or the unavailable device, or it would need a
- *   new slot on a device whose slots are full.
+ *   per resource episode (and per reason a person must act on), without an
+ *   issue id (an issue-scoped wake would wait behind the waiting run's issue
+ *   lock), skipped when the PM would only wait too: it shares the account or
+ *   the unavailable device, or it would need a new slot on a device whose
+ *   slots are full.
  *
  * An account's label appears only where its owner is an active member of the
  * company; elsewhere notices say "an account that is no longer available in
@@ -100,8 +104,22 @@ async function onceForKey(db: Db, companyId: string, noticeKey: string, now: Dat
   }
 }
 
-export function issueNoticeKey(issueId: string, episodeId: string, which: "immediate" | "long" | "resolved"): string {
-  return `issue:${issueId}:${episodeId}:${which}`;
+export function issueNoticeKey(issueId: string, episodeId: string, which: "immediate" | "long" | "resolved", reason?: string | null): string {
+  return reason ? `issue:${issueId}:${episodeId}:${which}:${reason}` : `issue:${issueId}:${episodeId}:${which}`;
+}
+
+function isLimitReason(reason: string): boolean {
+  return reason === "usage_limit" || reason === "credit_balance";
+}
+
+/** A person must act on this reason: its notices are keyed by it, not just by the episode. */
+function isActionReason(reason: string): boolean {
+  return !isLimitReason(reason) && RESOURCE_WAIT_NOTICE_POLICY[reason as ResourceWaitReason] === "immediate";
+}
+
+/** The immediate notice's key: one per episode for a limit, one per reason otherwise. */
+function immediateNoticeKey(issueId: string, episode: Pick<ResourceWaitEpisodeRow, "id" | "reason">): string {
+  return issueNoticeKey(issueId, episode.id, "immediate", isActionReason(episode.reason) ? episode.reason : null);
 }
 
 export function pmNoticeKey(pmAgentId: string, kind: string, resourceKey: string, resourceEpisodeKey: string): string {
@@ -331,7 +349,8 @@ function resourceEpisodeKeyOf(facts: ResourceEpisodeFacts): string {
   }
   if (episode.kind === "environment" && episode.scope === "target") return facts.unavailableSince?.toISOString() ?? since;
   if (episode.reason === "slots_full") return facts.overLimitAt?.toISOString() ?? since;
-  return since;
+  // One per reason a person must act on: a sign-out after a withdrawal is a new fix.
+  return isActionReason(episode.reason) ? `${since}:${episode.reason}` : since;
 }
 
 function resourceEpisodeKeyFromFacts(facts: NoticeFacts): string {
@@ -504,8 +523,9 @@ export function createResourceWaitNotifier(options: ResourceWaitNotifierOptions)
 
   /**
    * The immediate notice of an episode whose reason has one: the issue notice
-   * once per episode, and the PM wake when the company's account-wait setting
-   * is on (it also covers not_allowed, not_serving and slots_full).
+   * once per episode for a limit and once per reason otherwise, and the PM
+   * wake when the company's account-wait setting is on (it also covers
+   * not_allowed, not_serving and slots_full).
    */
   async function notifyImmediate(episode: ResourceWaitEpisodeRow, now: Date = new Date()): Promise<{ issueNotice: boolean; pmWake: boolean }> {
     const none = { issueNotice: false, pmWake: false };
@@ -514,7 +534,7 @@ export function createResourceWaitNotifier(options: ResourceWaitNotifierOptions)
     if (!isLive(facts)) return none;
     const issueId = episode.issueId;
     const issueNotice = issueId
-      ? await onceForKey(db, episode.companyId, issueNoticeKey(issueId, episode.id, "immediate"), now, () => {
+      ? await onceForKey(db, episode.companyId, immediateNoticeKey(issueId, episode), now, () => {
         const text = immediateBody(facts);
         return deps.addIssueSystemNotice({
           companyId: episode.companyId,

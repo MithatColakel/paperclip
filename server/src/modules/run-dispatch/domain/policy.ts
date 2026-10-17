@@ -107,6 +107,9 @@ export type ScheduledRetryFacts = {
   pendingResponse?: "interaction" | "approval" | null;
   /** Fork: a device, account or slot wait (its kind is "ai_connection_wait" too). */
   isResourceWaitLane?: boolean;
+  /** Fork: when the task last moved to blocked, and when the run was created. */
+  issueBlockedTransitionAt?: Date | null;
+  runCreatedAt?: Date | null;
 };
 
 export type QueuedRunStalenessErrorCode =
@@ -167,7 +170,29 @@ export type QueuedRunFacts = {
   reviewParticipant: ReviewParticipantFacts;
   /** Fork: a device, account or slot wait (its kind is "ai_connection_wait" too). */
   isResourceWaitLane?: boolean;
+  /** Fork: when the task last moved to blocked, and when the run was created. */
+  issueBlockedTransitionAt?: Date | null;
+  runCreatedAt?: Date | null;
 };
+
+/**
+ * Fork: a device, account or slot wait whose task moved to blocked after the
+ * run was created (while it ran or waited) ends. A wake that began on a task
+ * that was blocked already (a reply to a blocked worker, a mention) keeps
+ * waiting, as the subscription waits do.
+ */
+function isResourceWaitBlockedSinceCreated(facts: {
+  isResourceWaitLane?: boolean;
+  issueStatus: string | null;
+  issueBlockedTransitionAt?: Date | null;
+  runCreatedAt?: Date | null;
+}): boolean {
+  return facts.isResourceWaitLane === true
+    && facts.issueStatus === "blocked"
+    && facts.issueBlockedTransitionAt != null
+    && facts.runCreatedAt != null
+    && facts.issueBlockedTransitionAt.getTime() > facts.runCreatedAt.getTime();
+}
 
 type OwnershipFacts = {
   runAgentId: string;
@@ -371,8 +396,8 @@ export function decideScheduledRetryGate(
       details: { issueId: facts.issueId } };
   }
 
-  // Fork: a task moved to blocked ends its device, account or slot wait.
-  if (facts.isResourceWaitLane && facts.issueStatus === "blocked") {
+  // Fork: a task moved to blocked while it waited ends its device, account or slot wait.
+  if (isResourceWaitBlockedSinceCreated(facts)) {
     return { allowed: false, issueId: facts.issueId, errorCode: "issue_blocked",
       reason: "Scheduled resource wait suppressed because the task was blocked",
       details: { issueId: facts.issueId } };
@@ -611,8 +636,8 @@ export function decideQueuedRunStaleness(
       details: { issueId: facts.issueId } };
   }
 
-  // Fork: a task moved to blocked ends its device, account or slot wait.
-  if (facts.isResourceWaitLane && facts.issueStatus === "blocked") {
+  // Fork: a task moved to blocked while it waited ends its device, account or slot wait.
+  if (isResourceWaitBlockedSinceCreated(facts)) {
     return { stale: true, errorCode: "issue_blocked",
       reason: "Cancelled because the task was blocked before the resource wait could resume",
       details: { issueId: facts.issueId } };

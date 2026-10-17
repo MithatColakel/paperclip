@@ -21,7 +21,9 @@ import type { ResourceWaitDb } from "./types.js";
  * or through its own `contextSnapshot.resourceWait` (a second agent waiting
  * on the same issue, or a run whose episode ended). Matching episodes also
  * drop their admission backoff (`next_check_at`) first, so a driver's wake
- * gets one real attempt at once.
+ * gets the episode's wait one real attempt at once; a joined wait for the
+ * same resource keeps its own backoff and follows once that attempt ends the
+ * wait.
  *
  * Environment and device wakes also bump the environments' wake epochs, so a
  * deferral racing the wake (its successor not inserted yet) still notices it

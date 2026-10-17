@@ -5,6 +5,7 @@ import {
   aiAccountAgentBindings,
   aiAccountHosts,
   aiAccounts,
+  environments,
   heartbeatRuns,
   resourceWaitEpisodes,
 } from "@paperclipai/db";
@@ -17,11 +18,12 @@ import {
 } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
 import { environmentAvailabilityService, isFreshlyUnavailable } from "../environment-availability.js";
+import { executionRetryAttemptCount } from "../execution-recovery-attempt.js";
 import { capOf, deviceForEnvironment, runningPoolAccountsOnDevice, wouldExceedDeviceCap } from "../execution-devices.js";
 import { evaluateAccountPlan } from "./account-plan.js";
-import { jittered, resourceWaitJitterMs } from "./deferral.js";
+import { jittered, resourceWaitJitterMs, waitDelayMs, type EpisodeEndedHandler } from "./deferral.js";
 import { chainOfRun, handOverOrAbandon, resourceKeyOf } from "./episodes.js";
-import { readRunEnvironmentPolicy, resolveRunEnvironment, type RunEnvironmentPolicy } from "./run-environment.js";
+import { readRunEnvironmentPolicy, resolveRunEnvironment, type RunEnvironmentPolicy, type RunEnvironmentRow } from "./run-environment.js";
 import { touchedAt } from "./wake.js";
 import {
   RESOURCE_WAIT_TIMINGS,
@@ -29,6 +31,7 @@ import {
   type HeartbeatRunRow,
   type ResourceWaitDeps,
   type ResourceWaitEpisodeRow,
+  type ResourceWaitTarget,
 } from "./types.js";
 
 /**
@@ -54,9 +57,16 @@ import {
  *
  * Admission waits make one real attempt each time their backoff passes (the
  * episode's `next_check_at`, every 5 min doubling to 60 min), or at once after
- * a wake. A target-scope wait whose registry row went stale makes one real
- * attempt per environment: the oldest waiter's, whose result refreshes the
- * row; the others re-check every 60 s.
+ * a wake. A joined admission wait for the episode's own resource keeps its
+ * own backoff from its lane attempts as well, so it never attempts while the
+ * owner's attempt is in flight; it follows at once when the owner's attempt
+ * ended the wait. A target-scope wait whose registry row went stale makes one
+ * real attempt per environment: the oldest waiter's, whose result refreshes
+ * the row; the others re-check every 60 s.
+ *
+ * Forced-Kubernetes and managed-sandbox-only instances choose the run's
+ * environment themselves (`resolveRunEnvironment` does not model them): there
+ * the environment the wait recorded stands.
  *
  * Probe rule: when an account's estimated (or repeated) limit has passed,
  * only the limit waiter whose episode started first proceeds, after claiming
@@ -76,7 +86,7 @@ export interface HoldRuntime {
   random: () => number;
   environmentWaitsEnabled: boolean;
   deploymentMode?: DeploymentMode;
-  onEpisodeEnded: (episode: ResourceWaitEpisodeRow) => Promise<void>;
+  onEpisodeEnded: EpisodeEndedHandler;
 }
 
 export interface HoldPassResult {
@@ -122,7 +132,11 @@ interface DueRow {
   run: HeartbeatRunRow;
   observed: string;
   observedUpdatedAt: string;
+  /** `created_at` as exact text: with `observed` and the id, the page cursor. */
+  observedCreatedAt: string;
 }
+
+const exactCreatedAt = sql<string>`to_char(${heartbeatRuns.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')`;
 
 function proceed(reason: string): ProceedDecision {
   return { proceed: true, reason };
@@ -136,21 +150,69 @@ function isLimitReason(reason: string | null | undefined): boolean {
   return reason === "usage_limit" || reason === "credit_balance";
 }
 
+/** The wait a lane run's context describes (the driver's `retryAfter` is not kept there). */
+function targetOfContext(context: ResourceWaitContext): ResourceWaitTarget {
+  return {
+    kind: context.kind,
+    reason: context.reason,
+    scope: context.scope,
+    environmentId: context.environmentId,
+    environmentName: context.environmentName,
+    deviceId: context.deviceId,
+    deviceName: context.deviceName,
+    accountId: context.accountId,
+    accountLabel: context.accountLabel,
+    resumeAt: context.resumeAt ? new Date(context.resumeAt) : null,
+    resumeAtSource: context.resumeAtSource,
+    message: context.message,
+    retryAfter: null,
+  };
+}
+
+/**
+ * When a joined admission wait for the episode's own resource makes its next
+ * real attempt: once its own backoff has passed (its creation plus the
+ * deferral's doubling over its own lane attempts) and never before the
+ * episode's next attempt. A cleared episode backoff (the owner's attempt is in
+ * flight) does not make it due; an episode its owner's attempt resolved does,
+ * at once. Null means due.
+ */
+function coWaiterAdmissionDueAt(
+  run: HeartbeatRunRow,
+  context: ResourceWaitContext,
+  named: ResourceWaitEpisodeRow,
+  random: () => number,
+): Date | null {
+  if (named.resolution === "resolved") return null;
+  const lane = RESOURCE_WAIT_LANE_BY_KIND[context.kind];
+  const ownDelayMs = waitDelayMs({
+    wait: targetOfContext(context),
+    episode: { checks: Math.max(0, executionRetryAttemptCount(run, lane) - 1) },
+    runId: run.id,
+    now: run.createdAt,
+    random,
+  });
+  const borrowed = named.resolvedAt ? null : named.nextCheckAt;
+  return new Date(Math.max(run.createdAt.getTime() + ownDelayMs, borrowed?.getTime() ?? 0));
+}
+
 /**
  * The wait a run's own context describes, as an episode-shaped view. The
  * episode the context names lends its start, and while it is open and waits
- * for the same resource, its backoff.
+ * for the same resource, its backoff (an admission wait also keeps its own).
  */
 function viewFromContext(
   run: HeartbeatRunRow,
   context: ResourceWaitContext,
   named: ResourceWaitEpisodeRow | null,
+  random: () => number,
 ): ResourceWaitEpisodeRow {
   const resourceKey = resourceKeyOf(context);
   const same = named && named.companyId === run.companyId && named.kind === context.kind && named.resourceKey === resourceKey
     ? named
     : null;
   const open = same && !same.resolvedAt ? same : null;
+  const admission = context.kind === "environment" && context.scope === "admission";
   return {
     id: context.episodeId,
     companyId: run.companyId,
@@ -167,7 +229,7 @@ function viewFromContext(
     currentRunId: open?.currentRunId ?? null,
     resumeAt: context.resumeAt ? new Date(context.resumeAt) : null,
     resumeAtSource: context.resumeAtSource,
-    nextCheckAt: open?.nextCheckAt ?? null,
+    nextCheckAt: admission && same ? coWaiterAdmissionDueAt(run, context, same, random) : open?.nextCheckAt ?? null,
     checks: open?.checks ?? 0,
     gateCheckedAt: null,
     notifiedAt: null,
@@ -243,6 +305,24 @@ export function createHold(runtime: HoldRuntime) {
   }
 
   /**
+   * The environment the waiting run would use now. Where the instance forces
+   * Kubernetes or managed sandboxes, executeRun picks it and nothing here
+   * models that choice: the environment the wait recorded stands (null only
+   * when the wait recorded none or it is gone).
+   */
+  async function environmentNow(
+    run: HeartbeatRunRow,
+    agent: AgentRow,
+    view: ResourceWaitEpisodeRow,
+    policy: RunEnvironmentPolicy,
+  ): Promise<RunEnvironmentRow | null> {
+    if (!policy.unmodelled) return (await runEnvironment(run, agent, policy))?.environment ?? null;
+    if (!view.environmentId) return null;
+    const [recorded] = await db.select().from(environments).where(eq(environments.id, view.environmentId));
+    return recorded ?? null;
+  }
+
+  /**
    * The oldest target-scope wait on an environment whose run still waits, or
    * started an attempt within the gate interval. While its row is stale it
    * alone makes the real attempt that refreshes the row.
@@ -284,9 +364,9 @@ export function createHold(runtime: HoldRuntime) {
     policy: RunEnvironmentPolicy,
     now: Date,
   ): Promise<ProceedDecision> {
-    const resolved = await runEnvironment(run, agent, policy);
-    if (!resolved || resolved.environment.id !== view.environmentId) return proceed("environment_changed");
-    const row = await availability.get(resolved.environment.id);
+    const environment = await environmentNow(run, agent, view, policy);
+    if (!environment || environment.id !== view.environmentId) return proceed("environment_changed");
+    const row = await availability.get(environment.id);
     if (row?.state === "retired") return proceed("environment_retired");
     if (view.scope !== "target") {
       if (view.nextCheckAt && view.nextCheckAt.getTime() > now.getTime()) return hold(view.nextCheckAt, "admission_backoff");
@@ -296,7 +376,7 @@ export function createHold(runtime: HoldRuntime) {
     if (!isFreshlyUnavailable(row, now)) {
       // The target said when to come back: nothing to learn before that.
       if (row.retryAfter && row.retryAfter.getTime() > now.getTime()) return hold(row.retryAfter, "registry_retry_after");
-      const leader = await staleRowLeader(resolved.environment.id, now);
+      const leader = await staleRowLeader(environment.id, now);
       if (!leader || leader.runId === run.id) return proceed("registry_stale");
       // The leader's attempt refreshes the row; wake it if it is still held.
       if (leader.status === "scheduled_retry" && leader.scheduledRetryAt && leader.scheduledRetryAt.getTime() > now.getTime()) {
@@ -332,11 +412,10 @@ export function createHold(runtime: HoldRuntime) {
   ): Promise<ProceedDecision & { probeClaimed?: boolean }> {
     const binding = await bindingOf(agent.id);
     if (!binding || binding.mode !== "pool_account" || binding.accountId !== view.accountId) return proceed("binding_changed");
-    const resolved = await runEnvironment(run, agent, policy);
     const plan = await evaluateAccountPlan(db, {
       companyId: run.companyId,
       accountId: view.accountId,
-      environment: resolved?.environment ?? null,
+      environment: await environmentNow(run, agent, view, policy),
       now,
       deploymentMode: runtime.deploymentMode,
     });
@@ -430,7 +509,7 @@ export function createHold(runtime: HoldRuntime) {
       const context = contexts.get(run.id);
       if (!context) continue;
       const episode = named.find((row) => row.id === context.episodeId) ?? null;
-      byRun.set(run.id, { view: viewFromContext(run, context, episode), owned: false });
+      byRun.set(run.id, { view: viewFromContext(run, context, episode, runtime.random), owned: false });
     }
     return byRun;
   }
@@ -474,9 +553,9 @@ export function createHold(runtime: HoldRuntime) {
       return proceed("binding_changed");
     }
     if (!view.deviceId) return proceed("device_unknown");
-    const resolved = await runEnvironment(run, agent, policy);
-    if (resolved) {
-      const device = await deviceForEnvironment(db, resolved.environment, { create: false }).catch(() => null);
+    const environment = await environmentNow(run, agent, view, policy);
+    if (environment) {
+      const device = await deviceForEnvironment(db, environment, { create: false }).catch(() => null);
       if (device?.id !== view.deviceId) return proceed("device_changed");
     }
     const [device] = await db.select().from(aiAccountHosts).where(eq(aiAccountHosts.id, view.deviceId));
@@ -617,26 +696,46 @@ export function createHold(runtime: HoldRuntime) {
       if (!other.scheduledRetryAt || other.scheduledRetryAt.getTime() > now.getTime()) await makeDueNow(other.id, now);
     }
     const { abandoned } = await handOverOrAbandon(db, episode, ending, now);
-    if (abandoned) await runtime.onEpisodeEnded(abandoned).catch(() => undefined);
+    if (abandoned) await runtime.onEpisodeEnded(abandoned, { endingRunIds: ending, now }).catch(() => undefined);
   }
 
-  async function holdDueWaits(input: { now?: Date; limit?: number; cutoff?: Date | null } = {}): Promise<HoldPassResult> {
-    const now = input.now ?? runtime.clock();
-    const result: HoldPassResult = { examined: 0, proceeding: 0, held: 0, gateSuppressed: 0, probesClaimed: 0, rearmLost: 0, slotWakes: 0 };
-    const dueRows: DueRow[] = await db
-      .select({ run: heartbeatRuns, observed: exactScheduledRetryAt, observedUpdatedAt: exactUpdatedAt })
+  /**
+   * One page of due lane rows, oldest due first, after `cursor` (the last row
+   * of the previous page, compared as exact database text).
+   */
+  async function dueLanePage(now: Date, cutoff: Date | null | undefined, pageSize: number, cursor: DueRow | null): Promise<DueRow[]> {
+    return db
+      .select({ run: heartbeatRuns, observed: exactScheduledRetryAt, observedUpdatedAt: exactUpdatedAt, observedCreatedAt: exactCreatedAt })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.status, "scheduled_retry"),
         inArray(heartbeatRuns.scheduledRetryReason, [...RESOURCE_WAIT_RETRY_REASONS]),
         lte(heartbeatRuns.scheduledRetryAt, now),
-        input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+        cursor
+          ? sql`(${heartbeatRuns.scheduledRetryAt}, ${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
+              (${cursor.observed}::timestamp at time zone 'UTC'),
+              (${cursor.observedCreatedAt}::timestamp at time zone 'UTC'),
+              ${cursor.run.id}::uuid
+            )`
+          : undefined,
       ))
       .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-      .limit(Math.max(1, input.limit ?? RESOURCE_WAIT_TIMINGS.holdBatchLimit));
-    if (dueRows.length === 0) return result;
-    result.examined = dueRows.length;
-    const waits = await loadWaits(dueRows.map((row) => row.run));
+      .limit(pageSize);
+  }
+
+  /**
+   * Every due lane row is examined, a page (`limit`, 200) at a time.
+   * run-dispatch then promotes the oldest due rows of any lane, and a held row
+   * leaves the due set: a row left past the first page would otherwise be
+   * promoted without a check (a herd behind a stale registry row).
+   */
+  async function holdDueWaits(input: { now?: Date; limit?: number; cutoff?: Date | null } = {}): Promise<HoldPassResult> {
+    const now = input.now ?? runtime.clock();
+    const result: HoldPassResult = { examined: 0, proceeding: 0, held: 0, gateSuppressed: 0, probesClaimed: 0, rearmLost: 0, slotWakes: 0 };
+    const pageSize = Math.max(1, input.limit ?? RESOURCE_WAIT_TIMINGS.holdBatchLimit);
+    let page = await dueLanePage(now, input.cutoff, pageSize, null);
+    if (page.length === 0) return result;
     const policy = await readRunEnvironmentPolicy(db);
     const slotWaiters = new Map<string, Array<{ row: DueRow; wait: RunWait }>>();
 
@@ -657,48 +756,56 @@ export function createHold(runtime: HoldRuntime) {
       }
     };
 
-    for (const row of dueRows) {
-      const wait = waits.get(row.run.id) ?? null;
-      try {
-        if (wait && (runtime.environmentWaitsEnabled || wait.view.kind !== "environment")) {
-          // A run that does not own its episode keeps no gate time: its gate runs at each check.
-          const gateDue = !wait.owned
-            || !wait.view.gateCheckedAt
-            || now.getTime() - wait.view.gateCheckedAt.getTime() >= RESOURCE_WAIT_TIMINGS.gateIntervalMs;
-          if (gateDue) {
-            const gate = await deps.evaluateScheduledRetryGate({
-              runId: row.run.id,
-              companyId: row.run.companyId,
-              retryReasonOverride: row.run.scheduledRetryReason ?? "",
-              now,
-            });
-            if (!gate.allowed) {
-              // Left due: run-dispatch cancels it and releases the lock in this tick.
-              result.gateSuppressed += 1;
-              if (wait.owned) await endSuppressed(row.run, wait.view, now);
+    for (;;) {
+      result.examined += page.length;
+      const waits = await loadWaits(page.map((row) => row.run));
+      for (const row of page) {
+        const wait = waits.get(row.run.id) ?? null;
+        try {
+          if (wait && (runtime.environmentWaitsEnabled || wait.view.kind !== "environment")) {
+            // A run that does not own its episode keeps no gate time: its gate runs at each check.
+            const gateDue = !wait.owned
+              || !wait.view.gateCheckedAt
+              || now.getTime() - wait.view.gateCheckedAt.getTime() >= RESOURCE_WAIT_TIMINGS.gateIntervalMs;
+            if (gateDue) {
+              const gate = await deps.evaluateScheduledRetryGate({
+                runId: row.run.id,
+                companyId: row.run.companyId,
+                retryReasonOverride: row.run.scheduledRetryReason ?? "",
+                now,
+              });
+              if (!gate.allowed) {
+                // Left due: run-dispatch cancels it and releases the lock in this tick.
+                result.gateSuppressed += 1;
+                if (wait.owned) await endSuppressed(row.run, wait.view, now);
+                continue;
+              }
+              if (wait.owned) {
+                await db.update(resourceWaitEpisodes).set({ gateCheckedAt: now, updatedAt: now }).where(eq(resourceWaitEpisodes.id, wait.view.id));
+              }
+            }
+            if (wait.view.kind === "device_slots" && wait.view.deviceId) {
+              const list = slotWaiters.get(wait.view.deviceId) ?? [];
+              list.push({ row, wait });
+              slotWaiters.set(wait.view.deviceId, list);
               continue;
             }
-            if (wait.owned) {
-              await db.update(resourceWaitEpisodes).set({ gateCheckedAt: now, updatedAt: now }).where(eq(resourceWaitEpisodes.id, wait.view.id));
-            }
           }
-          if (wait.view.kind === "device_slots" && wait.view.deviceId) {
-            const list = slotWaiters.get(wait.view.deviceId) ?? [];
-            list.push({ row, wait });
-            slotWaiters.set(wait.view.deviceId, list);
-            continue;
-          }
+          const decision = await decide(row.run, wait, now, policy);
+          if (decision.probeClaimed) result.probesClaimed += 1;
+          await apply(row, wait, decision);
+        } catch (error) {
+          // A failed check never strands a run: it proceeds to a real attempt.
+          logger.warn({ err: error, runId: row.run.id }, "resource wait hold check failed; letting the run proceed");
+          result.proceeding += 1;
         }
-        const decision = await decide(row.run, wait, now, policy);
-        if (decision.probeClaimed) result.probesClaimed += 1;
-        await apply(row, wait, decision);
-      } catch (error) {
-        // A failed check never strands a run: it proceeds to a real attempt.
-        logger.warn({ err: error, runId: row.run.id }, "resource wait hold check failed; letting the run proceed");
-        result.proceeding += 1;
       }
+      if (page.length < pageSize) break;
+      page = await dueLanePage(now, input.cutoff, pageSize, page[page.length - 1]!);
+      if (page.length === 0) break;
     }
 
+    // Slots are admitted once per device for the whole pass, first in first out.
     for (const [deviceId, due] of slotWaiters) {
       try {
         const { decisions, woken } = await admitSlots(deviceId, due, policy, now);

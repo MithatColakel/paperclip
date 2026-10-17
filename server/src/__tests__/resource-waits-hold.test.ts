@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -19,6 +19,7 @@ import {
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issues,
   plugins,
   projects,
@@ -36,7 +37,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { createRunDispatch } from "../modules/run-dispatch/index.js";
+import { createRunDispatch, isNonAssigneeWorkspaceBusyRetry } from "../modules/run-dispatch/index.js";
 import { environmentAvailabilityService } from "../services/environment-availability.js";
 import { legacyExecutionNeedsReconciliation } from "../services/legacy-execution-recovery.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -45,10 +46,12 @@ import {
   claimAccountProbe,
   createResourceWaits,
   environmentWaitDeferral,
+  handOverOrAbandon,
   openEpisode,
   readScheduledRetryResourceWaits,
   readWakeEpochs,
   resourceWaitJitterMs,
+  setEpisodeCurrentRun,
   wakeResourceWaits,
   type ResourceWaitDeferral,
   type ResourceWaitDeps,
@@ -243,7 +246,10 @@ describeEmbeddedPostgres("resource waits (database)", () => {
   function makeDeps(options: {
     gate?: ResourceWaitDeps["evaluateScheduledRetryGate"];
     refuseSchedule?: boolean;
+    beforeSuccessorInsert?: (run: RunRow) => Promise<void>;
     afterSuccessorInsert?: (successor: RunRow) => Promise<void>;
+    /** Check like heartbeat's scheduleBoundedRetryForRun does for the lanes (W8 H7): the gate on the run's row, then the lock recheck. */
+    h7?: boolean;
   } = {}) {
     const calls = {
       events: [] as Array<{ runId: string; message?: string; level?: string }>,
@@ -277,6 +283,17 @@ describeEmbeddedPostgres("resource waits (database)", () => {
           return { outcome: "not_scheduled", reason: "Scheduled retry suppressed because issue reached terminal status (done)", errorCode: "issue_terminal_status", issueId: null };
         }
         const issueId = typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null;
+        if (options.h7) {
+          const gate = await runDispatch.evaluateScheduledRetryGate({ runId: run.id, companyId: run.companyId, retryReasonOverride: opts.retryReason, now: opts.now });
+          if (!gate.allowed) return { outcome: "not_scheduled", reason: gate.reason, errorCode: gate.errorCode, issueId: gate.issueId };
+          if (issueId && !isNonAssigneeWorkspaceBusyRetry(opts.retryReason, run.contextSnapshot ?? {})) {
+            const [locked] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
+            if (locked?.executionRunId !== run.id) {
+              return { outcome: "not_scheduled", reason: "the task execution lock changed", errorCode: "issue_execution_lock_changed", issueId };
+            }
+          }
+        }
+        await options.beforeSuccessorInsert?.(run);
         const [successor] = await db.insert(heartbeatRuns).values({
           companyId: run.companyId,
           agentId: run.agentId,
@@ -287,6 +304,9 @@ describeEmbeddedPostgres("resource waits (database)", () => {
           scheduledRetryAttempt: opts.maxAttempts,
           scheduledRetryReason: opts.retryReason,
           contextSnapshot: { ...run.contextSnapshot, retryReason: opts.retryReason, wakeReason: opts.wakeReason, ...opts.contextPatch },
+          // As heartbeat's insert: created in the scheduling transaction.
+          createdAt: opts.now,
+          updatedAt: opts.now,
         }).returning();
         if (issueId) {
           await db.update(issues).set({ executionRunId: successor!.id })
@@ -434,7 +454,8 @@ describeEmbeddedPostgres("resource waits (database)", () => {
         agent: worker, kind: "environment", reason: "offline", scope: "target",
         dueAt: seconds(now, -1), issueId: task.id, environmentId: env.id,
       });
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, task.id));
+      // As issueService.update records it: the block came after the wait began.
+      await db.update(issues).set({ status: "blocked", blockedTransitionAt: new Date(run.createdAt.getTime() + 1_000) }).where(eq(issues.id, task.id));
       const { deps, calls } = makeDeps();
       expect(await waits(deps).holdDueWaits({ now })).toMatchObject({ gateSuppressed: 1, held: 0 });
       expect(await episodeRow(episode.id)).toMatchObject({ resolution: "abandoned" });
@@ -442,6 +463,94 @@ describeEmbeddedPostgres("resource waits (database)", () => {
       await createRunDispatch(db).promoteDueScheduledRetries({ now, cutoff: null });
       expect(await runRow(run.id)).toMatchObject({ status: "cancelled", errorCode: "issue_blocked" });
       expect((await db.select().from(issues).where(eq(issues.id, task.id)))[0]!.executionRunId).toBeNull();
+    });
+
+    it("keeps the wait of a run woken on a task that was blocked an hour before (a reply to the blocked worker)", async () => {
+      const { env, worker, task } = await envFixture();
+      const now = new Date();
+      await db.update(issues).set({ status: "blocked", blockedTransitionAt: seconds(now, -3600) }).where(eq(issues.id, task.id));
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      // The PM's reply wakes the worker while the task stays blocked; its device is offline.
+      const [woken] = await db.insert(heartbeatRuns).values({
+        companyId: worker.companyId, agentId: worker.id, status: "running", startedAt: now, contextSnapshot: { issueId: task.id },
+      }).returning();
+      await db.update(issues).set({ executionRunId: woken!.id }).where(eq(issues.id, task.id));
+      const { deps, calls } = makeDeps({ h7: true });
+      const service = waits(deps, { now: () => now });
+      const result = await service.finalizeDeferral(woken!, environmentWaitDeferral({ reason: "offline", scope: "target", environment: { id: env.id, name: env.name } }));
+      expect(result).toMatchObject({ outcome: "scheduled" });
+      const successorId = ("successorRunId" in result && result.successorRunId) || "";
+      expect(calls.released).toEqual([]);
+      expect(await createRunDispatch(db).evaluateScheduledRetryGate({ runId: successorId, companyId: worker.companyId, retryReasonOverride: "environment_wait", now }))
+        .toEqual({ allowed: true });
+      const at = seconds(now, 60);
+      await makeDue(successorId, at);
+      expect(await service.holdDueWaits({ now: at })).toMatchObject({ examined: 1, held: 1, gateSuppressed: 0 });
+      // The device is back: the wait proceeds and is promoted, not cancelled.
+      await environmentAvailabilityService(db).markAvailable(env.id, { source: "check", now: at });
+      const later = seconds(now, 120);
+      await makeDue(successorId, later);
+      expect(await service.holdDueWaits({ now: later })).toMatchObject({ examined: 1, proceeding: 1 });
+      await createRunDispatch(db).promoteDueScheduledRetries({ now: later, cutoff: null });
+      expect(await runRow(successorId)).toMatchObject({ status: "queued" });
+      expect(await createRunDispatch(db).cancelStaleQueuedRun({ runId: successorId, companyId: worker.companyId, expectedStatus: "queued", now: later }))
+        .toMatchObject({ outcome: "not_stale" });
+      expect((await db.select().from(issues).where(eq(issues.id, task.id)))[0]!.executionRunId).toBe(successorId);
+    });
+
+    it("examines every due wait, a page at a time, so none past the first page is promoted unchecked", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      const now = new Date();
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      // The oldest wait's agent moved to the Local environment: it proceeds and stays due.
+      await db.update(agents).set({ defaultEnvironmentId: localEnvironment.id }).where(eq(agents.id, worker.id));
+      const moved = await waitingRun({
+        agent: worker, kind: "environment", reason: "offline", scope: "target", dueAt: seconds(now, -10), issueId: task.id, environmentId: env.id,
+      });
+      const held: Array<Awaited<ReturnType<typeof waitingRun>>> = [];
+      for (let index = 1; index < 5; index += 1) {
+        const row = await agent(companyId, { defaultEnvironmentId: env.id });
+        // The last two are due at the same moment: the page cursor breaks the tie.
+        held.push(await waitingRun({
+          agent: row, kind: "environment", reason: "offline", scope: "target",
+          dueAt: seconds(now, -10 + Math.min(index, 3)), issueId: (await issue(companyId, row.id)).id, environmentId: env.id,
+        }));
+      }
+      const { deps } = makeDeps();
+      // Each row exactly once: the one that proceeds stays due but is not examined again.
+      expect(await waits(deps).holdDueWaits({ now, limit: 2 })).toMatchObject({ examined: 5, held: 4, proceeding: 1 });
+      // Only the checked one is left due for run-dispatch.
+      await createRunDispatch(db).promoteDueScheduledRetries({ now, cutoff: null });
+      expect((await runRow(moved.run.id)).status).toBe("queued");
+      for (const { run } of held) {
+        const row = await runRow(run.id);
+        expect(row.status).toBe("scheduled_retry");
+        expect(row.scheduledRetryAt!.getTime()).toBeGreaterThan(now.getTime());
+      }
+    });
+
+    it("keeps the environment a wait recorded where the instance forces Kubernetes, instead of treating it as changed", async () => {
+      const general = { executionMode: "kubernetes" };
+      await db.insert(instanceSettings).values({ singletonKey: "default", general, experimental: {} })
+        .onConflictDoUpdate({ target: instanceSettings.singletonKey, set: { general } });
+      try {
+        const { env, worker, task, companyId } = await envFixture();
+        const now = new Date();
+        await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+        await waitingRun({ agent: worker, kind: "environment", reason: "offline", scope: "target", dueAt: seconds(now, -1), issueId: task.id, environmentId: env.id });
+        const upgrading = await agent(companyId, { defaultEnvironmentId: env.id });
+        const admission = await waitingRun({
+          agent: upgrading, kind: "environment", reason: "plugin_upgrade_pending", scope: "admission",
+          dueAt: seconds(now, -1), issueId: (await issue(companyId, upgrading.id)).id, environmentId: env.id,
+        });
+        await db.update(resourceWaitEpisodes).set({ nextCheckAt: seconds(now, 40 * 60) }).where(eq(resourceWaitEpisodes.id, admission.episode.id));
+        const { deps } = makeDeps();
+        // The target wait holds on its fresh registry row; the admission wait keeps its 40-minute backoff.
+        expect(await waits(deps).holdDueWaits({ now })).toMatchObject({ examined: 2, held: 2, proceeding: 0 });
+        expect((await runRow(admission.run.id)).scheduledRetryAt!.getTime()).toBe(now.getTime() + 5 * 60_000);
+      } finally {
+        await db.delete(instanceSettings);
+      }
     });
 
     it("runs the gate at most every 5 minutes per row and never re-arms further than that", async () => {
@@ -977,6 +1086,66 @@ describeEmbeddedPostgres("resource waits (database)", () => {
       expect(open.map((row) => row.id)).toEqual([other.episode.id]);
     });
 
+    it("posts a new notice and PM wake when a wait's reason changes to one a person must fix, and none for another limit", async () => {
+      const now = new Date();
+      const companyId = await company();
+      await member(companyId, "owner-1");
+      const lead = await agent(companyId);
+      const worker = await agent(companyId, { defaultEnvironmentId: localEnvironment.id, reportsTo: lead.id });
+      const task = await issue(companyId, worker.id);
+      const pool = await account("owner-1", { limitEpisodeStartedAt: now });
+      await bind(worker, pool.id);
+      const { deps, calls } = makeDeps();
+      const service = waits(deps, { now: () => now });
+      const [first] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: worker.id, status: "failed", startedAt: now, finishedAt: now, contextSnapshot: { issueId: task.id },
+      }).returning();
+      await db.update(issues).set({ executionRunId: first!.id }).where(eq(issues.id, task.id));
+      let runId = first!.id;
+      // The limit turns into a credit limit (the same limit), then the token expires, then the owner switches it off.
+      for (const reason of ["usage_limit", "credit_balance", "signed_out", "withdrawn"] as const) {
+        const limit = reason === "usage_limit" || reason === "credit_balance";
+        const result = await service.scheduleResourceWait({
+          run: await runRow(runId),
+          wait: accountWaitDeferral({
+            reason, accountId: pool.id, accountLabel: pool.label,
+            resumeAt: limit ? seconds(now, 3600) : null, resumeAtSource: limit ? "provider" : null,
+          }).wait,
+        });
+        expect(result).toMatchObject({ outcome: "scheduled", shared: false });
+        runId = result.successorRunId!;
+        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: now }).where(eq(heartbeatRuns.id, runId));
+      }
+      const episodes = await db.select().from(resourceWaitEpisodes);
+      expect(episodes).toEqual([expect.objectContaining({ reason: "withdrawn", resolvedAt: null, since: now })]);
+      expect(episodes[0]!.notifiedAt).not.toBeNull();
+      expect(calls.notices.map((notice) => notice.body)).toEqual([
+        expect.stringContaining("usage limit reached"),
+        expect.stringContaining("it is signed out"),
+        expect.stringContaining("it is switched off"),
+      ]);
+      expect(calls.wakes.map((wake) => (wake.contextSnapshot.resourceWait as { reason: string }).reason))
+        .toEqual(["usage_limit", "signed_out", "withdrawn"]);
+      expect(calls.wakes.every((wake) => wake.agentId === lead.id)).toBe(true);
+    });
+
+    it("clears the notice time when a reused wait's reason becomes one a person must fix, so the notify pass retries its notice", async () => {
+      const { worker, task, companyId } = await envFixture();
+      const now = new Date();
+      const chain = { companyId, issueId: task.id, agentId: worker.id };
+      const accountId = randomUUID();
+      const wait = (reason: "usage_limit" | "credit_balance" | "signed_out" | "auth_unconfirmed") =>
+        accountWaitDeferral({ reason, accountId, accountLabel: "Max-2" }).wait;
+      const { episode } = await openEpisode(db, { chain, wait: wait("usage_limit"), now });
+      await db.update(resourceWaitEpisodes).set({ notifiedAt: now }).where(eq(resourceWaitEpisodes.id, episode.id));
+      // Another limit is the same limit; a reason without a notice changes nothing either.
+      expect((await openEpisode(db, { chain, wait: wait("credit_balance"), now })).episode.notifiedAt).toEqual(now);
+      expect((await openEpisode(db, { chain, wait: wait("auth_unconfirmed"), now })).episode.notifiedAt).toEqual(now);
+      const signedOut = await openEpisode(db, { chain, wait: wait("signed_out"), now });
+      expect(signedOut).toMatchObject({ created: false, reasonChanged: true });
+      expect(signedOut.episode).toMatchObject({ id: episode.id, notifiedAt: null });
+    });
+
     it("keeps one open episode per chain when two deferrals race", async () => {
       const { env, worker, task, companyId } = await envFixture();
       const now = new Date();
@@ -1166,6 +1335,261 @@ describeEmbeddedPostgres("resource waits (database)", () => {
       await makeDue(mentionedWait, at);
       expect(await service.holdDueWaits({ now: at })).toMatchObject({ examined: 2, gateSuppressed: 1, held: 1 });
       expect(await episodeRow(first!.id)).toMatchObject({ currentRunId: mentionedWait, agentId: mentioned.id, resolvedAt: null, gateCheckedAt: null });
+    });
+
+    it("a mentioned agent's run that ended on a usage limit gets a wait the gate keeps (it never held the task)", async () => {
+      const { worker, task, companyId } = await envFixture();
+      await member(companyId, "owner-1");
+      const now = new Date();
+      const pool = await account("owner-1", {
+        exhaustedUntil: seconds(now, 3600), limitReason: "provider_quota", limitSource: "provider", limitStrikes: 1, limitEpisodeStartedAt: now,
+      });
+      const mentioned = await agent(companyId, { defaultEnvironmentId: localEnvironment.id });
+      await bind(mentioned, pool.id);
+      // The assignee's own run holds the task.
+      await startedRun(worker, task.id);
+      const [limited] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: mentioned.id, status: "failed", startedAt: now, finishedAt: now,
+        contextSnapshot: { issueId: task.id }, runnerProfileJson: { aiConnectionNonAssigneeCommentWake: true },
+      }).returning();
+      const { deps } = makeDeps({ h7: true });
+      const service = waits(deps, { now: () => now });
+      // What the account's limit handler does for a run that ended (spec 4.6).
+      const result = await service.scheduleResourceWait({
+        run: limited!,
+        wait: accountWaitDeferral({ reason: "usage_limit", accountId: pool.id, accountLabel: pool.label, resumeAt: seconds(now, 3600), resumeAtSource: "provider" }).wait,
+      });
+      expect(result).toMatchObject({ outcome: "scheduled" });
+      // The authority is on the run's row (the gate before scheduling read it) and on its successor.
+      expect((await runRow(limited!.id)).contextSnapshot?.resourceWaitDeferredWhileAssignee).toBe(false);
+      const successor = await runRow(result.successorRunId!);
+      expect(successor.contextSnapshot?.resourceWaitDeferredWhileAssignee).toBe(false);
+      expect(await createRunDispatch(db).evaluateScheduledRetryGate({ runId: successor.id, companyId, retryReasonOverride: "ai_account_wait", now }))
+        .toEqual({ allowed: true });
+      const at = seconds(now, 60);
+      await makeDue(successor.id, at);
+      expect(await service.holdDueWaits({ now: at })).toMatchObject({ examined: 1, held: 1, gateSuppressed: 0 });
+      expect((await db.select().from(issues).where(eq(issues.id, task.id)))[0]!.executionRunId).not.toBe(successor.id);
+    });
+
+    it("never ends a wait the assignee took over while the hold checked the wait it replaced", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      const mentioned = await agent(companyId, { defaultEnvironmentId: env.id });
+      const now = new Date();
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      const runDispatch = createRunDispatch(db);
+      let mentionedWait = "";
+      let assigneeWait = "";
+      let service: ReturnType<typeof waits> | null = null;
+      const { deps } = makeDeps({
+        gate: async (input) => {
+          if (input.runId === mentionedWait && !assigneeWait) {
+            // The assignee's run defers for the same device while the hold checks the mentioned agent's wait, which the gate then suppresses.
+            assigneeWait = successorOf(await service!.finalizeDeferral(await startedRun(worker, task.id), offline(env)));
+            return { allowed: false, reason: "Scheduled retry suppressed because the agent is not invokable", errorCode: "agent_not_invokable", issueId: task.id, details: {} };
+          }
+          return runDispatch.evaluateScheduledRetryGate(input);
+        },
+      });
+      service = waits(deps, { now: () => now });
+      mentionedWait = successorOf(await service.finalizeDeferral(await startedRun(mentioned, task.id, { mentioned: true }), offline(env)));
+      const [episode] = await db.select().from(resourceWaitEpisodes);
+      expect(episode).toMatchObject({ currentRunId: mentionedWait });
+      const at = seconds(now, 60);
+      await makeDue(mentionedWait, at);
+      expect(await service.holdDueWaits({ now: at })).toMatchObject({ examined: 1, gateSuppressed: 1 });
+      // The assignee's wait keeps the episode, its start and the device's registry row.
+      expect(await episodeRow(episode!.id)).toMatchObject({ resolvedAt: null, currentRunId: assigneeWait, since: episode!.since });
+      expect(await db.select().from(environmentAvailability).where(eq(environmentAvailability.environmentId, env.id))).toHaveLength(1);
+      // Its next check holds it: the device is still down.
+      const later = seconds(now, 120);
+      await makeDue(assigneeWait, later);
+      await makeDue(mentionedWait, later);
+      expect(await service.holdDueWaits({ now: later })).toMatchObject({ examined: 2, held: 2, proceeding: 0, gateSuppressed: 0 });
+      expect(await db.select().from(resourceWaitEpisodes)).toHaveLength(1);
+    });
+
+    it("a takeover holds the episode from the moment it is reused, so a check that saw the replaced run cannot end it", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      const mentioned = await agent(companyId, { defaultEnvironmentId: env.id });
+      const now = new Date();
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      let stale: typeof resourceWaitEpisodes.$inferSelect | null = null;
+      let staleResult: Awaited<ReturnType<typeof handOverOrAbandon>> | null = null;
+      const { deps } = makeDeps({
+        // While the assignee's deferral schedules its successor, a check that read the
+        // episode earlier (the mentioned agent's wait as current run) ends that wait.
+        beforeSuccessorInsert: async (run) => {
+          if (stale && run.agentId === worker.id) staleResult = await handOverOrAbandon(db, stale, [stale.currentRunId!], now);
+        },
+      });
+      const service = waits(deps, { now: () => now });
+      const mentionedWait = successorOf(await service.finalizeDeferral(await startedRun(mentioned, task.id, { mentioned: true }), offline(env)));
+      [stale] = await db.select().from(resourceWaitEpisodes);
+      expect(stale).toMatchObject({ currentRunId: mentionedWait });
+      const assigneeWait = successorOf(await service.finalizeDeferral(await startedRun(worker, task.id), offline(env)));
+      expect(staleResult).toEqual({ handedOverTo: null, abandoned: null });
+      expect(await episodeRow(stale!.id)).toMatchObject({ resolvedAt: null, currentRunId: assigneeWait });
+    });
+
+    it("hands over or abandons an episode only while it has the current run the caller saw", async () => {
+      const { env, worker, task } = await envFixture();
+      const now = new Date();
+      const { run, episode } = await waitingRun({ agent: worker, kind: "environment", reason: "offline", scope: "target", dueAt: now, issueId: task.id, environmentId: env.id });
+      // A stale snapshot: another run took the episode over since. Neither the
+      // hand-over (to the run that waits in it) nor the abandonment happens.
+      const stale = { ...episode, currentRunId: randomUUID() };
+      expect(await handOverOrAbandon(db, stale, [], now)).toEqual({ handedOverTo: null, abandoned: null });
+      expect(await handOverOrAbandon(db, stale, [run.id], now)).toEqual({ handedOverTo: null, abandoned: null });
+      expect(await episodeRow(episode.id)).toMatchObject({ resolvedAt: null, currentRunId: run.id });
+      // With the current run it saw, the caller abandons it.
+      expect((await handOverOrAbandon(db, episode, [run.id], now)).abandoned).toMatchObject({ id: episode.id, resolution: "abandoned" });
+      // An ended episode never gets a current run again.
+      expect(await setEpisodeCurrentRun(db, episode.id, randomUUID(), now)).toBe(false);
+      expect(await episodeRow(episode.id)).toMatchObject({ currentRunId: run.id });
+    });
+
+    it("a joined admission wait for the same device keeps its own backoff while the owner's attempt is in flight", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      const mentioned = await agent(companyId, { defaultEnvironmentId: env.id });
+      const t0 = new Date();
+      let clock = t0;
+      const { deps } = makeDeps();
+      const service = waits(deps, { now: () => clock });
+      const notServing = () => environmentWaitDeferral({ reason: "not_serving", scope: "admission", environment: { id: env.id, name: env.name } });
+      const ownerWait = successorOf(await service.finalizeDeferral(await startedRun(worker, task.id), notServing()));
+      const joined = await service.finalizeDeferral(await startedRun(mentioned, task.id, { mentioned: true }), notServing());
+      expect(joined).toMatchObject({ outcome: "scheduled", shared: true });
+      // Both attempt at +5 min; the owner's attempt then waits in the queue (its agent is busy elsewhere).
+      const firstAt = seconds(t0, 300);
+      expect(await service.holdDueWaits({ now: firstAt })).toMatchObject({ examined: 2, proceeding: 2 });
+      await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, ownerWait));
+      expect((await db.select().from(resourceWaitEpisodes))[0]!.nextCheckAt).toBeNull();
+      let runId = successorOf(joined);
+      const attempts = [firstAt];
+      for (let index = 0; index < 3; index += 1) {
+        clock = attempts[attempts.length - 1]!;
+        // The joined wait's attempt is refused again.
+        await db.update(heartbeatRuns).set({ status: "running", startedAt: clock }).where(eq(heartbeatRuns.id, runId));
+        runId = successorOf(await service.finalizeDeferral(await runRow(runId), notServing()));
+        if (index === 2) break;
+        for (let pass = 0; pass < 20; pass += 1) {
+          const due = (await runRow(runId)).scheduledRetryAt!;
+          const result = await service.holdDueWaits({ now: due });
+          expect(result.examined).toBe(1);
+          if (result.proceeding === 1) {
+            attempts.push(due);
+            break;
+          }
+          // Held, but its gate still runs every 5 minutes.
+          expect((await runRow(runId)).scheduledRetryAt!.getTime() - due.getTime()).toBeLessThanOrEqual(5 * 60_000);
+        }
+      }
+      expect(attempts.map((at) => (at.getTime() - t0.getTime()) / 60_000)).toEqual([5, 15, 35]);
+      expect(await db.select().from(resourceWaitEpisodes)).toEqual([expect.objectContaining({ currentRunId: ownerWait, resolvedAt: null })]);
+    });
+
+    it("a joined wait for another resource takes the task's wait over, with its notice, when the owner's wait ends", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      await member(companyId, "owner-1");
+      const now = new Date();
+      const pool = await account("owner-1", { status: "auth_failed" });
+      const mentioned = await agent(companyId, { defaultEnvironmentId: localEnvironment.id });
+      await bind(mentioned, pool.id);
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      const { deps, calls } = makeDeps();
+      const service = waits(deps, { now: () => now });
+      const assigneeWait = successorOf(await service.finalizeDeferral(await startedRun(worker, task.id), offline(env)));
+      const signedOut = accountWaitDeferral({ reason: "signed_out", accountId: pool.id, accountLabel: pool.label });
+      const riderWait = successorOf(await service.finalizeDeferral(await startedRun(mentioned, task.id, { mentioned: true }), signedOut));
+      // While the assignee's wait owns the task, the joined wait is quiet.
+      expect(calls.notices).toEqual([]);
+      const [first] = await db.select().from(resourceWaitEpisodes);
+
+      // The device is back: the assignee's run passes its lease, and its wait ends.
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: now }).where(eq(heartbeatRuns.id, assigneeWait));
+      expect(await service.noteRunPassed({ run: await runRow(assigneeWait), step: "lease" })).toMatchObject({ resolved: true, episodeId: first!.id });
+      const open = await db.select().from(resourceWaitEpisodes).where(isNull(resourceWaitEpisodes.resolvedAt));
+      expect(open).toEqual([expect.objectContaining({ kind: "ai_account", reason: "signed_out", accountId: pool.id, currentRunId: riderWait, agentId: mentioned.id })]);
+      expect(calls.notices.map((notice) => notice.body)).toEqual([expect.stringContaining("it is signed out")]);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "resource_wait.started"))).toHaveLength(2);
+      expect((await readScheduledRetryResourceWaits(db, [await runRow(riderWait)])).get(riderWait))
+        .toMatchObject({ episodeId: open[0]!.id, since: open[0]!.since.toISOString() });
+      // It is that episode's wait now: held on its own account, with the gate on the owner's cadence.
+      const at = seconds(now, 60);
+      await makeDue(riderWait, at);
+      expect(await service.holdDueWaits({ now: at })).toMatchObject({ examined: 1, held: 1 });
+      expect(await episodeRow(open[0]!.id)).toMatchObject({ gateCheckedAt: at });
+    });
+
+    it("passes the task's wait from one joined wait to the next as each one ends", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      await member(companyId, "owner-1");
+      const now = new Date();
+      let clock = now;
+      const signedOutPool = await account("owner-1", { status: "auth_failed" });
+      const withdrawnPool = await account("owner-1", { status: "disabled" });
+      const firstAgent = await agent(companyId, { defaultEnvironmentId: localEnvironment.id });
+      await bind(firstAgent, signedOutPool.id);
+      const secondAgent = await agent(companyId, { defaultEnvironmentId: localEnvironment.id });
+      await bind(secondAgent, withdrawnPool.id);
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      const { deps, calls } = makeDeps();
+      const service = waits(deps, { now: () => clock });
+      const assigneeWait = successorOf(await service.finalizeDeferral(await startedRun(worker, task.id), offline(env)));
+      const firstWait = successorOf(await service.finalizeDeferral(
+        await startedRun(firstAgent, task.id, { mentioned: true }),
+        accountWaitDeferral({ reason: "signed_out", accountId: signedOutPool.id, accountLabel: signedOutPool.label }),
+      ));
+      clock = seconds(now, 1);
+      const secondWait = successorOf(await service.finalizeDeferral(
+        await startedRun(secondAgent, task.id, { mentioned: true }),
+        accountWaitDeferral({ reason: "withdrawn", accountId: withdrawnPool.id, accountLabel: withdrawnPool.label }),
+      ));
+      const openEpisodes = () => db.select().from(resourceWaitEpisodes).where(isNull(resourceWaitEpisodes.resolvedAt));
+
+      // The device is back for the assignee: the oldest joined wait takes the task's wait over.
+      clock = seconds(now, 2);
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: clock }).where(eq(heartbeatRuns.id, assigneeWait));
+      expect(await service.noteRunPassed({ run: await runRow(assigneeWait), step: "lease" })).toMatchObject({ resolved: true });
+      expect(await openEpisodes()).toEqual([expect.objectContaining({ reason: "signed_out", currentRunId: firstWait })]);
+
+      // Its token is replaced and its run passes credentials: the other joined wait takes over next.
+      clock = seconds(now, 3);
+      await db.update(aiAccounts).set({ status: "active" }).where(eq(aiAccounts.id, signedOutPool.id));
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: clock }).where(eq(heartbeatRuns.id, firstWait));
+      expect(await service.noteRunPassed({ run: await runRow(firstWait), step: "credentials" })).toMatchObject({ resolved: true });
+      expect(await openEpisodes()).toEqual([expect.objectContaining({ reason: "withdrawn", currentRunId: secondWait, agentId: secondAgent.id })]);
+      expect(calls.notices.map((notice) => notice.body)).toEqual([
+        expect.stringContaining("it is signed out"),
+        expect.stringMatching(/^Started after waiting/),
+        expect.stringContaining("it is switched off"),
+      ]);
+    });
+
+    it("cancels a joined wait in the same tick when the owner's wait is abandoned on a closed task, however far out its next check is", async () => {
+      const { env, worker, task, companyId } = await envFixture();
+      const sandbox = await environment("sandbox", { provider: "box", deviceId: "d-5" });
+      const mentioned = await agent(companyId, { defaultEnvironmentId: sandbox.id });
+      const now = new Date();
+      await environmentAvailabilityService(db).markUnavailable(env.id, { reason: "offline", source: "lease_error", now });
+      const { deps, calls } = makeDeps();
+      const service = waits(deps, { now: () => now });
+      const assigneeWait = successorOf(await service.finalizeDeferral(await startedRun(worker, task.id), offline(env)));
+      const riderWait = successorOf(await service.finalizeDeferral(
+        await startedRun(mentioned, task.id, { mentioned: true }),
+        environmentWaitDeferral({ reason: "stopped", scope: "admission", environment: { id: sandbox.id, name: sandbox.name } }),
+      ));
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: seconds(now, 3600) }).where(eq(heartbeatRuns.id, riderWait));
+      // The task was closed and the assignee's wait was cancelled more than 10 minutes ago, without a newer run.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, task.id));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: seconds(now, -660) }).where(eq(heartbeatRuns.id, assigneeWait));
+      expect(await service.sweepResourceWaits({ now })).toMatchObject({ episodesAbandoned: 1 });
+      expect(await db.select().from(resourceWaitEpisodes).where(isNull(resourceWaitEpisodes.resolvedAt))).toEqual([]);
+      expect((await runRow(riderWait)).scheduledRetryAt!.getTime()).toBeLessThanOrEqual(now.getTime());
+      await createRunDispatch(db).promoteDueScheduledRetries({ now, cutoff: null });
+      expect(await runRow(riderWait)).toMatchObject({ status: "cancelled", errorCode: "issue_terminal_status" });
+      expect(calls.notices).toEqual([]);
     });
   });
 

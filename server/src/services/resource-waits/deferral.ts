@@ -1,4 +1,4 @@
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, sql } from "drizzle-orm";
 import { type Db, heartbeatRuns, resourceWaitEpisodes } from "@paperclipai/db";
 import {
   RESOURCE_WAIT_ERROR_CODE_BY_KIND,
@@ -9,7 +9,7 @@ import {
   type ResourceWaitContext,
 } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
-import { isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/domain/wake-context.js";
+import { isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
 import { environmentAvailabilityService, type EnvironmentAvailabilityRow } from "../environment-availability.js";
 import { executionFailureRetryCount, executionRetryAttemptCount } from "../execution-recovery-attempt.js";
 import { wakeEpochsMoved } from "./epochs.js";
@@ -18,6 +18,7 @@ import {
   chainOfRun,
   handOverOrAbandon,
   openEpisode,
+  restoreEpisodeCurrentRun,
   sameResource,
   setEpisodeCurrentRun,
   type OpenEpisodeResult,
@@ -54,9 +55,19 @@ export interface DeferralRuntime {
   notifier: ResourceWaitNotifier;
   clock: () => Date;
   random: () => number;
-  /** Ends bookkeeping of a closed episode (registry cleanup). */
-  onEpisodeEnded: (episode: ResourceWaitEpisodeRow) => Promise<void>;
+  /** Ends bookkeeping of a closed episode (registry cleanup, the chain's other waits). */
+  onEpisodeEnded: EpisodeEndedHandler;
 }
+
+/**
+ * Runs after an episode ended: registry cleanup, and the chain's other
+ * waiting runs that named it. `endingRunIds` are runs that end with it (the
+ * caller already handled them); `now` is the caller's clock (a hold pass).
+ */
+export type EpisodeEndedHandler = (
+  episode: ResourceWaitEpisodeRow,
+  options?: { endingRunIds?: readonly string[]; now?: Date },
+) => Promise<void>;
 
 /** A per-run spread of 0..maxMs, stable for one run id (`jitter(runId)`). */
 export function resourceWaitJitterMs(runId: string, maxMs: number = RESOURCE_WAIT_TIMINGS.limitJitterMaxMs): number {
@@ -248,14 +259,49 @@ export function createDeferral(runtime: DeferralRuntime) {
   const { db, deps, notifier } = runtime;
   const availability = environmentAvailabilityService(db);
 
-  async function abandon(episode: ResourceWaitEpisodeRow, runId: string, now: Date): Promise<void> {
+  async function isLiveRun(runId: string): Promise<boolean> {
+    const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    return Boolean(row && ["scheduled_retry", "queued", "running"].includes(row.status));
+  }
+
+  /**
+   * The deferring run got no successor: the episode it opened, reused or
+   * took over goes back to the live run it was taken from, else to another
+   * run of the chain that waits for the same resource, else it is abandoned.
+   * An episode another live run kept (a joined wait) is left alone.
+   */
+  async function releaseEpisode(opened: OpenEpisodeResult, runId: string, now: Date): Promise<void> {
+    const episode = opened.episode;
     if (episode.currentRunId && episode.currentRunId !== runId) {
-      const [current] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, episode.currentRunId));
-      // Another live run still waits in this episode.
-      if (current && ["scheduled_retry", "queued", "running"].includes(current.status)) return;
+      if (await isLiveRun(episode.currentRunId)) return;
+    }
+    const previous = opened.previousCurrentRunId;
+    if (episode.currentRunId === runId && previous && previous !== runId && await isLiveRun(previous)) {
+      await restoreEpisodeCurrentRun(db, episode.id, runId, previous, now);
+      return;
     }
     const { abandoned } = await handOverOrAbandon(db, episode, [runId], now);
     if (abandoned) await runtime.onEpisodeEnded(abandoned);
+  }
+
+  /**
+   * Records on the run itself whether it ran as the issue's assignee, unless
+   * its context already says so. heartbeat's gate before scheduling (H7) reads
+   * the run's row, its lock recheck and the successor (which copies the
+   * context) read the object passed on: a non-assignee's wait that started
+   * after the run ended (a limit) is then neither "reassigned" nor holding a
+   * lock it never had.
+   */
+  async function recordAuthority(run: HeartbeatRunRow, wasIssueAssignee: boolean): Promise<HeartbeatRunRow> {
+    const recorded = run.contextSnapshot?.resourceWaitDeferredWhileAssignee !== false;
+    if (!chainOfRun(run).issueId || recorded === wasIssueAssignee) return run;
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || jsonb_build_object('resourceWaitDeferredWhileAssignee', ${wasIssueAssignee}::boolean)`,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+    return { ...run, contextSnapshot: { ...(run.contextSnapshot ?? {}), resourceWaitDeferredWhileAssignee: wasIssueAssignee } };
   }
 
   /**
@@ -273,9 +319,9 @@ export function createDeferral(runtime: DeferralRuntime) {
    */
   async function scheduleResourceWait(input: ScheduleResourceWaitInput): Promise<ScheduleResourceWaitResult> {
     const now = input.now ?? runtime.clock();
-    const run = input.run;
     const wait = normalizeWait(input.wait, now);
-    const wasIssueAssignee = input.wasIssueAssignee ?? deferredWhileAssignee(run);
+    const wasIssueAssignee = input.wasIssueAssignee ?? deferredWhileAssignee(input.run);
+    const run = await recordAuthority(input.run, wasIssueAssignee);
     const opened = input.episode ?? await openEpisode(db, {
       chain: chainOfRun(run),
       wait,
@@ -283,7 +329,7 @@ export function createDeferral(runtime: DeferralRuntime) {
       run: { id: run.id, agentId: run.agentId, wasIssueAssignee },
     });
     const episode = opened.episode;
-    const shared = opened.shared;
+    let shared = opened.shared;
     if (opened.superseded) await runtime.onEpisodeEnded(opened.superseded).catch(() => undefined);
     const context = resourceWaitContextFor(episode, wait);
     const lane = RESOURCE_WAIT_LANE_BY_KIND[wait.kind];
@@ -347,17 +393,23 @@ export function createDeferral(runtime: DeferralRuntime) {
           logger.error({ err: error, runId: run.id }, "failed to release issue execution after a resource-wait deferral");
         });
       }
-      await abandon(episode, run.id, now).catch(() => undefined);
+      await releaseEpisode(opened, run.id, now).catch(() => undefined);
       return { outcome: "not_scheduled", episodeId: episode.id, successorRunId: null, dueNow: false, shared, context, reason };
     }
 
     // An admission wait's next real attempt may lie beyond the first hold
     // (which the gate interval caps): the episode keeps it for the hold.
-    const admission = !shared && isAdmissionWait(wait);
+    let admission = !shared && isAdmissionWait(wait);
     if (!shared) {
-      await setEpisodeCurrentRun(db, episode.id, successor.id, now, admission
+      const owns = await setEpisodeCurrentRun(db, episode.id, successor.id, now, admission
         ? { nextCheckAt: new Date(now.getTime() + delayMs) }
         : {});
+      // The episode ended meanwhile (another deferral superseded it): the
+      // successor waits from its own context, like a joined wait.
+      if (!owns) {
+        shared = true;
+        admission = false;
+      }
     }
     // Step 5: a report, check or wake between the attempt and the successor
     // insert would otherwise be lost; the successor becomes due now.
@@ -445,7 +497,13 @@ export function createDeferral(runtime: DeferralRuntime) {
     });
     if (!cancelWrite.updated) {
       logger.info({ runId: run.id }, "skipping resource-wait deferral because the run left running state before it was cancelled");
-      if (opened.created) await abandon(opened.episode, run.id, now).catch(() => undefined);
+      const previous = opened.previousCurrentRunId;
+      if (opened.superseded) await runtime.onEpisodeEnded(opened.superseded).catch(() => undefined);
+      if (opened.created) await releaseEpisode(opened, run.id, now).catch(() => undefined);
+      else if (!opened.shared && previous && previous !== run.id) {
+        // The reuse made this run current: the run it took the episode from keeps it.
+        await restoreEpisodeCurrentRun(db, opened.episode.id, run.id, previous, now).catch(() => undefined);
+      }
       return { outcome: "skipped", episodeId: opened.episode.id };
     }
     // Step 2.

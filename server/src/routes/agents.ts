@@ -108,6 +108,7 @@ import {
 } from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
+import { aiAccountPoolService, assertAccountPoolAllowsBindingChange } from "../services/ai-account-pool.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { resolvePluginSandboxProviderDriverByKey } from "../services/plugin-environment-driver.js";
@@ -549,6 +550,8 @@ export function agentRoutes(
   const approvalsSvc = approvalService(db);
   const budgets = budgetService(db);
   const environmentsSvc = environmentService(db);
+  // Fork: the Claude account pool's binding and placement rules (spec 5).
+  const aiAccountPool = aiAccountPoolService(db, { deploymentMode: options.deploymentMode });
   const environmentRuntime = environmentRuntimeService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
@@ -2492,7 +2495,8 @@ export function agentRoutes(
     const manager = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
     if (!manager || manager.companyId !== companyId) throw forbidden("Hiring agent is unavailable");
     const binding = defaultAiConnectionForHire(adapterType, adapterConfig, manager.runtimeConfig?.aiConnection);
-    if (binding) normalized.aiConnection = binding;
+    // Fork: the company account pool is retired (spec 15.5), so a hire takes the provider through its responsible user instead.
+    if (binding) normalized.aiConnection = binding.mode === "company_pool" ? { provider: binding.provider, method: binding.method, mode: "responsible_user" } : binding;
     return normalized;
   }
 
@@ -3482,6 +3486,8 @@ export function agentRoutes(
   }
 
   async function validateManagedAgentBinding(req: Request, companyId: string, agentId: string, adapterType: string, config: Record<string, unknown>, binding: AiRuntimeConnectionBinding, environmentId: string | null | undefined, test: boolean, newAgent = false) {
+    // Fork: no new or changed company pools, and no routers for Claude agents (spec 4.1, 15.5).
+    await assertAccountPoolAllowsBindingChange(db, { companyId, agentId, binding, adapterType, newAgent });
     if (binding.mode === "router") {
       const settings = await import("../services/instance-settings.js");
       if (!(await settings.instanceSettingsService(db).getExperimental()).enableAiConnectionRouters) throw unprocessable("Ask your instance operator to enable AI connection routing.");
@@ -4543,10 +4549,12 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
-    const updated = await svc.rollbackConfigRevision(id, revisionId, {
+    // Fork: a rollback that moves a pool-bound agent passes the placement checks (spec 5.6).
+    const rollbackEnvironment = { defaultEnvironmentId: typeof rollbackConfig.defaultEnvironmentId === "string" ? rollbackConfig.defaultEnvironmentId : null };
+    const updated = await aiAccountPool.savePlacement(req.actor, existing, rollbackEnvironment, (agentsDb) => agentService(agentsDb).rollbackConfigRevision(id, revisionId, {
       agentId: actor.agentId,
       userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    }));
     if (!updated) {
       res.status(404).json({ error: "Revision not found" });
       return;
@@ -5783,7 +5791,8 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agent = await svc.update(id, patchData, {
+    // Fork: moving a pool-bound agent passes the placement checks and is saved under the bindings lock (spec 5.6).
+    const agent = await aiAccountPool.savePlacement(req.actor, existing, patchData, (agentsDb) => agentService(agentsDb).update(id, patchData, {
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5796,7 +5805,7 @@ export function agentRoutes(
         applyExistingWithoutClaim:
           req.actor.type !== "agent" && applyStoredClaudeLogin,
       },
-    });
+    }));
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;

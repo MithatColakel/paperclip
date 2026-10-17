@@ -784,6 +784,8 @@ export function pluginRoutes(
         agentId: null,
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
+        // Fork: host-derived (spec 9.6); a plugin reads a missing value as false.
+        isInstanceAdmin: req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true,
       };
     }
     return {

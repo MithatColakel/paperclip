@@ -2,17 +2,17 @@ import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import { resolveDeploymentMode } from "../../config-file.js";
 import { logger } from "../../middleware/logger.js";
-import { environmentAvailabilityService } from "../environment-availability.js";
 import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { environmentWaitsEnabled as readEnvironmentWaitsEnabled } from "./classify.js";
 import { createCheckNow } from "./check-now.js";
 import { createDeferral } from "./deferral.js";
+import { createEpisodeEnd } from "./episode-end.js";
 import { readWakeEpochs } from "./epochs.js";
 import { createHold } from "./hold.js";
 import { createResourceWaitNotifier } from "./notify.js";
 import { createPreflight } from "./preflight.js";
 import { createSweep } from "./sweep.js";
-import type { ResourceWaitDeps, ResourceWaitEpisodeRow, WakeEpochRefs } from "./types.js";
+import type { ResourceWaitDeps, WakeEpochRefs } from "./types.js";
 import { wakeResourceWaits, type ResourceWaitWakeFilter, type ResourceWaitWakeOptions } from "./wake.js";
 
 /**
@@ -77,17 +77,10 @@ export function createResourceWaits(options: CreateResourceWaitsOptions) {
   const random = options.random ?? Math.random;
   const environmentWaitsEnabled = options.environmentWaitsEnabled ?? readEnvironmentWaitsEnabled(env);
   const deploymentMode = options.deploymentMode ?? configuredDeploymentMode();
-  const availability = environmentAvailabilityService(db);
-
-  /** When an environment's last wait ends, its registry row goes (retired rows stay). */
-  async function onEpisodeEnded(episode: ResourceWaitEpisodeRow): Promise<void> {
-    if (episode.kind !== "environment" || !episode.environmentId) return;
-    await availability.deleteIfNoWaits(episode.environmentId).catch((error) => {
-      logger.warn({ err: error, environmentId: episode.environmentId }, "failed to clean up an environment availability row");
-    });
-  }
 
   const notifier = createResourceWaitNotifier({ db, deps, deploymentMode, env });
+  // An ended episode: registry cleanup, and the issue's other waits that named it.
+  const onEpisodeEnded = createEpisodeEnd({ db, deps, notifier, clock });
   const deferral = createDeferral({ db, deps, notifier, clock, random, onEpisodeEnded });
   const preflight = createPreflight({ db, deps, notifier, clock, random, environmentWaitsEnabled, onEpisodeEnded });
   const hold = createHold({ db, deps, clock, random, environmentWaitsEnabled, deploymentMode, onEpisodeEnded });
@@ -163,15 +156,18 @@ export {
   type RunEnvironmentPolicy,
 } from "./run-environment.js";
 export {
+  adoptEpisode,
   chainOfRun,
   coWaiterOf,
   episodeForRun,
   getEpisode,
   handOverOrAbandon,
+  needsNewImmediateNotice,
   openEpisode,
   openEpisodeForChain,
   resolveEpisode,
   resourceKeyOf,
+  restoreEpisodeCurrentRun,
   sameResource,
   setEpisodeCurrentRun,
   type EpisodeChain,
@@ -194,9 +190,11 @@ export {
   resourceWaitContextFor,
   resourceWaitJitterMs,
   waitDelayMs,
+  type EpisodeEndedHandler,
   type ScheduleResourceWaitInput,
   type ScheduleResourceWaitResult,
 } from "./deferral.js";
+export { createEpisodeEnd } from "./episode-end.js";
 export type { PreflightResult, RunEnvironmentRef } from "./preflight.js";
 export { claimAccountProbe, type HoldPassResult, type ProceedDecision, type RunWait } from "./hold.js";
 export {

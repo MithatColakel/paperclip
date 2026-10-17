@@ -26,6 +26,7 @@ import {
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { recheckDeviceLimitsAfterChange } from "../services/ai-account-pool.js";
 
 function sameJsonValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -160,6 +161,8 @@ export function instanceSettingsRoutes(db: Db) {
         }
         return svc.update(req.body, { db: tx });
       });
+      // Fork: the instance default can push an execution device over its Claude account limit (spec 5.6).
+      if (writesDefault) recheckDeviceLimitsAfterChange(db, "instance_settings_updated");
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
       await Promise.all(

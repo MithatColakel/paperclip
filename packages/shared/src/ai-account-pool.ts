@@ -600,7 +600,10 @@ export interface AgentAiAccountBindingSummary {
 
 /** `GET /api/agents/:agentId/ai-account`. */
 export interface AgentAiAccountBindingDetail extends AgentAiAccountBindingSummary {
+  /** The accounts eligible in the company, with this agent's `selectable`, `reason`, `warning` and `onAgentDevice`. */
   options: CompanyAiAccountOption[];
+  /** Whether the caller is a company admin, who may bind any eligible account (as in `CompanyAiAccountsResponse`). */
+  canBindAny?: boolean;
 }
 
 export interface CompanyAiAccountBindingsResponse {

@@ -512,8 +512,14 @@ describe("native replacement execution authority", () => {
 
 // Fork: device, account and slot waits (spec 18).
 describe("resource wait lanes", () => {
-  it("end on a task moved to blocked, at both retry gates; subscription waits keep their behaviour", () => {
-    const lane = { retryReasonKind: "ai_connection_wait" as const, isResourceWaitLane: true, issueStatus: "blocked" };
+  const createdAt = new Date("2025-12-31T23:00:00.000Z");
+  const blockedAfter = new Date("2025-12-31T23:30:00.000Z");
+
+  it("end on a task moved to blocked while they waited, at both retry gates; subscription waits keep their behaviour", () => {
+    const lane = {
+      retryReasonKind: "ai_connection_wait" as const, isResourceWaitLane: true, issueStatus: "blocked",
+      runCreatedAt: createdAt, issueBlockedTransitionAt: blockedAfter,
+    };
     expect(decideScheduledRetryGate({ ...baseGateFacts(), ...lane }, NOW))
       .toMatchObject({ allowed: false, errorCode: "issue_blocked", issueId: "issue-1" });
     expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), ...lane }, NOW))
@@ -522,6 +528,19 @@ describe("resource wait lanes", () => {
     expect(decideScheduledRetryGate({ ...baseGateFacts(), ...subscription }, NOW)).toEqual({ allowed: true });
     expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), ...subscription }, NOW)).toEqual({ stale: false });
     expect(decideScheduledRetryGate({ ...baseGateFacts(), ...lane, issueStatus: "in_progress" }, NOW)).toEqual({ allowed: true });
+  });
+
+  it.each([
+    ["blocked before the run was created", new Date("2025-12-31T22:00:00.000Z")],
+    ["blocked in the same instant", createdAt],
+    ["blocked with no recorded transition", null],
+  ])("keep waiting on a task %s (a reply or a mention woke the worker)", (_label, blockedAt) => {
+    const lane = {
+      retryReasonKind: "ai_connection_wait" as const, isResourceWaitLane: true, issueStatus: "blocked",
+      runCreatedAt: createdAt, issueBlockedTransitionAt: blockedAt,
+    };
+    expect(decideScheduledRetryGate({ ...baseGateFacts(), ...lane }, NOW)).toEqual({ allowed: true });
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), ...lane }, NOW)).toEqual({ stale: false });
   });
 });
 

@@ -71,6 +71,7 @@ import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
+import { recheckDeviceLimitsAfterChange } from "../services/ai-account-pool.js";
 
 // A company import can arrive one of two ways on the import + preview routes:
 //   • application/json — the original inline body `{ source, target, ... }`,
@@ -1305,6 +1306,8 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       res.status(404).json({ error: "Company not found" });
       return;
     }
+    // Fork: a company default can push an execution device over its Claude account limit (spec 5.6).
+    if (body.defaultEnvironmentId !== undefined) recheckDeviceLimitsAfterChange(db, "company_updated");
     if (!lifecycleEventEmittedByService) {
       await logActivity(db, {
         companyId,
