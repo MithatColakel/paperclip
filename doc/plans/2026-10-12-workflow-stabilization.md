@@ -15,7 +15,7 @@ since 2026-10-11 04:04Z. Every issue-bound run failed or never started:
 - Only the "resets 4pm (UTC)" reset form parsed; "resets Oct 15, 6am (UTC)"
   did not. ACP runs lost the provider text, and limit-caused ACP compaction
   failures put agents into `error`.
-- A question answer on CLE-7 was redelivered more than 16,000 times because its
+- A question answer on ACM-7 was redelivered more than 16,000 times because its
   issue was dependency-blocked and delivery retried without bound.
 - Wakes skipped by `maxDailyRuns` were dropped, quota failures counted against
   the cap, and stranded-todo recovery reasoned from another agent's run.
@@ -51,12 +51,12 @@ Code (one commit series per item, no migrations):
 
 Operations, applied together with the deploy:
 
-- Rewrite the per-agent AGENTS.md hand-off rules for CLE, VPN and PRE: hand
+- Rewrite the per-agent AGENTS.md hand-off rules for ACM, INI and GLO: hand
   back with one `PATCH {status: "todo", assigneeAgentId: <PM>, comment}` as the
   run's last call; never rely on mentions or agent-addressed confirmations.
 - Prepare the prod host for a 1005-based patched image (versioned build
   script, base image by digest, disk cleanup).
-- Move CLE TrelloIntake to Sonnet with a 3-hour cadence.
+- Move ACM TrelloIntake to Sonnet with a 3-hour cadence.
 
 ## Deferred
 
@@ -74,4 +74,4 @@ Operations, applied together with the deploy:
 - Three-lens review of the combined diff (correctness, deploy-time behaviour on
   the real prod state, DB load), each finding verified adversarially.
 - After deploy: health, migrations, the quota-loop issues re-armed to the
-  parsed reset time, the CLE-7 delivery parked, no run bursts.
+  parsed reset time, the ACM-7 delivery parked, no run bursts.

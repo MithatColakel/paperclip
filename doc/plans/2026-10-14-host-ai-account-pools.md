@@ -7,7 +7,7 @@ Date: 2026-10-14. Status: implemented on `feat/host-ai-account-pools` (server, A
 Claude subscriptions are company-scoped today. A connection, its grant, the
 owner's vault secret, the fork's `company_pool` members and their quota
 states all carry `company_id`, and the server refuses another company's
-account on purpose. A new company (LumineAI) therefore lists nothing, and
+account on purpose. A new company (Vandelay) therefore lists nothing, and
 the "from a computer" token source lists only computers enrolled in that company.
 
 Meanwhile the real constraint the operator manages is per **machine**: the
@@ -81,7 +81,7 @@ returned by the API.
    count, exactly like `company_pool`. Authentication failures mark the
    account `auth_failed` and stop selecting it.
 7. Agents with an explicit `aiConnection` keep it (escape hatch). The rollout
-   removes the one existing binding (VPN Project Manager) so every agent
+   removes the one existing binding (Initech Project Manager) so every agent
    uses its host pool.
 
 ## API (instance admin)

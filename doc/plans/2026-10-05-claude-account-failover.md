@@ -36,9 +36,9 @@ kadar atlansın ve sonra kendiliğinden havuza geri dönsün.
 
 | Şirket | Claude hesapları (bilinen) | Not |
 |---|---|---|
-| VPNProjects | Max hesap 1 (bilgisayar A), Max hesap 2 (bilgisayar B), Pro hesap 3 (bilgisayar C), sunucu token'ı (`claude_subscription_token` secret) | Linux runner ortamları sunucu token'ını kullanıyor |
-| Cleanio | Max hesap 4 (bilgisayar D) | Tek hesap — ikinci hesap eklenmezse devredecek hesap yok |
-| SkyNet Labs | — | Aktif agent yok |
+| Initech | Max hesap 1 (bilgisayar A), Max hesap 2 (bilgisayar B), Pro hesap 3 (bilgisayar C), sunucu token'ı (`claude_subscription_token` secret) | Linux runner ortamları sunucu token'ını kullanıyor |
+| Acme | Max hesap 4 (bilgisayar D) | Tek hesap — ikinci hesap eklenmezse devredecek hesap yok |
+| Hooli | — | Aktif agent yok |
 
 - Hiçbir agent'ta `runtimeConfig.aiConnection` tanımlı değil ve hiç AI
   connection yok. Kimlik bilgileri ortam `envVars` içindeki
@@ -47,7 +47,7 @@ kadar atlansın ve sonra kendiliğinden havuza geri dönsün.
 - Bilgisayarlar bir sandbox sağlayıcısı eklentisiyle değil, **SSH
   ortamlarıyla** bağlı (iki SSH ortamı). Bu SSH ortamlarında
   `CLAUDE_CODE_OAUTH_TOKEN` tanımlı değil.
-- Bugün bir run (VPNProjects / TrelloIntake) `provider_quota` ile düştü ve
+- Bugün bir run (Initech / TrelloIntake) `provider_quota` ile düştü ve
   `retryNotBefore=16:00` aldı. Mevcut davranışta run aynı hesapla 16:00'yı
   bekliyor.
 
@@ -208,7 +208,7 @@ AI connection rotalarıyla aynı kalıpta olur.
     anahtar zinciri kilitli olduğu için `CLAUDE_CODE_OAUTH_TOKEN` ile
     çalışmanın sorunsuz olduğu (beklenen) ve ACP motorunun uzak auth dizinini
     SSH hedefinde kurduğu.
-- **Linux runner ortamları** (`runner: vpn-*`):
+- **Linux runner ortamları** (`runner: ini-*`):
   - Ortam `envVars` içindeki `CLAUDE_CODE_OAUTH_TOKEN`, yönetilen modda zaten
     temizleniyor (`stripAiAuthBindings`).
   - Havuza geçen agent'larda bu değişken ortamdan kaldırılacak; kaldırılmasa
@@ -251,7 +251,7 @@ AI connection rotalarıyla aynı kalıpta olur.
    için `PAPERCLIP_IMAGE_ROLLBACK` ve `deploy-image.sh` aynen korunur.
 2. **Migration geri dönüşü.** Yeni tablolar yalnızca eklemedir. Eski imaja
    dönülürse eski kod bu tabloları okumaz, yani geri dönüş güvenlidir.
-3. **SSH bilgisayar denemesi.** VPNProjects'te tek bir test agent'ı, bir
+3. **SSH bilgisayar denemesi.** Initech'te tek bir test agent'ı, bir
    bilgisayarın SSH ortamında mevcut `shared` modla bir AI connection
    kullanarak çalıştırılır. Token enjeksiyonu doğrulanır.
 
@@ -270,10 +270,10 @@ AI connection rotalarıyla aynı kalıpta olur.
 1. Her hesap için ilgili bilgisayarda (ya da herhangi bir terminalde o hesapla)
    `claude setup-token` çalıştırılır ve token Paperclip'te ilgili şirketin AI
    hesabı olarak eklenir.
-2. Havuz sırası belirlenir. Örneğin VPNProjects için: Max → Max → sunucu Max →
+2. Havuz sırası belirlenir. Örneğin Initech için: Max → Max → sunucu Max →
    Pro. Pro'nun limiti düşük olduğu için en sona konur.
 3. Agent'lar "Şirket Claude havuzu" moduna alınır.
-4. Cleanio için ikinci bir hesap atanmadıkça devir olmaz; bu durumda run
+4. Acme için ikinci bir hesap atanmadıkça devir olmaz; bu durumda run
    sıfırlanmayı bekler.
 
 ### Faz 4 — Kota dolmadan geçiş (ilk teslime dahil)
@@ -347,6 +347,6 @@ hesabı run başlamadan atlar.
 
 1. Her şirkete hangi hesaplar atanacak ve sıraları ne olacak? Sunucu
    token'ının hangi hesaba ait olduğu da netleşmeli.
-2. Cleanio'ya ikinci bir hesap atanacak mı?
+2. Acme'ye ikinci bir hesap atanacak mı?
 
 Yanıtlananlar: 60 dk varsayılanı onaylandı; Faz 4 ilk teslime dahil.

@@ -11,7 +11,7 @@
 ## 1. Why: measured on prod, 2026-10-06
 
 **The setup:**
-- Company: VPNProjects.
+- Company: Initech.
 - Agent: the engineer agent of app A.
 - Environment: the SSH environment of computer A.
   - Driver: `ssh`.
@@ -20,7 +20,7 @@
 - Computer B (another tunnel port, the engineer agent of app B) uses the same driver and has the same problems.
 
 **What every run does today (copy mode):**
-1. The server owns the worktree, for example `…/<app A repo>/.paperclip/worktrees/VPN-146-…`.
+1. The server owns the worktree, for example `…/<app A repo>/.paperclip/worktrees/INI-146-…`.
 2. `prepareRemoteManagedRuntime` (`packages/adapter-utils/src/remote-managed-runtime.ts:~121`) creates a new directory on the device for every run: `<remoteCwd>/.paperclip-runtime/runs/<runId>/workspace`.
 3. `importGitWorkspaceToSsh` (`ssh.ts:~762`) uploads a bundle of the whole history reachable from HEAD.
 4. `syncDirectoryToSsh` (`ssh.ts:~1316`) then uploads a tar of the whole tree.
@@ -256,7 +256,7 @@ The environment driver plugin's sandbox provider can already return `in_place` t
    4. Check: no EPIPE crash under a forced SSH drop, no `.build/` in transfers, and no run directories left on the device after a run.
 2. **Part A** behind `workspaceMode: "device"`.
    1. Change computer A's environment to a dedicated root (decision 9.3) and set `workspaceMode: "device"`.
-   2. Verify on VPN-146:
+   2. Verify on INI-146:
       - The first run fetches from GitHub, and the server log shows no "Importing git history" or "Syncing workspace" lines.
       - The second run moves 5 MB or less.
       - The build is incremental.
@@ -288,12 +288,12 @@ The environment driver plugin's sandbox provider can already return `in_place` t
   - Its orphan server-side `tar` was stopped. Only `tar` was killed, to avoid the EPIPE crash.
   - The orphan `paperclip-bridge-server.mjs` from run `9fe6fd8e` was killed on the device.
 - **Backups** are in `~/PaperclipRunBackups/2026-10-06/` on the device (161 MB):
-  - `vpn146-duplicate-local-backup.bundle` holds 3 VPN-146 commits that existed only on the device. Its base is `6ee9dc5`. To recover: `git fetch <bundle> vpn146-duplicate-local-backup:vpn146-duplicate-local-backup`.
+  - `ini146-duplicate-local-backup.bundle` holds 3 INI-146 commits that existed only on the device. Its base is `6ee9dc5`. To recover: `git fetch <bundle> ini146-duplicate-local-backup:ini146-duplicate-local-backup`.
   - Patches and untracked files from 7 run directories with working changes: `changes.patch`, `untracked.tgz` and `info.txt` per run.
   - Every other run-directory HEAD was present on the server or on GitHub.
 - **Deleted:**
   - All 31 run directories under `~/Documents/Projects/.paperclip-runtime/runs/`, about 25 GB.
-  - The 5 `.build/` directories in the server worktrees: VPN-146 (3), VPN-5's nested copy of the app A repository, and app B's VPN-129. VPN-146 went from 2.0 GB to 162 MB.
+  - The 5 `.build/` directories in the server worktrees: INI-146 (3), INI-5's nested copy of the app A repository, and app B's INI-129. INI-146 went from 2.0 GB to 162 MB.
 
 ## 11. Implementation status (2026-10-06)
 
