@@ -2,6 +2,7 @@
 
 - Date: 2026-10-07
 - Status: proposed, **revision 5, checked against the code**. It replaces revision 4 in full. Revision 4 content that is still correct is restated here; nothing else carries over.
+- Follow-up: the release flow of Roadmap 0.2-0.4 is planned in `doc/plans/2026-10-18-roadmap-0.2.md`, approved on 2026-10-19. That plan is an additive delta on this one; its §15 lists what carries over, what is deferred and what diverges.
 - Owner: board operator
 - Applies to: fork `MithatColakel/paperclip`, branch `deploy/2026.1001.0` at `e6624f4bf`, and every company on the instance. The fork-owned plugin is `paperclip.roadmap`. **Acme (ACM) is the pilot**, and Initech (INI) and Globex Suite (GLO) follow.
 - Inputs: the user's requirements 1–15 (§1); the user's follow-up of 2026-10-07: "continue with project types with components; initech-node is really a separate project, so existing projects need some restructuring, which we do later"; the prod facts and Phase 0 state of 2026-10-06/07 (§2.3, §19.1); the Acme PM's roadmap draft rev1 (ACM-97 document `roadmap`); three design inputs (project types and components; roles, skill and rollout; multi-project UX); and a code review of revision 4 (30 findings, one blocker; §0.1 and §0.5). Every code reference was re-checked on this branch.
