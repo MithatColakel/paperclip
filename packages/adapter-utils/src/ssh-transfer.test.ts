@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
+  streamLocalFileToSsh,
+  syncDirectoryFromSsh,
   syncDirectoryToSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
@@ -16,10 +18,16 @@ import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 // A stand-in `ssh` on PATH. "local" runs the remote command on this machine,
 // so the real tar and git do the transfer; "drop" reads a little of the
-// upload and then dies like a dropped tunnel.
+// upload and then dies like a dropped tunnel. "stallThenDrop" stops reading
+// first, so the upload backs up before ssh gives up the way ServerAlive does;
+// "hang" stops reading and stays connected; "slow" reads the whole upload in
+// small, steady steps.
 const FAKE_SSH = {
   local: "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n",
   drop: "#!/bin/sh\nhead -c 4096 >/dev/null\necho 'Connection to fake closed by remote host.' >&2\nexit 255\n",
+  stallThenDrop: "#!/bin/sh\nhead -c 4096 >/dev/null\nsleep 1\necho 'Timeout, server fake not responding.' >&2\nexit 255\n",
+  hang: "#!/bin/sh\nhead -c 4096 >/dev/null\nexec sleep 30\n",
+  slow: "#!/bin/sh\nwhile [ \"$(head -c 65536 | wc -c)\" -gt 0 ]; do sleep 0.05; done\n",
 };
 
 const spec = (remoteCwd: string): SshRemoteExecutionSpec => ({
@@ -141,6 +149,144 @@ describe("SSH workspace transfer", () => {
     expect(registered).toHaveLength(1);
     expect(unregistered).toBe(1);
   });
+
+  // With a progress sink the upload runs through a byte counter. When ssh died
+  // with the pipe backed up, tar's stdout stayed paused behind that counter, so
+  // tar never emitted `close` and the run waited forever on the transfer.
+  it("settles a progress-reporting upload when ssh drops with the pipe backed up", async () => {
+    await useFakeSsh("stallThenDrop");
+    const localDir = await tempDir("paperclip-ssh-stall-drop-");
+    await writeFile(path.join(localDir, "big.bin"), randomBytes(8 * 1024 * 1024));
+    const lines: string[] = [];
+
+    await expect(syncDirectoryToSsh({
+      spec: spec("/remote"),
+      localDir,
+      remoteDir: "/remote/workspace",
+      onProgress: (line) => {
+        lines.push(line);
+      },
+      progressLabel: "workspace",
+    })).rejects.toThrow("Timeout, server fake not responding.");
+    expect(lines.at(-1)).toMatch(/^\[paperclip\] Syncing workspace to ssh: failed /);
+  }, 15_000);
+
+  it("settles a progress-reporting upload when the registered transfer process is killed", async () => {
+    await writeFile(path.join(binDir, "ssh"), "#!/bin/sh\nexec sleep 30\n", "utf8");
+    await chmod(path.join(binDir, "ssh"), 0o755);
+    const localDir = await tempDir("paperclip-ssh-cancel-progress-");
+    await writeFile(path.join(localDir, "big.bin"), randomBytes(8 * 1024 * 1024));
+    let unregistered = 0;
+
+    await expect(syncDirectoryToSsh({
+      spec: spec("/remote"),
+      localDir,
+      remoteDir: "/remote/workspace",
+      onProgress: () => undefined,
+      registerTransferProcess: (child) => {
+        setTimeout(() => child.kill("SIGTERM"), 300);
+        return () => {
+          unregistered += 1;
+        };
+      },
+    })).rejects.toThrow(/ssh exited with signal SIGTERM/);
+    expect(unregistered).toBe(1);
+  }, 15_000);
+
+  it("fails an upload that stops moving while ssh stays connected", async () => {
+    await useFakeSsh("hang");
+    const localDir = await tempDir("paperclip-ssh-hang-");
+    await writeFile(path.join(localDir, "big.bin"), randomBytes(8 * 1024 * 1024));
+    const lines: string[] = [];
+
+    const startedAt = Date.now();
+    await expect(syncDirectoryToSsh({
+      spec: spec("/remote"),
+      localDir,
+      remoteDir: "/remote/workspace",
+      onProgress: (line) => {
+        lines.push(line);
+      },
+      progressLabel: "workspace",
+      stallTimeoutMs: 500,
+    })).rejects.toThrow("SSH transfer stalled: no data moved for 500 ms");
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(lines.at(-1)).toMatch(/^\[paperclip\] Syncing workspace to ssh: failed /);
+  }, 15_000);
+
+  it("keeps a slow upload going while its bytes keep moving", async () => {
+    await useFakeSsh("slow");
+    const localDir = await tempDir("paperclip-ssh-slow-");
+    await writeFile(path.join(localDir, "big.bin"), randomBytes(2 * 1024 * 1024));
+
+    const startedAt = Date.now();
+    await syncDirectoryToSsh({
+      spec: spec("/remote"),
+      localDir,
+      remoteDir: "/remote/workspace",
+      onProgress: () => undefined,
+      stallTimeoutMs: 400,
+    });
+    // The whole upload outlasts the stall timeout; only the gaps are shorter.
+    expect(Date.now() - startedAt).toBeGreaterThan(400);
+  }, 30_000);
+
+  it("fails a git history upload that stops moving while ssh stays connected", async () => {
+    await useFakeSsh("hang");
+    const localDir = await tempDir("paperclip-ssh-bundle-hang-");
+    const localFile = path.join(localDir, "workspace.bundle");
+    await writeFile(localFile, randomBytes(8 * 1024 * 1024));
+
+    await expect(streamLocalFileToSsh({
+      spec: spec("/remote"),
+      localFile,
+      remoteScript: "cat >/dev/null",
+      stallTimeoutMs: 500,
+    })).rejects.toThrow("SSH transfer stalled: no data moved for 500 ms");
+  }, 15_000);
+
+  it("does not time the remote work that follows a git history upload", async () => {
+    // Reads the whole bundle, then stays quiet while it "fetches and checks out".
+    await writeFile(path.join(binDir, "ssh"), "#!/bin/sh\ncat >/dev/null\nsleep 1\nexit 0\n", "utf8");
+    await chmod(path.join(binDir, "ssh"), 0o755);
+    const localDir = await tempDir("paperclip-ssh-bundle-quiet-");
+    const localFile = path.join(localDir, "workspace.bundle");
+    await writeFile(localFile, randomBytes(1024 * 1024));
+
+    await streamLocalFileToSsh({
+      spec: spec("/remote"),
+      localFile,
+      remoteScript: "cat >/dev/null",
+      stallTimeoutMs: 300,
+    });
+  }, 15_000);
+
+  it("settles a progress-reporting restore when the local tar dies mid-transfer", async () => {
+    await useFakeSsh("local");
+    const realTar = execFileSync("sh", ["-c", "command -v tar"], { encoding: "utf8" }).trim();
+    // The local extraction (`tar -xf - -C <staging>`) reads a little and fails;
+    // the remote side's archive still comes from the real tar.
+    await writeFile(
+      path.join(binDir, "tar"),
+      `#!/bin/sh\nif [ "$1" = "-xf" ]; then head -c 4096 >/dev/null; echo 'tar: fake extract failure' >&2; exit 2; fi\nexec '${realTar}' "$@"\n`,
+      "utf8",
+    );
+    await chmod(path.join(binDir, "tar"), 0o755);
+    const remoteDir = await tempDir("paperclip-ssh-restore-remote-");
+    await writeFile(path.join(remoteDir, "big.bin"), randomBytes(8 * 1024 * 1024));
+    const localDir = await tempDir("paperclip-ssh-restore-local-");
+    await writeFile(path.join(localDir, "keep.txt"), "local\n", "utf8");
+
+    await expect(syncDirectoryFromSsh({
+      spec: spec(remoteDir),
+      remoteDir,
+      localDir,
+      onProgress: () => undefined,
+    })).rejects.toThrow();
+    // A failed restore leaves the local copy alone.
+    expect(await readFile(path.join(localDir, "keep.txt"), "utf8")).toBe("local\n");
+    expect(await exists(path.join(localDir, "big.bin"))).toBe(false);
+  }, 15_000);
 
   it("leaves git-ignored build output out of the upload and the pull-back", async () => {
     await useFakeSsh("local");
