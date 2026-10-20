@@ -6,6 +6,17 @@ const effortFlagSupportCache = new Map<string, Promise<boolean | null>>();
 
 export const CLAUDE_FABLE_5_1_MIN_CLI_VERSION = "2.1.251";
 
+const CLAUDE_CLI_PROBE_MAX_TIMEOUT_SEC = 20;
+
+// A run timeoutSec of 0 or less means "no adapter wall-clock timeout" (local
+// and SSH targets default to it), not "probe for 0 s". Give the probe the full
+// cap then: an SSH round trip over a reverse tunnel alone can take ~1 s, so a
+// 1 s floor killed `claude --version` before it answered.
+function claudeCliProbeTimeoutSec(timeoutSec: number): number {
+  if (!(timeoutSec > 0)) return CLAUDE_CLI_PROBE_MAX_TIMEOUT_SEC;
+  return Math.max(1, Math.min(timeoutSec, CLAUDE_CLI_PROBE_MAX_TIMEOUT_SEC));
+}
+
 export function claudeCommandLooksLike(command: string, expected = "claude"): boolean {
   const base = path.basename(command).toLowerCase();
   return base === expected || base === `${expected}.cmd` || base === `${expected}.exe`;
@@ -85,7 +96,7 @@ async function probeClaudeCommandVersion(input: {
     {
       cwd: input.cwd,
       env: input.env,
-      timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
+      timeoutSec: claudeCliProbeTimeoutSec(input.timeoutSec),
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
     },
@@ -127,7 +138,7 @@ async function probeClaudeCommandSupportsEffortFlag(input: {
     {
       cwd: input.cwd,
       env: input.env,
-      timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
+      timeoutSec: claudeCliProbeTimeoutSec(input.timeoutSec),
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
     },
