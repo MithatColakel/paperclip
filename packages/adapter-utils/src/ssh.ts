@@ -936,16 +936,29 @@ export async function streamSshToLocalFile(input: {
     ssh.stdout?.on("error", fail);
     ssh.on("error", fail);
     sink.on("error", fail);
+    // Settle only when ssh has exited AND the pipe has written every byte. ssh
+    // can close while the progress counter still holds chunks; ending the sink
+    // at that point cut the file short and still reported success, so git
+    // later failed on the bundle with "early EOF". The pipe ends the sink once
+    // the stream it drains has ended.
+    let exitCode: number | null | undefined;
+    let sinkFinished = false;
+    const settleWhenWritten = () => {
+      if (settled || exitCode === undefined || !sinkFinished) return;
+      settled = true;
+      resolve();
+    };
+    sink.on("finish", () => {
+      sinkFinished = true;
+      settleWhenWritten();
+    });
     ssh.on("close", (code) => {
-      sink.end(() => {
-        if (settled) return;
-        settled = true;
-        if ((code ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
-          return;
-        }
-        resolve();
-      });
+      exitCode = code;
+      if ((code ?? 0) !== 0) {
+        fail(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+        return;
+      }
+      settleWhenWritten();
     });
   }).finally(async () => {
     stopStallWatch();

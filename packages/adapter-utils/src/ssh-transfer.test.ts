@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
+import { Transform } from "node:stream";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,12 +9,17 @@ import {
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
   streamLocalFileToSsh,
+  streamSshToLocalFile,
   syncDirectoryFromSsh,
   syncDirectoryToSsh,
   type SshRemoteExecutionSpec,
 } from "./ssh.js";
 import { GIT_ARCHIVE_EXCLUDES, PROJECT_REPOSITORIES_DIR } from "./git-workspace-sync.js";
-import { prepareRemoteManagedRuntime, removeRemoteRunScratchDir } from "./remote-managed-runtime.js";
+import {
+  prepareRemoteManagedRuntime,
+  pruneStaleRemoteRunScratchDirs,
+  removeRemoteRunScratchDir,
+} from "./remote-managed-runtime.js";
 import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
 
 // A stand-in `ssh` on PATH. "local" runs the remote command on this machine,
@@ -92,6 +98,32 @@ describe("SSH workspace transfer", () => {
     while (cleanupDirs.length > 0) {
       await rm(cleanupDirs.pop()!, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  it("writes the whole download before it settles, even when the progress counter lags behind ssh", async () => {
+    await useFakeSsh("local");
+    const remoteDir = await tempDir("paperclip-ssh-download-remote-");
+    const source = path.join(remoteDir, "export.bundle");
+    const payload = randomBytes(4 * 1024 * 1024);
+    await writeFile(source, payload);
+    const localFile = path.join(await tempDir("paperclip-ssh-download-local-"), "workspace.bundle");
+    // A counter that hands each chunk on a little later, like a busy host, so
+    // data is still inside it when ssh exits.
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        setTimeout(() => callback(null, chunk), 2);
+      },
+    });
+
+    await streamSshToLocalFile({
+      spec: spec(remoteDir),
+      remoteScript: `cat ${source}`,
+      localFile,
+      progress: { counter } as unknown as Parameters<typeof streamSshToLocalFile>[0]["progress"],
+    });
+
+    expect((await stat(localFile)).size).toBe(payload.length);
+    expect((await readFile(localFile)).equals(payload)).toBe(true);
   });
 
   it("fails the transfer instead of crashing the process when ssh drops mid-upload", async () => {
@@ -493,6 +525,85 @@ describe("SSH workspace transfer", () => {
     await exited;
     expect(await exists(scratchDir)).toBe(false);
     expect(await exists(path.join(remoteRoot, ".paperclip-runtime", "runs"))).toBe(true);
+  });
+
+  async function startBridge(scratchDir: string) {
+    const bridgeScript = path.join(scratchDir, "workspace", "bridge.mjs");
+    await mkdir(path.dirname(bridgeScript), { recursive: true });
+    await writeFile(bridgeScript, "setInterval(() => {}, 1000);\n", "utf8");
+    const bridge = spawn(process.execPath, [bridgeScript], { stdio: "ignore", detached: true });
+    const exited = new Promise<void>((resolve) => bridge.once("exit", () => resolve()));
+    return { bridge, exited };
+  }
+
+  async function ageDays(dir: string, days: number) {
+    const then = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    await utimes(dir, then, then);
+  }
+
+  it("prunes run scratch directories past retention and stops their leaked processes", async () => {
+    await useFakeSsh("local");
+    const remoteRoot = await tempDir("paperclip-ssh-prune-");
+    const runsDir = path.join(remoteRoot, ".paperclip-runtime", "runs");
+    const stale = path.join(runsDir, "run-stale");
+    const { bridge, exited } = await startBridge(stale);
+    const recent = path.join(runsDir, "run-recent");
+    const current = path.join(runsDir, "run-current");
+    const notARun = path.join(runsDir, "not a run");
+    for (const dir of [recent, current, notARun]) await mkdir(dir, { recursive: true });
+    for (const dir of [stale, current, notARun]) await ageDays(dir, 10);
+    await ageDays(recent, 2);
+
+    const removed = await pruneStaleRemoteRunScratchDirs(spec(remoteRoot), runsDir, "run-current");
+
+    await exited;
+    expect(bridge.exitCode !== null || bridge.signalCode !== null).toBe(true);
+    expect(removed).toEqual(["run-stale"]);
+    expect(await exists(stale)).toBe(false);
+    expect(await exists(recent)).toBe(true);
+    expect(await exists(current)).toBe(true);
+    expect(await exists(notARun)).toBe(true);
+  });
+
+  it("prunes a stale sibling when a new run prepares on the same host", async () => {
+    await useFakeSsh("local");
+    const localDir = await gitWorkspace();
+    const remoteRoot = await tempDir("paperclip-ssh-prune-prepare-");
+    const stale = path.join(remoteRoot, ".paperclip-runtime", "runs", "run-old");
+    await mkdir(path.join(stale, "workspace"), { recursive: true });
+    await ageDays(stale, 30);
+
+    const runtime = await prepareRemoteManagedRuntime({
+      spec: spec(remoteRoot),
+      runId: "run-new",
+      adapterKey: "claude",
+      workspaceLocalDir: localDir,
+    });
+
+    expect(await exists(stale)).toBe(false);
+    expect(await exists(runtime.workspaceRemoteDir)).toBe(true);
+    await runtime.restoreWorkspace();
+  });
+
+  it("stops the run's leftover processes but keeps its copy when the restore fails", async () => {
+    await useFakeSsh("local");
+    const localDir = await gitWorkspace();
+    const remoteRoot = await tempDir("paperclip-ssh-restore-fail-");
+    const runtime = await prepareRemoteManagedRuntime({
+      spec: spec(remoteRoot),
+      runId: "run-broken",
+      adapterKey: "claude",
+      workspaceLocalDir: localDir,
+    });
+    const scratchDir = path.join(remoteRoot, ".paperclip-runtime", "runs", "run-broken");
+    const { exited } = await startBridge(scratchDir);
+    // Break the remote copy so the git-backed restore cannot export it.
+    await rm(path.join(runtime.workspaceRemoteDir, ".git"), { recursive: true, force: true });
+
+    await expect(runtime.restoreWorkspace()).rejects.toThrow();
+
+    await exited;
+    expect(await exists(scratchDir)).toBe(true);
   });
 
   it("refuses to remove a directory that is not named after the run", async () => {
