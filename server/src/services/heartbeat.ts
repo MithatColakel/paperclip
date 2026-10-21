@@ -632,6 +632,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
+import { leaseProviderIdNamesExclusiveResource } from "./environment-driver-traits.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -19322,8 +19323,10 @@ export function heartbeatService(
     for (const { lease } of rows) {
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
-      // must not tear down a sandbox that a different lease still owns.
-      if (lease.provider && lease.providerLeaseId) {
+      // must not tear down a sandbox that a different lease still owns. An SSH
+      // id names the host target that every run shares, so it proves nothing.
+      if (lease.provider && lease.providerLeaseId
+        && leaseProviderIdNamesExclusiveResource(readNonEmptyString(lease.metadata?.driver))) {
         const [otherOwner] = await db
           .select({ id: environmentLeases.id })
           .from(environmentLeases)

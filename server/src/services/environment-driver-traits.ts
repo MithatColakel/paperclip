@@ -123,6 +123,18 @@ export interface EnvironmentDriverTraits {
    * `true` changes runtime behavior, so the board owns that decision.
    */
   readonly hasLeaseCapabilityModel: boolean;
+  /**
+   * True when a lease's `providerLeaseId` names one physical provider resource
+   * that a single lease owns, such as one sandbox. Read by
+   * `sweepOrphanedActiveLeases` (`heartbeat.ts`): while another live lease
+   * carries the same id, the resource is still in use, so the orphan stays put.
+   *
+   * False for `ssh`: its id (`ssh://user@host:port/cwd`) names the shared target
+   * that every run on the environment uses at once, so another run's lease on the
+   * same host says nothing about this run's lease. False for `local`, which
+   * records no provider lease id.
+   */
+  readonly providerLeaseIdNamesExclusiveResource: boolean;
 }
 
 /**
@@ -137,6 +149,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: false,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: false,
   },
   ssh: {
     driver: "ssh",
@@ -144,6 +157,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: false,
   },
   sandbox: {
     driver: "sandbox",
@@ -151,6 +165,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: true,
     hasLeaseCapabilityModel: true,
+    providerLeaseIdNamesExclusiveResource: true,
   },
   plugin: {
     driver: "plugin",
@@ -158,6 +173,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: true,
   },
 };
 
@@ -173,4 +189,13 @@ export function getEnvironmentDriverTraits(
   return Object.prototype.hasOwnProperty.call(ENVIRONMENT_DRIVER_TRAITS, driver)
     ? ENVIRONMENT_DRIVER_TRAITS[driver as EnvironmentDriver]
     : null;
+}
+
+/**
+ * Whether a lease recorded for this driver key names an exclusive provider
+ * resource (see {@link EnvironmentDriverTraits.providerLeaseIdNamesExclusiveResource}).
+ * An unknown or absent driver keeps the conservative answer, `true`.
+ */
+export function leaseProviderIdNamesExclusiveResource(driver: string | null | undefined): boolean {
+  return getEnvironmentDriverTraits(driver)?.providerLeaseIdNamesExclusiveResource ?? true;
 }

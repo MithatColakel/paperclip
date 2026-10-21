@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ENVIRONMENT_DRIVER_TRAITS,
   getEnvironmentDriverTraits,
+  leaseProviderIdNamesExclusiveResource,
   type EnvironmentDriverTraits,
 } from "../services/environment-driver-traits.js";
 
@@ -14,24 +15,28 @@ const EXPECTED_TRAITS: Record<string, Omit<EnvironmentDriverTraits, "driver">> =
     runsWorkspaceOffHost: false,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: false,
   },
   ssh: {
     realizesWorkspace: true,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: false,
   },
   sandbox: {
     realizesWorkspace: true,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: true,
     hasLeaseCapabilityModel: true,
+    providerLeaseIdNamesExclusiveResource: true,
   },
   plugin: {
     realizesWorkspace: false,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    providerLeaseIdNamesExclusiveResource: true,
   },
 };
 
@@ -44,6 +49,7 @@ describe("environment driver traits", () => {
       expect(traits.runsWorkspaceOffHost).toBe(expected.runsWorkspaceOffHost);
       expect(traits.confinesStagedProjects).toBe(expected.confinesStagedProjects);
       expect(traits.hasLeaseCapabilityModel).toBe(expected.hasLeaseCapabilityModel);
+      expect(traits.providerLeaseIdNamesExclusiveResource).toBe(expected.providerLeaseIdNamesExclusiveResource);
     });
   }
 
@@ -63,5 +69,13 @@ describe("environment driver traits", () => {
     expect(getEnvironmentDriverTraits("not-a-real-driver")).toBeNull();
     expect(getEnvironmentDriverTraits(null)).toBeNull();
     expect(getEnvironmentDriverTraits(undefined)).toBeNull();
+  });
+
+  it("an SSH or local lease id names no exclusive resource; an unknown driver keeps the guard", () => {
+    expect(leaseProviderIdNamesExclusiveResource("ssh")).toBe(false);
+    expect(leaseProviderIdNamesExclusiveResource("local")).toBe(false);
+    expect(leaseProviderIdNamesExclusiveResource("sandbox")).toBe(true);
+    expect(leaseProviderIdNamesExclusiveResource("not-a-real-driver")).toBe(true);
+    expect(leaseProviderIdNamesExclusiveResource(null)).toBe(true);
   });
 });
