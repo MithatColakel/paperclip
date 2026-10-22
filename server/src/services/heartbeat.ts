@@ -19462,6 +19462,15 @@ export function heartbeatService(
       // environment still exists tears down through `destroyRunLease`. That
       // path uses the provider and configuration recorded on the lease first;
       // the environment is lifecycle context and only a legacy fallback.
+      // The agent's next run may already hold this reusable sandbox through a
+      // newer live lease. A teardown now would stop and delete that run's
+      // workspace, so the stale row settles without one.
+      if (lease.leasePolicy === "reuse_by_environment" && !hasStopOnlyCleanup(lease)
+        && await environmentsSvc.settleSupersededReusableLease(lease.id)) {
+        logger.info({ leaseId: row.id }, "settled a pending_cleanup lease whose sandbox a live lease reused");
+        continue;
+      }
+
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
       const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
 

@@ -202,6 +202,48 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(status).toBe("expired");
   });
 
+  it("settles a pending reusable lease without a teardown when a live lease reused its sandbox", async () => {
+    const { companyId, environmentId } = await seedCompanyAndEnvironment();
+    const staleId = await insertPendingCleanupLease({
+      companyId,
+      environmentId,
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    const [stale] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, staleId));
+    // The agent's next run took the same reusable sandbox and is still running.
+    const liveId = randomUUID();
+    const now = new Date();
+    await db.insert(environmentLeases).values({
+      id: liveId,
+      companyId,
+      environmentId,
+      status: "active",
+      leasePolicy: "reuse_by_environment",
+      provider: "fake",
+      providerLeaseId: stale!.providerLeaseId,
+      metadata: { driver: "sandbox" },
+      acquiredAt: now,
+      lastUsedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const destroyRunLease = vi.fn(async () => null);
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: fakeRuntime(destroyRunLease as unknown as HeartbeatEnvironmentRuntime["destroyRunLease"]),
+    });
+
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(destroyRunLease).not.toHaveBeenCalled();
+    const rows = await db.select().from(environmentLeases);
+    expect(rows.find((row) => row.id === staleId)).toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+      failureReason: "superseded_by_live_lease",
+    });
+    expect(rows.find((row) => row.id === liveId)).toMatchObject({ status: "active", releasedAt: null });
+  });
+
   it("test_pending_cleanup_sweep_respects_backoff_and_page_size", async () => {
     const { companyId, environmentId } = await seedCompanyAndEnvironment();
 

@@ -1693,6 +1693,46 @@ export function environmentService(db: Db) {
     },
 
     /**
+     * Settle a reusable sandbox lease left in `pending_cleanup` when a newer live
+     * lease (active or retained) of the same provider resource already holds the
+     * sandbox, as when the agent's next run reused its workspace. Destroying the
+     * resource then would stop and delete that live run's workspace, so the stale
+     * row is settled without a teardown and without a termination receipt. The
+     * live lease owns the resource from here on. Returns null, and changes
+     * nothing, unless every condition still holds at write time.
+     */
+    settleSupersededReusableLease: async (id: string) => {
+      const now = new Date();
+      const row = await db
+        .update(environmentLeases)
+        .set({
+          status: "expired",
+          releasedAt: now,
+          lastUsedAt: now,
+          updatedAt: now,
+          cleanupStatus: "success",
+          failureReason: "superseded_by_live_lease",
+          metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination')
+            || '{"pendingCleanupInFlight": false}'::jsonb`,
+        })
+        .where(and(
+          eq(environmentLeases.id, id),
+          eq(environmentLeases.status, "pending_cleanup"),
+          eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+          sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`,
+          sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ?| array['sandboxStopAndRetain', 'nativeWorkspaceExportResume'])`,
+          sql`exists (select 1 from environment_leases as live_owner
+            where live_owner.id <> "environment_leases"."id"
+              and live_owner.provider = "environment_leases"."provider"
+              and live_owner.provider_lease_id = "environment_leases"."provider_lease_id"
+              and live_owner.status in ('active', 'retained'))`,
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return row ? toEnvironmentLease(row) : null;
+    },
+
+    /**
      * Record a lease-less orphan sandbox directly in the terminal
      * `pending_cleanup` state with one atomic insert. The sweep reads a row with
      * status `pending_cleanup` and cleanup status `failed`, so this insert makes
