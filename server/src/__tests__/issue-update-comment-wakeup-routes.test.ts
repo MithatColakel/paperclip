@@ -501,6 +501,84 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it("checks the final patch before the interrupt cancels the run, and skips the check for plain edits", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-3",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(
+      makeIssue({ ...existing, assigneeAgentId: ASSIGNEE_AGENT_ID }),
+    );
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-precheck",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "hand this over",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-3",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-3",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        comment: "hand this over",
+        interrupt: true,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // One check, on the stored row and the patch the update writes, by the
+    // acting board user (no agent run), before the interrupt cancels the run.
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    const [checkedIssue, checkedPatch] = mockIssueService.precheckUpdate.mock
+      .calls[0] as unknown as [Record<string, unknown>, Record<string, unknown>];
+    expect(checkedIssue).toMatchObject({ id: existing.id, status: "in_progress" });
+    expect(checkedPatch).toMatchObject({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      actorAgentId: null,
+      actorRunId: null,
+    });
+    expect(checkedPatch).not.toHaveProperty("comment");
+    expect(checkedPatch).not.toHaveProperty("interrupt");
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject(checkedPatch);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-3",
+      "Interrupted by board comment",
+      expect.anything(),
+    );
+    expect(mockIssueService.precheckUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]!,
+    );
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+
+    // A plain field edit stops nothing, so it leaves the rules to the update.
+    vi.clearAllMocks();
+    mockIssueService.update.mockResolvedValue({ ...existing, title: "Renamed" });
+    const titleRes = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ title: "Renamed" });
+    expect(titleRes.status, JSON.stringify(titleRes.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.precheckUpdate).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
   it("interrupts the active run without waking an agent when the handoff assigns a user", async () => {
     const existing = makeIssue({
       assigneeAgentId: PREVIOUS_AGENT_ID,

@@ -37,6 +37,8 @@ import {
 
 const CONVERSATION_IDENTITY_ERROR =
   "Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation";
+const CONVERSATION_PARENT_ERROR =
+  "Conversations cannot have new subtasks; create a task in a project instead";
 const BOARD_USER_ID = "board-user";
 // Background wakes stay off: no test here should start another run.
 const NO_WAKE_RUNTIME_CONFIG = { heartbeat: { wakeOnDemand: false } };
@@ -575,13 +577,126 @@ const support = await getEmbeddedPostgresTestSupport();
       ).toEqual([]);
     });
 
+    it("rejects a board comment's update before its interrupt cancels the run", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const conversation = await createConversation(companyId, agentId);
+      const issue = await createTask(companyId, agentId);
+      const run = await startRun(companyId, agentId, issue.id);
+
+      // Only the interrupt stops work here: the assignee and status stay.
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Stop and look at this", interrupt: true, parentId: conversation.id });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(CONVERSATION_PARENT_ERROR);
+      expectRunStillRunning(await readRun(run.id));
+      expect(
+        await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)),
+      ).toEqual([]);
+      const after = await readIssue(issue.id);
+      expect(after.parentId).toBeNull();
+      expect(after.executionRunId).toBe(run.id);
+    });
+
+    it("rejects a human comment's update before it cancels the scheduled retry it supersedes", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const conversation = await createConversation(companyId, agentId);
+      const issue = await createTask(companyId, agentId);
+      const [retry] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId,
+          agentId,
+          status: "scheduled_retry",
+          scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+          scheduledRetryAttempt: 1,
+          scheduledRetryReason: "transient_failure",
+          contextSnapshot: { issueId: issue.id, taskKey: issue.id },
+        })
+        .returning();
+
+      // The comment would move the task back to todo and cancel the retry;
+      // only that cancel stops work here.
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Try it again with the new settings", parentId: conversation.id });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(CONVERSATION_PARENT_ERROR);
+      const retryAfter = await readRun(retry!.id);
+      expect({ status: retryAfter.status, finishedAt: retryAfter.finishedAt }).toEqual({
+        status: "scheduled_retry",
+        finishedAt: null,
+      });
+      const after = await readIssue(issue.id);
+      expect(after.status).toBe("in_progress");
+      expect(after.parentId).toBeNull();
+    });
+
+    it("rejects starting a task whose agent's manager is terminated before a board comment interrupts its run", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId, { status: "todo" });
+      const run = await startRun(companyId, agentId, issue.id);
+      // The assignee's manager leaves after the task was assigned.
+      const managerId = randomUUID();
+      await db.insert(agents).values({
+        id: managerId,
+        companyId,
+        name: "Former manager",
+        role: "manager",
+        status: "terminated",
+        adapterType: "process",
+        runtimeConfig: NO_WAKE_RUNTIME_CONFIG,
+      });
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, agentId));
+
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Start on this now", interrupt: true, status: "in_progress" });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.code, JSON.stringify(res.body)).toBe("agent_not_assignable");
+      expect(res.body.details).toMatchObject({ reason: "ancestor_terminated" });
+      expectRunStillRunning(await readRun(run.id));
+      expect((await readIssue(issue.id)).status).toBe("todo");
+    });
+
+    it("checks the acting agent's run before the connection review, as the update does", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const run = await startRun(companyId, agentId, issue.id);
+      const [invocation] = await db
+        .insert(toolInvocations)
+        .values({ companyId, agentId, issueId: issue.id, toolName: "sheets:update_cell" })
+        .returning();
+      await db.insert(toolActionRequests).values({
+        companyId,
+        invocationId: invocation!.id,
+        issueId: issue.id,
+        status: "pending",
+        canonicalArgumentsHash: "args-hash",
+        canonicalArgumentsSummary: { summary: "{}", sha256: "args-hash", sizeBytes: 2 },
+      });
+      // An operator stops the run while the agent's request is in flight.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+
+      const svc = issueService(db);
+      const stored = await svc.getById(issue.id);
+      const patch = { status: "done", actorAgentId: agentId, actorRunId: run.id };
+      const refusal = { status: 403, details: { code: "agent_run_cancelled" } };
+      await expect(svc.precheckUpdate(stored!, patch)).rejects.toMatchObject(refusal);
+      await expect(svc.update(issue.id, patch)).rejects.toMatchObject(refusal);
+      expect((await readIssue(issue.id)).status).toBe("in_progress");
+    });
+
     it("checks the update again after the runner goal stops, before cancelling the run", async () => {
       const { companyId, agentId, otherAgentId } = await seedCompany(RUNNER_AGENT);
       const issue = await createTask(companyId, agentId);
       const run = await startRun(companyId, agentId, issue.id);
       // Another writer hands the task to the user while the route waits for the
       // runner to pause the goal; the requested agent change is now refused.
-      await startRunnerGoal(
+      const session = await startRunnerGoal(
         { companyId, agentId, issueId: issue.id, runId: run.id },
         async () => {
           await db
@@ -597,6 +712,14 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.error).toBe("Issue can only have one assignee");
       expectRunStillRunning(await readRun(run.id));
+      // The goal stays paused: the task is no longer this agent's to resume.
+      // The error says so.
+      expect(res.body.details).toMatchObject({ runnerGoalStopped: "pause" });
+      const [sessionAfter] = await db
+        .select()
+        .from(agentTaskSessions)
+        .where(eq(agentTaskSessions.id, session.id));
+      expect((sessionAfter!.goalJson as Record<string, unknown>).status).toBe("paused");
     });
 
     it("still cancels the current run before an allowed reassignment", async () => {

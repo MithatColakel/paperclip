@@ -3586,6 +3586,8 @@ export function issueRoutes(
     companyId: string;
     issueId: string;
     agentId: string;
+    /** Runs only when there is a goal to stop, right before it is stopped. */
+    beforeStop?: () => Promise<void>;
   }) => {
     const current = await runnerGoals.projection(
       input.companyId,
@@ -3610,6 +3612,7 @@ export function issueRoutes(
         { code: "runner_goal_stop_unsupported", projection: current },
       );
     }
+    await input.beforeStop?.();
     await runnerGoals.act(input.companyId, input.issueId, {
       requestId: `ownership_${randomUUID()}`,
       agentId: input.agentId,
@@ -4124,9 +4127,12 @@ export function issueRoutes(
     scheduledRetryRunId: string | null | undefined;
     issue: { id: string; companyId: string };
     actor: ReturnType<typeof getActorInfo>;
+    /** Runs only when there is a retry to cancel, right before it is cancelled. */
+    beforeCancel?: () => Promise<void>;
   }) {
     const scheduledRetryRunId = readNonEmptyString(input.scheduledRetryRunId);
     if (!scheduledRetryRunId) return null;
+    await input.beforeCancel?.();
 
     try {
       const cancelled = await heartbeat.cancelRun(scheduledRetryRunId);
@@ -13420,21 +13426,17 @@ export function issueRoutes(
       }
 
       // Below, before the update is written, the request may interrupt the
-      // active run, cancel a scheduled retry, stop the assignee's runner goal
-      // or cancel its run. None of that can be undone, so first reject a patch
-      // that the update will refuse anyway (for example reassigning or
-      // completing a conversation, or handing a task to a user who is no
-      // longer a member). Requests without those steps leave the rules to the
-      // update alone.
+      // active run, cancel a scheduled retry, stop the assignee's runner goal,
+      // cancel its run or reopen its closed workspace. None of that can be
+      // undone, so right before the first of those steps actually happens,
+      // reject a patch that the update will refuse anyway (for example
+      // reassigning or completing a conversation, or handing a task to a user
+      // who is no longer a member). A request that takes none of those steps
+      // leaves the rules to the update alone.
       const terminalizingIssue =
         typeof updateFields.status === "string" &&
         updateFields.status !== existing.status &&
         isClosedIssueStatus(updateFields.status);
-      const stopsWorkBeforeUpdate =
-        Boolean(interruptRequested) ||
-        cancelsScheduledRetrySupersededByComment ||
-        (Boolean(existing.assigneeAgentId) &&
-          (assigneeWillChange || terminalizingIssue));
       const logRejectedIssueUpdate = (err: unknown) => {
         if (!(err instanceof HttpError) || err.status !== 422) return;
         logger.warn(
@@ -13468,24 +13470,63 @@ export function issueRoutes(
           await svc.precheckUpdate(current, {
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
+            actorRunId: actor.agentId ? actor.runId : null,
           });
         } catch (err) {
           logRejectedIssueUpdate(err);
           throw err;
         }
       };
+      // Every step below that cannot be undone awaits this first. It checks
+      // the row read above once per request.
+      let issueUpdatePrecheck: Promise<void> | null = null;
+      const precheckIssueUpdateOnce = () =>
+        (issueUpdatePrecheck ??= precheckIssueUpdate(existing));
       // Stopping a runner goal can wait for the runner, so the row read above
       // can be stale by the time the run is cancelled. Check again on a fresh
-      // read; a row that is gone is left to the update.
-      const precheckIssueUpdateAfterGoalStop = async () => {
+      // read; a row that is gone is left to the update. If the check now
+      // refuses, the run keeps running and the goal stays stopped: resuming it
+      // could restart a goal that a concurrent change took from this agent.
+      // The error then says which stop was made.
+      const precheckIssueUpdateAfterGoalStop = async (
+        goalStopAction: "pause" | "clear",
+      ) => {
         const current = await svc.getById(id);
-        if (current) await precheckIssueUpdate(current);
+        if (!current) return;
+        try {
+          await precheckIssueUpdate(current);
+        } catch (err) {
+          if (err instanceof HttpError) {
+            logger.warn(
+              {
+                issueId: id,
+                companyId: existing.companyId,
+                runnerGoalStopped: goalStopAction,
+                status: err.status,
+                error: err.message,
+              },
+              "issue update refused after its runner goal was stopped",
+            );
+            if (
+              err.details === undefined ||
+              (err.details !== null &&
+                typeof err.details === "object" &&
+                !Array.isArray(err.details))
+            ) {
+              err.details = {
+                ...(err.details as Record<string, unknown> | undefined),
+                runnerGoalStopped: goalStopAction,
+              };
+            }
+          }
+          throw err;
+        }
       };
-      if (stopsWorkBeforeUpdate) await precheckIssueUpdate(existing);
 
       if (interruptRequested) {
         const runToInterrupt = await resolveActiveIssueRun(existing);
         if (runToInterrupt) {
+          await precheckIssueUpdateOnce();
           const cancelled = await heartbeat.cancelRun(
             runToInterrupt.id,
             "Interrupted by board comment",
@@ -13527,6 +13568,7 @@ export function issueRoutes(
               scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
               issue: existing,
               actor,
+              beforeCancel: precheckIssueUpdateOnce,
             })
           : null;
 
@@ -13538,10 +13580,12 @@ export function issueRoutes(
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          beforeStop: precheckIssueUpdateOnce,
         });
-        if (goalStopAction) await precheckIssueUpdateAfterGoalStop();
+        if (goalStopAction) await precheckIssueUpdateAfterGoalStop(goalStopAction);
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
+          await precheckIssueUpdateOnce();
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -13574,12 +13618,14 @@ export function issueRoutes(
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          beforeStop: precheckIssueUpdateOnce,
         });
-        if (goalStopAction) await precheckIssueUpdateAfterGoalStop();
+        if (goalStopAction) await precheckIssueUpdateAfterGoalStop(goalStopAction);
         const runToStopForTerminalization = goalStopAction
           ? await resolveActiveIssueRun(existing)
           : null;
         if (goalStopAction && runToStopForTerminalization) {
+          await precheckIssueUpdateOnce();
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
@@ -13737,12 +13783,14 @@ export function issueRoutes(
         );
       };
       // Reopen the closed isolated workspace only after every access, validation,
-      // and policy gate passes, and just before the update persists. A rejected
-      // update must not rebuild and republish the workspace as active, because the
-      // issue stays terminal and the reaper then skips the leaked workspace.
+      // and policy gate and the update precheck pass, and just before the update
+      // persists. A rejected update must not rebuild and republish the workspace
+      // as active, because the issue stays terminal and the reaper then skips the
+      // leaked workspace.
       let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
       let reopenedGeneration: number | null = null;
       if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
+        await precheckIssueUpdateOnce();
         const reopenOutcome =
           await reopenClosedIssueExecutionWorkspaceOrRespond(
             req,

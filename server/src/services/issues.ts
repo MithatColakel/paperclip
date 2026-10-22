@@ -1,6 +1,6 @@
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
-import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { assertAgentRunWriteAllowed, assertAgentRunWriteNotRevoked } from "../agent-run-cancellation.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
@@ -10830,14 +10830,21 @@ export function issueService(db: Db) {
      * Read-only. Throws the error `update` would return for `data` from the
      * rules it applies before writing, in the same order, without the issue
      * row lock. The PATCH route calls it before it stops the assignee's
-     * runner goal or cancels a run, so a refused request leaves that work
-     * alone. `update` stays the authority and runs the same rules again.
+     * runner goal, cancels a run or reopens a workspace, so a refused request
+     * leaves that work alone. `update` stays the authority and runs the same
+     * rules again. The checks that `update` makes under the lock (the actor's
+     * run is still allowed to write, no connection review is open) are best
+     * effort here: either can change before `update` takes the lock.
      */
     precheckUpdate: async (
       existing: IssueUpdatePrecheckRow,
       data: IssueUpdateData,
     ) => {
       await assertIssueUpdateRules(db, existing, data);
+      await assertAgentRunWriteNotRevoked(db, existing.companyId, {
+        agentId: data.actorAgentId,
+        runId: data.actorRunId,
+      });
       await assertNoPendingToolReviewForAgentCompletion(db, existing, data);
     },
 

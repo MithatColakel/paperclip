@@ -16,6 +16,7 @@ const REOPEN_PENDING_WAIT_TIMEOUT_MS = 5_000;
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   checkout: vi.fn(),
   addComment: vi.fn(),
 }));
@@ -206,11 +207,12 @@ async function assertNoBackgroundClearWithinRetryWindow() {
 
 describe("closed isolated workspace issue routes", () => {
   const routeModules = hoistModuleGraph(registerServiceMocks, async () => {
-    const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+    const [{ issueRoutes }, { errorHandler }, { unprocessable }] = await Promise.all([
       vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
       vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../errors.js")>("../errors.js"),
     ]);
-    return { issueRoutes, errorHandler };
+    return { issueRoutes, errorHandler, unprocessable };
   });
 
   function createApp(actor?: Record<string, unknown>) {
@@ -235,6 +237,9 @@ describe("closed isolated workspace issue routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
+    // Tests that reach the update set its result; the precheck allows by default.
+    mockIssueService.update.mockReset();
+    mockIssueService.precheckUpdate.mockReset().mockResolvedValue(undefined);
     mockExecutionWorkspaceService.getById.mockResolvedValue(makeClosedWorkspace());
     mockExecutionWorkspaceService.refreshReopenPendingConsumption.mockResolvedValue({ refreshed: true });
     // The guard reopens a closed isolated workspace and lets the request
@@ -350,6 +355,36 @@ describe("closed isolated workspace issue routes", () => {
       mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
     ).not.toHaveBeenCalled();
     expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen the workspace when the update precheck refuses the comment update", async () => {
+    // A done task with no assignee cannot move to in_progress. The update would
+    // refuse it after the reopen, so the route must check the update first and
+    // leave the closed workspace alone.
+    const { unprocessable } = routeModules.value;
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue(),
+      status: "done",
+      assigneeAgentId: null,
+    });
+    mockIssueService.precheckUpdate.mockRejectedValue(
+      unprocessable("in_progress issues require an assignee"),
+    );
+    mockIssueService.update.mockRejectedValue(
+      unprocessable("in_progress issues require an assignee"),
+    );
+
+    const res = await request(createApp())
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "hello", status: "in_progress" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("in_progress issues require an assignee");
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("clears the reopen-pending flag when the comment update returns null after a reopen", async () => {

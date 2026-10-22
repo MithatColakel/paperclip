@@ -29,3 +29,22 @@ export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, acto
     throw forbidden("This run was cancelled", { code: "agent_run_cancelled" });
   }
 }
+
+/**
+ * The check above, read-only and without its lock, for a precheck that runs
+ * before the caller stops any run. No run has been stopped for this mutation
+ * yet, so the stop-id exemption does not apply. The write must still call
+ * `assertAgentRunWriteAllowed` in its transaction.
+ */
+export async function assertAgentRunWriteNotRevoked(db: Db, companyId: string, actor: {
+  agentId?: string | null;
+  runId?: string | null;
+}) {
+  if (!actor.agentId || !actor.runId) return;
+  const [run] = await db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)));
+  if (agentRunWritesRevoked(run)) {
+    throw forbidden("This run was cancelled", { code: "agent_run_cancelled" });
+  }
+}
