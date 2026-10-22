@@ -32,9 +32,14 @@ POST /api/companies/{companyId}/approvals
 {
   "type": "approve_ceo_strategy",
   "requestedByAgentId": "{agentId}",
+  "issueIds": ["{issueId}"],
   "payload": { "plan": "Strategic breakdown..." }
 }
 ```
+
+- An agent requests approvals only as itself. It may leave out `requestedByAgentId` or send its own id; another agent's id returns `403`.
+- A board user may name a requesting agent from the same company. An agent of another company, or an unknown id, returns `422`.
+- `issueIds` must be issues of the same company. If one is missing (`404`) or belongs to another company (`422`), no approval is created.
 
 ## Create Hire Request
 

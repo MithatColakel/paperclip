@@ -1,6 +1,6 @@
 import { Router, type Request } from "express";
 import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   approveApprovalSchema,
@@ -22,7 +22,7 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { environmentService } from "../services/environments.js";
 import { aiAccountPoolService } from "../services/ai-account-pool.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
@@ -210,6 +210,31 @@ export function approvalRoutes(
     return false;
   }
 
+  // An agent requests approvals only as itself. A board user may name a
+  // requesting agent, but only one of this company's agents.
+  async function resolveApprovalRequester(
+    companyId: string,
+    actor: ReturnType<typeof getActorInfo>,
+    requestedByAgentId: string | null,
+  ) {
+    if (actor.actorType === "agent") {
+      if (requestedByAgentId && requestedByAgentId !== actor.actorId) {
+        throw forbidden("Agents can request approvals only as themselves");
+      }
+      return actor.actorId;
+    }
+    if (!requestedByAgentId) return null;
+    const requester = await db
+      .select({ companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.id, requestedByAgentId))
+      .then((rows) => rows[0] ?? null);
+    if (requester?.companyId !== companyId) {
+      throw unprocessable("The requesting agent must belong to this company");
+    }
+    return requestedByAgentId;
+  }
+
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -238,6 +263,12 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    const actor = getActorInfo(req);
+    const requestedByAgentId = await resolveApprovalRequester(
+      companyId,
+      actor,
+      approvalInput.requestedByAgentId ?? null,
+    );
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -247,26 +278,30 @@ export function approvalRoutes(
           )
         : approvalInput.payload;
 
-    const actor = getActorInfo(req);
-    const approval = await svc.create(companyId, {
-      ...approvalInput,
-      payload: normalizedPayload,
-      requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
-      status: "pending",
-      decisionNote: null,
-      decidedByUserId: null,
-      decidedAt: null,
-      updatedAt: new Date(),
-    });
-
-    if (uniqueIssueIds.length > 0) {
-      await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
+    // The approval and its issue links commit together, so a rejected link
+    // (another company's issue, or a missing one) leaves no pending approval.
+    const approval = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const created = await approvalService(txDb).create(companyId, {
+        ...approvalInput,
+        payload: normalizedPayload,
+        requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        requestedByAgentId,
+        status: "pending",
+        decisionNote: null,
+        decidedByUserId: null,
+        decidedAt: null,
+        updatedAt: new Date(),
       });
-    }
+
+      if (uniqueIssueIds.length > 0) {
+        await issueApprovalService(txDb).linkManyForApproval(created.id, uniqueIssueIds, {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        });
+      }
+      return created;
+    });
 
     await logActivity(db, {
       companyId,

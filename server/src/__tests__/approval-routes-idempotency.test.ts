@@ -81,7 +81,7 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
     agentId,
     contextSnapshot,
   }];
-  return {
+  const db = {
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
@@ -91,7 +91,9 @@ function createRouteDb(contextSnapshot: Record<string, unknown> = {}, runId = "r
         })),
       })),
     })),
-  } as any;
+    transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback(db)),
+  };
+  return db as any;
 }
 
 async function createAgentApp(options: { runId?: string; contextSnapshot?: Record<string, unknown> } = {}) {
@@ -437,6 +439,22 @@ describe("approval routes idempotent retries", () => {
         action: "approval.created",
       }),
     );
+  });
+
+  it("refuses an agent that names another agent as the requester", async () => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({
+        type: "request_board_approval",
+        requestedByAgentId: "00000000-0000-0000-0000-0000000000a2",
+        payload: { title: "Approve hosting spend" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agents can request approvals only as themselves");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("blocks status-only recovery runs from creating approvals", async () => {
