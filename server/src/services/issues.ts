@@ -204,16 +204,19 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  ALL_ISSUE_STATUSES,
+  assertIssueUpdatePrecheck,
+  issueUpdateChangesAssigneeAgent,
+} from "./issue-update-precheck.js";
 
-const ALL_ISSUE_STATUSES = [
-  "backlog",
-  "todo",
-  "in_progress",
-  "in_review",
-  "blocked",
-  "done",
-  "cancelled",
-];
+export {
+  assertIssueUpdatePrecheck,
+  type IssueUpdatePrecheckFacts,
+  type IssueUpdatePrecheckIssue,
+  type IssueUpdatePrecheckPatch,
+} from "./issue-update-precheck.js";
+
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
@@ -307,13 +310,6 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
     or ${activityLog.details} ->> 'issueId' = ${issueId}
     or ${activityLog.details} ->> 'rootIssueId' = ${issueId}
   )`;
-}
-
-function assertTransition(from: string, to: string) {
-  if (from === to) return;
-  if (!ALL_ISSUE_STATUSES.includes(to)) {
-    throw conflict(`Unknown issue status: ${to}`);
-  }
 }
 
 function applyStatusSideEffects(
@@ -10733,14 +10729,23 @@ export function issueService(db: Db) {
       if (data.parentId !== undefined && data.parentId !== existing.parentId) {
         await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
       }
-      if (existing.conversationAgentId) {
-        if ((data.assigneeAgentId !== undefined && data.assigneeAgentId !== existing.conversationAgentId)
-          || data.assigneeUserId || data.conversationAgentId !== undefined || data.conversationUserId !== undefined
-          || data.conversationState !== undefined || data.conversationSessionGeneration !== undefined
-          || data.conversationBoundaryCommentId !== undefined || data.status === "done" || data.status === "cancelled") {
-          throw unprocessable("Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation");
-        }
-      }
+      const externalBinding = issueUpdateChangesAssigneeAgent(existing, data)
+        ? await dbOrTx
+            .select({ id: chatConversations.id })
+            .from(chatConversations)
+            .where(
+              and(
+                eq(chatConversations.companyId, existing.companyId),
+                eq(chatConversations.issueId, existing.id),
+              ),
+            )
+            .limit(1)
+            .then((rows: Array<{ id: string }>) => rows[0] ?? null)
+        : null;
+      // The PATCH route runs the same rules before it stops the assignee's work.
+      assertIssueUpdatePrecheck(existing, data, {
+        externalChannelConversationId: externalBinding?.id ?? null,
+      });
 
       const {
         labelIds: nextLabelIds,
@@ -10754,31 +10759,6 @@ export function issueService(db: Db) {
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
-      if (
-        issueData.assigneeAgentId !== undefined &&
-        issueData.assigneeAgentId !== existing.assigneeAgentId
-      ) {
-        const externalBinding = await dbOrTx
-          .select({ id: chatConversations.id })
-          .from(chatConversations)
-          .where(
-            and(
-              eq(chatConversations.companyId, existing.companyId),
-              eq(chatConversations.issueId, existing.id),
-            ),
-          )
-          .limit(1)
-          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-        if (externalBinding) {
-          throw conflict(
-            "Agent assignment cannot change while this task is bound to an external channel",
-            {
-              code: "chat_binding_agent_locked",
-              conversationId: externalBinding.id,
-            },
-          );
-        }
-      }
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
@@ -10811,10 +10791,6 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspaceSettings;
       }
 
-      if (issueData.status) {
-        assertTransition(existing.status, issueData.status);
-      }
-
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -10844,16 +10820,6 @@ export function issueService(db: Db) {
           ? issueData.assigneeUserId
           : existing.assigneeUserId;
 
-      if (nextAssigneeAgentId && nextAssigneeUserId) {
-        throw unprocessable("Issue can only have one assignee");
-      }
-      if (
-        patch.status === "in_progress" &&
-        !nextAssigneeAgentId &&
-        !nextAssigneeUserId
-      ) {
-        throw unprocessable("in_progress issues require an assignee");
-      }
       if (patch.status === "in_progress") {
         const dependencyReadiness =
           blockedByIssueIds === undefined

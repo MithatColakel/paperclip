@@ -288,6 +288,8 @@ import {
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
+// Imported from its own module: route tests replace ../services/issues.js.
+import { assertIssueUpdatePrecheck } from "../services/issue-update-precheck.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -13461,6 +13463,12 @@ export function issueRoutes(
           });
         }
       }
+
+      // Everything below may stop the assignee's runner goal, cancel its run or
+      // reopen a workspace before the update is written. Reject a patch that
+      // the update will refuse anyway (for example reassigning or completing a
+      // conversation) first, so a rejected request leaves the run alone.
+      assertIssueUpdatePrecheck(existing, updateFields);
 
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).

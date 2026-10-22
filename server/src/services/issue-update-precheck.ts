@@ -1,0 +1,127 @@
+import { conflict, unprocessable } from "../errors.js";
+
+/**
+ * Rules that reject an issue update from the stored issue row and the patch
+ * alone. `issueService.update` runs them as the authority. The PATCH route runs
+ * them again before its own side effects (stopping the assignee's runner goal
+ * and cancelling its run), so a request that the update would refuse never
+ * stops the assignee's work first.
+ *
+ * Keep this module free of database access: the route calls it where no write
+ * may have happened yet, and route tests replace the issue service module.
+ */
+
+export const ALL_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+  "done",
+  "cancelled",
+];
+
+export interface IssueUpdatePrecheckIssue {
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  conversationAgentId: string | null;
+}
+
+/** `undefined` leaves the field unchanged, as in `issueService.update`. */
+export interface IssueUpdatePrecheckPatch {
+  status?: string | null;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  conversationAgentId?: unknown;
+  conversationUserId?: unknown;
+  conversationState?: unknown;
+  conversationSessionGeneration?: unknown;
+  conversationBoundaryCommentId?: unknown;
+}
+
+export interface IssueUpdatePrecheckFacts {
+  /**
+   * The chat conversation that binds the issue to an external channel, or null
+   * when there is none. Leave it undefined when the caller did not look the
+   * binding up; `issueService.update` always looks it up for an agent change.
+   */
+  externalChannelConversationId?: string | null;
+}
+
+export function issueUpdateChangesAssigneeAgent(
+  existing: Pick<IssueUpdatePrecheckIssue, "assigneeAgentId">,
+  patch: Pick<IssueUpdatePrecheckPatch, "assigneeAgentId">,
+) {
+  return (
+    patch.assigneeAgentId !== undefined &&
+    patch.assigneeAgentId !== existing.assigneeAgentId
+  );
+}
+
+/**
+ * Throws the same error `issueService.update` returns for these rules, in the
+ * same order. Every rule reads only its arguments.
+ */
+export function assertIssueUpdatePrecheck(
+  existing: IssueUpdatePrecheckIssue,
+  patch: IssueUpdatePrecheckPatch,
+  facts: IssueUpdatePrecheckFacts = {},
+): void {
+  if (existing.conversationAgentId) {
+    if (
+      (patch.assigneeAgentId !== undefined &&
+        patch.assigneeAgentId !== existing.conversationAgentId) ||
+      patch.assigneeUserId ||
+      patch.conversationAgentId !== undefined ||
+      patch.conversationUserId !== undefined ||
+      patch.conversationState !== undefined ||
+      patch.conversationSessionGeneration !== undefined ||
+      patch.conversationBoundaryCommentId !== undefined ||
+      patch.status === "done" ||
+      patch.status === "cancelled"
+    ) {
+      throw unprocessable(
+        "Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation",
+      );
+    }
+  }
+  if (
+    facts.externalChannelConversationId &&
+    issueUpdateChangesAssigneeAgent(existing, patch)
+  ) {
+    throw conflict(
+      "Agent assignment cannot change while this task is bound to an external channel",
+      {
+        code: "chat_binding_agent_locked",
+        conversationId: facts.externalChannelConversationId,
+      },
+    );
+  }
+  if (
+    patch.status &&
+    patch.status !== existing.status &&
+    !ALL_ISSUE_STATUSES.includes(patch.status)
+  ) {
+    throw conflict(`Unknown issue status: ${patch.status}`);
+  }
+
+  const nextAssigneeAgentId =
+    patch.assigneeAgentId !== undefined
+      ? patch.assigneeAgentId
+      : existing.assigneeAgentId;
+  const nextAssigneeUserId =
+    patch.assigneeUserId !== undefined
+      ? patch.assigneeUserId
+      : existing.assigneeUserId;
+  if (nextAssigneeAgentId && nextAssigneeUserId) {
+    throw unprocessable("Issue can only have one assignee");
+  }
+  if (
+    patch.status === "in_progress" &&
+    !nextAssigneeAgentId &&
+    !nextAssigneeUserId
+  ) {
+    throw unprocessable("in_progress issues require an assignee");
+  }
+}
