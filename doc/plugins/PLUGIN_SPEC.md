@@ -1604,6 +1604,12 @@ The host's plugin process manager must support:
 
 Each worker process is independent. There is no shared process pool or batch restart mechanism.
 
+A crash-recovery start that fails (spawn error, initialize timeout or failure) counts as one more consecutive crash and is retried with the same backoff until the consecutive-crash limit is reached; the host then logs one error and leaves the worker `crashed`.
+
+Fail-closed retirement. When the host cannot prove that a worker released a channel or a terminal (a duplex channel close or a login pseudo-terminal close that the worker did not acknowledge), it kills the worker at once. Until the process exits, the handle refuses new calls, channels and terminals (`diagnostics().retiring` is true while the status still reads `running`). Nothing the old process held is reused: its pending requests, routes and sessions end, and a host reply to one of its requests is dropped. Crash recovery then starts a fresh worker with backoff. These retirements share a budget that a successful start does not reset: at most 3 restarts in a rolling 30 minutes; the next retirement leaves the worker `crashed` with one error naming the reason and the count. A worker retired for a duplex ownership violation (a frame or reply for a channel it does not own) is not restarted. An operator stop, disable, unload or instance shutdown always wins over a pending restart.
+
+To bring a `crashed` worker back, an operator restarts the plugin, or disables and enables it. Both unload the old worker handle first, then start a fresh worker with a fresh retirement budget.
+
 ## 26. Plugin Observability
 
 ### 26.1 Logging

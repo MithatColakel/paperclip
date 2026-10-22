@@ -48,6 +48,9 @@
 //   - `mode: "exit-before-open-reply"`: the fixture emits the scripted outputs,
 //     then exits with no open reply, so a test proves the host clears the
 //     pre-bind queue on a worker exit during the open window.
+//
+// The `health` method returns the worker session ids of every `loginPtyStop`
+// this worker process received, so a test proves a stale stop never reaches it.
 const readline = require("node:readline");
 
 function send(message) {
@@ -155,6 +158,9 @@ function parseDirective(raw) {
     return {};
   }
 }
+
+// The worker session ids of every `loginPtyStop` this process received.
+const stopsReceived = [];
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
@@ -274,7 +280,17 @@ rl.on("line", (line) => {
   }
 
   if (method === "loginPtyStop") {
+    stopsReceived.push(params.workerSessionId);
     send({ jsonrpc: "2.0", id: message.id, result: null });
+    return;
+  }
+
+  if (method === "health") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { status: "ok", details: { loginPtyStops: stopsReceived } },
+    });
     return;
   }
 

@@ -2411,3 +2411,98 @@ describe("plugin worker manager login pseudo-terminal pre-bind queue", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Login pseudo-terminal retirement and restart
+// ---------------------------------------------------------------------------
+
+describe("plugin worker manager login pseudo-terminal retirement", () => {
+  async function waitUntilRunning(handle: ReturnType<typeof makeLoginPtyHandle>): Promise<void> {
+    const deadline = Date.now() + 8_000;
+    while (handle.status !== "running" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(handle.status).toBe("running");
+  }
+
+  async function stopsReceived(handle: ReturnType<typeof makeLoginPtyHandle>): Promise<unknown> {
+    // The worker handles requests in order, so a stop sent before this call is
+    // already counted in the reply.
+    const health = await handle.call("health", {});
+    return health.details?.loginPtyStops;
+  }
+
+  it("restarts a worker retired on an unacknowledged login pseudo-terminal close", async () => {
+    const handle = makeLoginPtyHandle({ loginPtyLimits: { closeTimeoutMs: 200 } });
+    const crashes: Array<{ willRestart: boolean; reason?: string }> = [];
+    handle.on("crash", (payload) => crashes.push(payload));
+    try {
+      await handle.start();
+      const exited = new Promise<void>((resolve) => handle.on("exit", () => resolve()));
+      const session = await handle.openLoginPtySession(
+        ptyOpenInput({ mode: "normal", closeMode: "bad-ack" }),
+      );
+      await session.close();
+      await exited;
+      expect(crashes).toEqual([
+        expect.objectContaining({
+          willRestart: true,
+          reason: "retired: login pseudo-terminal close not acknowledged",
+        }),
+      ]);
+      await waitUntilRunning(handle);
+      const fresh = await handle.openLoginPtySession(ptyOpenInput({ mode: "normal" }));
+      await fresh.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("never sends a stale login stop to a restarted worker that reuses the session id", async () => {
+    const handle = makeLoginPtyHandle({ loginPtyLimits: { closeTimeoutMs: 200 } });
+    try {
+      await handle.start();
+      const stale = await handle.openLoginPtySession(ptyOpenInput({ workerSessionId: "ws-1" }));
+      const exited = new Promise<void>((resolve) => handle.on("exit", () => resolve()));
+      const retiring = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-2", closeMode: "bad-ack" }),
+      );
+      await retiring.close();
+      await exited;
+      await waitUntilRunning(handle);
+      // The fresh worker mints the same worker session id for a new terminal.
+      const fresh = await handle.openLoginPtySession(ptyOpenInput({ workerSessionId: "ws-1" }));
+      stale.kill();
+      expect(await stopsReceived(handle)).toEqual([]);
+      // The live session's own stop still arrives.
+      fresh.kill();
+      expect(await stopsReceived(handle)).toEqual(["ws-1"]);
+      await fresh.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("ignores a stop for a login terminal that already ended on the same worker", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const ended = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-1", exitCode: 0 }),
+      );
+      await expect(ended.wait()).resolves.toEqual({ exitCode: 0 });
+      // The ended terminal's stop is ignored before and after its close, also
+      // once a new terminal holds the same worker session id.
+      ended.kill();
+      await ended.close();
+      const next = await handle.openLoginPtySession(ptyOpenInput({ workerSessionId: "ws-1" }));
+      ended.kill();
+      expect(await stopsReceived(handle)).toEqual([]);
+      next.kill();
+      expect(await stopsReceived(handle)).toEqual(["ws-1"]);
+      await next.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});

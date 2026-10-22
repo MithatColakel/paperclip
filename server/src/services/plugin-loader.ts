@@ -2192,9 +2192,13 @@ export function pluginLoader(
     // 3. Unregister agent tools
     toolDispatcher.unregisterPluginTools(pluginKey);
 
-    // 4. Stop the worker process
+    // 4. Stop the worker process. Stop any registered handle, not only a
+    //    running one: a handle in crash-recovery backoff, still starting, or
+    //    crashed would otherwise survive the unload. Its backoff timer would
+    //    bring the worker back after the unload, and the next load would fail
+    //    with "Worker already registered".
     try {
-      if (workerManager.isRunning(pluginId)) {
+      if (workerManager.isRunning(pluginId) || workerManager.getWorker(pluginId)) {
         await workerManager.stopWorker(pluginId);
       }
     } catch (err) {
