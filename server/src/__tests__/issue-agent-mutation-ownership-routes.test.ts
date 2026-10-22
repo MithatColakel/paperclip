@@ -35,6 +35,7 @@ const mockIssueService = vi.hoisted(() => ({
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   findMentionedAgents: vi.fn(),
 }));
 

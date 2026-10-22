@@ -1,14 +1,14 @@
 import { conflict, unprocessable } from "../errors.js";
 
 /**
- * Rules that reject an issue update from the stored issue row and the patch
- * alone. `issueService.update` runs them as the authority. The PATCH route runs
- * them again before its own side effects (stopping the assignee's runner goal
- * and cancelling its run), so a request that the update would refuse never
- * stops the assignee's work first.
+ * Rules that reject an issue update from the stored issue row, the patch and
+ * facts the caller looked up. `issueService.update` runs them as the
+ * authority. `issueService.precheckUpdate` runs them, with the rules that read
+ * other rows, before the PATCH route's own side effects (stopping the
+ * assignee's runner goal and cancelling its run), so a request that the update
+ * would refuse never stops the assignee's work first.
  *
- * Keep this module free of database access: the route calls it where no write
- * may have happened yet, and route tests replace the issue service module.
+ * Keep this module free of database access; the service reads the facts.
  */
 
 export const ALL_ISSUE_STATUSES = [

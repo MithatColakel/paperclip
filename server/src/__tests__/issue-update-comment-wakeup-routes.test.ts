@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
   getByIdForUpdate: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),

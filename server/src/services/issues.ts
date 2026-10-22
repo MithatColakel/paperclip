@@ -217,6 +217,29 @@ export {
   type IssueUpdatePrecheckPatch,
 } from "./issue-update-precheck.js";
 
+/** The patch `issueService.update` and `issueService.precheckUpdate` take. */
+export type IssueUpdateData = Partial<typeof issues.$inferInsert> & {
+  labelIds?: string[];
+  blockedByIssueIds?: string[];
+  actorAgentId?: string | null;
+  actorRunId?: string | null;
+  actorRunStopId?: string | null;
+  actorUserId?: string | null;
+  companyGuard?: string;
+};
+
+/** The stored issue fields the update rules read. */
+export type IssueUpdatePrecheckRow = Pick<
+  typeof issues.$inferSelect,
+  | "id"
+  | "companyId"
+  | "parentId"
+  | "status"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "conversationAgentId"
+>;
+
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
@@ -7203,6 +7226,120 @@ export function issueService(db: Db) {
     }
   }
 
+  /**
+   * The rules of `update` that refuse a patch before anything is written, in
+   * the order `update` applies them: the stored row, the patch and other rows
+   * (the new parent, an external-channel binding, blockers and the next
+   * assignees). `update` runs them as the authority; `precheckUpdate` runs the
+   * same function read-only, so the two cannot drift.
+   */
+  async function assertIssueUpdateRules(
+    dbOrTx: any,
+    existing: IssueUpdatePrecheckRow,
+    data: IssueUpdateData,
+  ) {
+    if (data.parentId !== undefined && data.parentId !== existing.parentId) {
+      await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
+    }
+    const externalBinding = issueUpdateChangesAssigneeAgent(existing, data)
+      ? await dbOrTx
+          .select({ id: chatConversations.id })
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.companyId, existing.companyId),
+              eq(chatConversations.issueId, existing.id),
+            ),
+          )
+          .limit(1)
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null)
+      : null;
+    assertIssueUpdatePrecheck(existing, data, {
+      externalChannelConversationId: externalBinding?.id ?? null,
+    });
+
+    if (data.status === "in_progress") {
+      const dependencyReadiness =
+        data.blockedByIssueIds === undefined
+          ? (
+              await listIssueDependencyReadinessMap(
+                dbOrTx,
+                existing.companyId,
+                [existing.id],
+              )
+            ).get(existing.id)
+          : null;
+      const unresolvedBlockerIssueIds =
+        data.blockedByIssueIds !== undefined
+          ? await listUnresolvedBlockerIssueIds(
+              dbOrTx,
+              existing.companyId,
+              data.blockedByIssueIds,
+            )
+          : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
+      if (unresolvedBlockerIssueIds.length > 0) {
+        const unresolvedBlockers = await listUnresolvedBlockerDetails(
+          dbOrTx,
+          existing.companyId,
+          unresolvedBlockerIssueIds,
+          dependencyReadiness?.pendingFinalizeBlockerIssueIds,
+        );
+        throw unprocessable("Issue is blocked by unresolved blockers", {
+          unresolvedBlockerIssueIds,
+          unresolvedBlockers,
+        });
+      }
+    }
+    const nextAssigneeAgentId =
+      data.assigneeAgentId !== undefined
+        ? data.assigneeAgentId
+        : existing.assigneeAgentId;
+    if (
+      nextAssigneeAgentId &&
+      (data.assigneeAgentId !== undefined || data.status === "in_progress")
+    ) {
+      await assertAssignableAgent(
+        dbOrTx as Db,
+        existing.companyId,
+        nextAssigneeAgentId,
+        { kind: "work" },
+      );
+    }
+    if (data.assigneeUserId) {
+      await assertAssignableUser(existing.companyId, data.assigneeUserId);
+    }
+  }
+
+  /**
+   * An agent may not complete a task while a connection review is open.
+   * `update` runs this under the issue row lock; `precheckUpdate` runs it
+   * without the lock.
+   */
+  async function assertNoPendingToolReviewForAgentCompletion(
+    dbOrTx: any,
+    existing: Pick<IssueUpdatePrecheckRow, "id" | "companyId">,
+    data: Pick<IssueUpdateData, "actorAgentId" | "status">,
+  ) {
+    if (!data.actorAgentId || data.status !== "done") return;
+    const [review] = await dbOrTx
+      .select({ id: toolActionRequests.id })
+      .from(toolActionRequests)
+      .where(
+        and(
+          eq(toolActionRequests.companyId, existing.companyId),
+          eq(toolActionRequests.issueId, existing.id),
+          inArray(toolActionRequests.status, ["pending", "approved", "executing"]),
+        ),
+      )
+      .limit(1);
+    if (review) {
+      throw conflict(
+        "This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.",
+        { code: "tool_review_pending", actionRequestId: review.id },
+      );
+    }
+  }
+
   async function assertValidProjectWorkspace(
     companyId: string,
     projectId: string | null | undefined,
@@ -10689,17 +10826,24 @@ export function issueService(db: Db) {
       });
     },
 
+    /**
+     * Read-only. Throws the error `update` would return for `data` from the
+     * rules it applies before writing, in the same order, without the issue
+     * row lock. The PATCH route calls it before it stops the assignee's
+     * runner goal or cancels a run, so a refused request leaves that work
+     * alone. `update` stays the authority and runs the same rules again.
+     */
+    precheckUpdate: async (
+      existing: IssueUpdatePrecheckRow,
+      data: IssueUpdateData,
+    ) => {
+      await assertIssueUpdateRules(db, existing, data);
+      await assertNoPendingToolReviewForAgentCompletion(db, existing, data);
+    },
+
     update: async (
       id: string,
-      data: Partial<typeof issues.$inferInsert> & {
-        labelIds?: string[];
-        blockedByIssueIds?: string[];
-        actorAgentId?: string | null;
-        actorRunId?: string | null;
-        actorRunStopId?: string | null;
-        actorUserId?: string | null;
-        companyGuard?: string;
-      },
+      data: IssueUpdateData,
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
@@ -10726,26 +10870,9 @@ export function issueService(db: Db) {
         .where(idPredicate)
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
-      if (data.parentId !== undefined && data.parentId !== existing.parentId) {
-        await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
-      }
-      const externalBinding = issueUpdateChangesAssigneeAgent(existing, data)
-        ? await dbOrTx
-            .select({ id: chatConversations.id })
-            .from(chatConversations)
-            .where(
-              and(
-                eq(chatConversations.companyId, existing.companyId),
-                eq(chatConversations.issueId, existing.id),
-              ),
-            )
-            .limit(1)
-            .then((rows: Array<{ id: string }>) => rows[0] ?? null)
-        : null;
-      // The PATCH route runs the same rules before it stops the assignee's work.
-      assertIssueUpdatePrecheck(existing, data, {
-        externalChannelConversationId: externalBinding?.id ?? null,
-      });
+      // `precheckUpdate` runs the same rules before the PATCH route stops the
+      // assignee's work.
+      await assertIssueUpdateRules(dbOrTx, existing, data);
 
       const {
         labelIds: nextLabelIds,
@@ -10811,65 +10938,6 @@ export function issueService(db: Db) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
       }
 
-      const nextAssigneeAgentId =
-        issueData.assigneeAgentId !== undefined
-          ? issueData.assigneeAgentId
-          : existing.assigneeAgentId;
-      const nextAssigneeUserId =
-        issueData.assigneeUserId !== undefined
-          ? issueData.assigneeUserId
-          : existing.assigneeUserId;
-
-      if (patch.status === "in_progress") {
-        const dependencyReadiness =
-          blockedByIssueIds === undefined
-            ? (
-                await listIssueDependencyReadinessMap(
-                  dbOrTx,
-                  existing.companyId,
-                  [id],
-                )
-              ).get(id)
-            : null;
-        const unresolvedBlockerIssueIds =
-          blockedByIssueIds !== undefined
-            ? await listUnresolvedBlockerIssueIds(
-                dbOrTx,
-                existing.companyId,
-                blockedByIssueIds,
-              )
-            : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
-        if (unresolvedBlockerIssueIds.length > 0) {
-          const unresolvedBlockers = await listUnresolvedBlockerDetails(
-            dbOrTx,
-            existing.companyId,
-            unresolvedBlockerIssueIds,
-            dependencyReadiness?.pendingFinalizeBlockerIssueIds,
-          );
-          throw unprocessable("Issue is blocked by unresolved blockers", {
-            unresolvedBlockerIssueIds,
-            unresolvedBlockers,
-          });
-        }
-      }
-      const shouldValidateNextAssignee =
-        Boolean(nextAssigneeAgentId) &&
-        (issueData.assigneeAgentId !== undefined ||
-          patch.status === "in_progress");
-      if (shouldValidateNextAssignee) {
-        await assertAssignableAgent(
-          dbOrTx as Db,
-          existing.companyId,
-          nextAssigneeAgentId,
-          { kind: "work" },
-        );
-      }
-      if (issueData.assigneeUserId) {
-        await assertAssignableUser(
-          existing.companyId,
-          issueData.assigneeUserId,
-        );
-      }
       let nextProjectId =
         issueData.projectId !== undefined
           ? issueData.projectId
@@ -10996,10 +11064,10 @@ export function issueService(db: Db) {
             agentId: actorAgentId, runId: actorRunId, stopId: actorRunStopId,
           });
         }
-        if (actorAgentId && patch.status === "done") {
-          const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
-          if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
-        }
+        await assertNoPendingToolReviewForAgentCompletion(tx, existing, {
+          actorAgentId,
+          status: patch.status,
+        });
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
