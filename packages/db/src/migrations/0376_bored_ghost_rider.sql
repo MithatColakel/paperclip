@@ -1,0 +1,2 @@
+ALTER TABLE "ai_connection_pool_members" DROP CONSTRAINT "ai_connection_pool_members_provider_check";--> statement-breakpoint
+ALTER TABLE "ai_connection_pool_members" ADD CONSTRAINT "ai_connection_pool_members_provider_check" CHECK ("ai_connection_pool_members"."provider" in ('anthropic','openai','openrouter','xai','google','github'));

@@ -35,6 +35,10 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/authorization.js", async (importActual) => ({
+    ...await importActual<typeof import("../services/authorization.js")>(),
+    canActorReadApproval: async () => true,
+  }));
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     approvalService: () => mockApprovalService,
@@ -263,7 +267,10 @@ describe("approval routes idempotent retries", () => {
       .send({ decidedByUserId: "forged-user", decisionNote: "ship it" });
 
     expect(res.status).toBe(200);
-    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-4", "user-1", "ship it");
+    // Fork: a hire's approval also carries the account pool's check of its activation.
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-4", "user-1", "ship it", expect.objectContaining({
+      beforeActivate: expect.any(Function),
+    }));
   });
 
   it("lets the approver pick where a hired agent runs", async () => {
@@ -293,9 +300,10 @@ describe("approval routes idempotent retries", () => {
       .send({ defaultEnvironmentId: environmentId });
 
     expect(res.status).toBe(200);
-    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-env", "user-1", undefined, {
+    expect(mockApprovalService.approve).toHaveBeenCalledWith("approval-env", "user-1", undefined, expect.objectContaining({
       payloadPatch: { defaultEnvironmentId: environmentId },
-    });
+      beforeActivate: expect.any(Function),
+    }));
   });
 
   it("refuses another company's environment or a non-hire approval", async () => {

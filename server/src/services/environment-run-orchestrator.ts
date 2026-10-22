@@ -206,6 +206,7 @@ export function environmentRunOrchestrator(
   async function acquireLease(input: {
     companyId: string;
     environment: Environment;
+    configuredEnvironment?: Environment;
     issueId: string | null;
     agentId: string;
     heartbeatRunId: string;
@@ -278,6 +279,8 @@ export function environmentRunOrchestrator(
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
     /** Fork: the run's project (null without one), sent only to driver plugins that opt in (spec 9.2). */
     projectId?: string | null;
+    /** Existing live runner recovery must use its original active lease, including ephemeral leases. */
+    reattachRemoteLease?: { leaseId: string; providerLeaseId: string; remoteCwd: string };
   }): Promise<EnvironmentAcquisitionResult> {
     // Step 1: Resolve environment
     const selectedEnvironment = await resolveEnvironment({
@@ -291,9 +294,10 @@ export function environmentRunOrchestrator(
     );
 
     // Step 2: Acquire lease
-    const leaseRecord = await acquireLease({
+    const acquisitionInput = {
       companyId: input.companyId,
       environment,
+      configuredEnvironment: selectedEnvironment,
       issueId: input.issueId,
       agentId: input.agentId,
       heartbeatRunId: input.heartbeatRunId,
@@ -301,7 +305,29 @@ export function environmentRunOrchestrator(
       executionWorkspaceSettings: input.executionWorkspaceSettings,
       adapterType: input.adapterType ?? null,
       projectId: input.projectId,
-    });
+    };
+    let leaseRecord: EnvironmentRuntimeLeaseRecord;
+    if (input.reattachRemoteLease) {
+      // Reattachment is inspection of an already running sandbox, never a new
+      // acquisition or a lifecycle resume. Those paths can create a replacement
+      // when the admitted per-turn policy deliberately disables reusable leases.
+      const expected = input.reattachRemoteLease;
+      const lease = await environmentsSvc.getLeaseById(expected.leaseId);
+      if (!lease || environment.driver !== "sandbox" ||
+          lease.companyId !== input.companyId || lease.environmentId !== environment.id ||
+          lease.heartbeatRunId !== input.heartbeatRunId || lease.issueId !== input.issueId ||
+          lease.executionWorkspaceId !== (input.persistedExecutionWorkspace?.id ?? null) ||
+          lease.metadata?.agentId !== input.agentId || lease.status !== "active" ||
+          lease.releasedAt !== null || lease.cleanupStatus !== null ||
+          (lease.expiresAt !== null && new Date(lease.expiresAt).getTime() <= Date.now()) ||
+          lease.provider !== environment.config.provider || lease.providerLeaseId !== expected.providerLeaseId ||
+          lease.metadata?.remoteCwd !== expected.remoteCwd) {
+        throw new Error("native_remote_recovery_lease_mismatch");
+      }
+      leaseRecord = { environment, lease, leaseContext: buildEnvironmentLeaseContext(input) };
+    } else {
+      leaseRecord = await acquireLease(acquisitionInput);
+    }
 
     // Step 3: Log lease acquisition activity
     await logActivity(db, {
@@ -381,6 +407,15 @@ export function environmentRunOrchestrator(
     } = input;
     let { lease, persistedExecutionWorkspace } = input;
 
+    if (executionWorkspace.providerBinding) {
+      const binding = executionWorkspace.providerBinding;
+      if (environment.driver !== "plugin" || adapterType !== "paperclip_runner" || lease.metadata?.pluginId !== binding.pluginId || !await environmentRuntime.supportsTasks({ lease })) {
+        throw new EnvironmentRunError("workspace_realization_failed", "The execution plugin cannot access this managed workspace.", { environmentId: environment.id });
+      }
+      const updated = await environmentsSvc.updateLeaseMetadata(lease.id, { ...lease.metadata, workspaceProvider: binding });
+      if (!updated) throw new Error("Workspace execution lease disappeared");
+      lease = updated;
+    }
     // Step 1: Build workspace realization request
     const workspaceRealizationRequest = buildWorkspaceRealizationRequest({
       adapterType,
@@ -461,7 +496,7 @@ export function environmentRunOrchestrator(
         "Skip host provisionCommand for sandbox-driver environment; the adapter stage.sync step delivers the provisioned tree",
       );
     }
-    if (provisionCommand && !driverSkipsHostProvision) {
+    if (provisionCommand && !executionWorkspace.providerBinding && !driverSkipsHostProvision) {
       try {
         const provisionResult = await environmentRuntime.execute({
           environment,
@@ -535,6 +570,11 @@ export function environmentRunOrchestrator(
         environmentRuntime,
         duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       });
+      // The native plugin task bridge owns guest paths. Never fall back to host execution.
+      if (executionWorkspace.providerBinding && (executionTarget?.kind !== "remote" ||
+          !("runnerTask" in executionTarget) || typeof executionTarget.runnerTask !== "function")) {
+        throw new Error("Managed workspace execution requires the native plugin task bridge");
+      }
       const realizationMode = workspaceRealization.mode === "in_place" ? "in_place" : "copy";
       const authoritativeRoot =
         typeof workspaceRealization.authoritativeRoot === "string" && workspaceRealization.authoritativeRoot.trim().length > 0

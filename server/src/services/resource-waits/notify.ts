@@ -27,6 +27,7 @@ import {
   type ResourceWaitReason,
 } from "@paperclipai/shared";
 import { logActivity } from "../activity-log.js";
+import { issueReadSqlCondition } from "../authorization.js";
 import { deviceForEnvironment, runningPoolAccountsOnDevice } from "../execution-devices.js";
 import { agentLinkRow, keyValueRow, runLinkRow, systemNoticePresentation } from "../recovery/notice-format.js";
 import { logger } from "../../middleware/logger.js";
@@ -54,7 +55,8 @@ import type { ResourceWaitDeps, ResourceWaitEpisodeRow } from "./types.js";
  *   issue id (an issue-scoped wake would wait behind the waiting run's issue
  *   lock), skipped when the PM would only wait too: it shares the account or
  *   the unavailable device, or it would need a new slot on a device whose
- *   slots are full.
+ *   slots are full. Its list of waiting tasks names only tasks the PM may
+ *   read (private tasks).
  *
  * An account's label appears only where its owner is an active member of the
  * company; elsewhere notices say "an account that is no longer available in
@@ -522,14 +524,18 @@ export function createResourceWaitNotifier(options: ResourceWaitNotifierOptions)
     const { episode } = facts;
     const key = pmNoticeKey(pm.id, episode.kind, episode.resourceKey, resourceEpisodeKeyFromFacts(facts));
     return onceForKey(db, episode.companyId, key, now, async () => {
+      // Only tasks the PM may read (private tasks, doc/ISSUE-PRIVACY.md): their ids go into its prompt.
+      const pmCanRead = await issueReadSqlCondition(db, { type: "agent", agentId: pm.id, companyId: pm.companyId });
       const waiting = await db
         .select({ issueId: resourceWaitEpisodes.issueId })
         .from(resourceWaitEpisodes)
+        .innerJoin(issues, and(eq(issues.id, resourceWaitEpisodes.issueId), eq(issues.companyId, resourceWaitEpisodes.companyId)))
         .where(and(
           eq(resourceWaitEpisodes.companyId, episode.companyId),
           eq(resourceWaitEpisodes.resourceKey, episode.resourceKey),
           isNull(resourceWaitEpisodes.resolvedAt),
           isNotNull(resourceWaitEpisodes.issueId),
+          pmCanRead,
         ))
         .orderBy(asc(resourceWaitEpisodes.since))
         .limit(PM_ISSUE_LIMIT);

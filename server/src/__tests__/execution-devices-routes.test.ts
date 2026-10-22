@@ -182,7 +182,7 @@ describeEmbeddedPostgres("execution device routes", () => {
       since: new Date(Date.now() - 600_000),
       currentRunId: run!.id,
     });
-    return { run: run!, due };
+    return { run: run!, due, task: task! };
   }
 
   async function dueAt(runId: string) {
@@ -293,6 +293,52 @@ describeEmbeddedPostgres("execution device routes", () => {
     // An instance admin who is a viewer here is a company admin (D4) and may check.
     await db.delete(resourceWaitNotices).where(eq(resourceWaitNotices.companyId, a));
     expect((await request(server_).post(`/api/companies/${a}/devices/${server.id}/check-now`).set("x-actor", "ia-viewer")).status).toBe(200);
+  });
+
+  it("names a waiting private task only to members who may read it, and still counts its wait", async () => {
+    const { a, a1, server, server_ } = await world();
+    // alpha-member's private task waits on the server, next to an open task (doc/ISSUE-PRIVACY.md).
+    const secret = await waitOn(a1, localEnvironment.id, server.id);
+    await db.update(issues)
+      .set({ title: "Acquisition of X", visibility: "private", privacyRootIssueId: secret.task.id, createdByUserId: "alpha-member", responsibleUserId: "alpha-member" })
+      .where(eq(issues.id, secret.task.id));
+    const open = await waitOn(a1, localEnvironment.id, server.id);
+    type Waits = { waits: Array<{ runId: string }> };
+    const waitOf = (body: Waits, runId: string) => body.waits.find((wait) => wait.runId === runId);
+    const redacted = { runId: secret.run.id, agentId: a1.id, agentName: a1.name, issueId: null, issueIdentifier: null, issueTitle: null, kind: "environment", reason: "busy" };
+    const expectNoSecret = (body: unknown) => {
+      expect(JSON.stringify(body)).not.toContain("Acquisition of X");
+      expect(JSON.stringify(body)).not.toContain(secret.task.id);
+    };
+
+    // A viewer and the company owner are not participants: the wait shows under its agent, and still counts.
+    for (const viewer of ["alpha-viewer", "alpha-admin"]) {
+      const listed = await request(server_).get(`/api/companies/${a}/devices`).set("x-actor", viewer);
+      expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+      const device = listed.body.devices.find((entry: { id: string }) => entry.id === server.id);
+      expect(device.waitingCount).toBe(2);
+      expect(waitOf(device, secret.run.id)).toMatchObject(redacted);
+      expect(waitOf(device, open.run.id)).toMatchObject({ issueId: open.task.id, issueTitle: open.task.title });
+      expectNoSecret(listed.body);
+      const detail = await request(server_).get(`/api/companies/${a}/devices/${server.id}`).set("x-actor", viewer);
+      expect(detail.status).toBe(200);
+      expect(detail.body.waitingCount).toBe(2);
+      expect(waitOf(detail.body, secret.run.id)).toMatchObject(redacted);
+      expectNoSecret(detail.body);
+    }
+
+    // Its creator, and an instance admin, see the task.
+    for (const reader of ["alpha-member", "ia-viewer"]) {
+      const detail = await request(server_).get(`/api/companies/${a}/devices/${server.id}`).set("x-actor", reader);
+      expect(detail.status).toBe(200);
+      expect(waitOf(detail.body, secret.run.id)).toMatchObject({ issueId: secret.task.id, issueTitle: "Acquisition of X" });
+    }
+
+    // "Check now" answers with the device as the caller may see it.
+    const checked = await request(server_).post(`/api/companies/${a}/devices/${server.id}/check-now`).set("x-actor", "alpha-admin");
+    expect(checked.status, JSON.stringify(checked.body)).toBe(200);
+    expect(waitOf(checked.body.device, secret.run.id)).toMatchObject(redacted);
+    expectNoSecret(checked.body);
   });
 
   it("reads wait settings for members and lets only company admins change them", async () => {

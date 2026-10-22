@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -90,6 +92,15 @@ describeEmbeddedPostgres("orphaned deferred wake promotion", () => {
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    // A promoted run acts for its responsible user, who must be an active
+    // member of the company; otherwise its setup fails before the adapter.
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "orphaned-deferred-wakes@example.test", createdAt: now, updatedAt: now,
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     await db.insert(agents).values([
       {

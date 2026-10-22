@@ -187,3 +187,36 @@ For each linked issue, either:
 - Short role drafting guide: `skills/paperclip-create-agent/references/baseline-role-guide.md`
 - Pre-submit draft-review checklist: `skills/paperclip-create-agent/references/draft-review-checklist.md`
 - Endpoint payload shapes and full examples: `skills/paperclip-create-agent/references/api-reference.md`
+
+## Harness and runner selection
+
+Choose the underlying harness in `adapterType`, such as `codex_local` or
+`claude_local`. New Codex agents use Paperclip Runner automatically on supported
+execution targets; unknown or unsupported targets retain Legacy. New Claude Code
+agents stay on Legacy (`claude_local`) so they can use the company's Claude
+accounts, device logins and usage-limit waits; `runner: "paperclip"` chooses
+Paperclip Runner explicitly on a qualified target (Apple Silicon, Intel Mac,
+Linux x64 and Linux ARM64 with supported glibc; Darwin SSH also needs matching
+remote assets). The runner is chosen for the device the agent will run on: its
+own `defaultEnvironmentId`, else the company's default device, else the
+instance default. The native Claude profile is
+`provider: acpx`, `acpxAgent: claude`, with ordinary model `claude-opus-5-5`.
+Explicit models and existing saved runners remain intact. The saved response
+may therefore have `adapterType: paperclip_runner` and a resolved provider;
+use that returned configuration for later reads and edits.
+
+The optional creation field `runner` accepts `auto`, `paperclip`, or `legacy`.
+Use `legacy` when the user needs CLI settings the native runtime cannot honor.
+For Claude this includes Chrome, custom commands/state paths, warm-process
+controls, confinement and turn limits. Native Claude uses existing API-key and
+subscription connections. Its configured effort requires provider acknowledgment. Setup and authentication errors never silently change runners.
+Existing agents keep their saved execution after unrelated edits. An approved
+hire uses the configuration reviewed by the board. If the board approves it
+onto a device where Paperclip Runner cannot run, an automatic runner choice is
+approved on Legacy instead, and an explicit `runner: "paperclip"` (or a
+`paperclip_runner` config) is refused until the board picks another device or
+asks for a revision. `inheritRuntimeFrom: caller`
+keeps its existing runtime inheritance and credential restrictions.
+
+CLI equivalents: `paperclipai agent create --runner legacy --payload-json ...`
+and `paperclipai agent hire --runner legacy --payload-json ...`.

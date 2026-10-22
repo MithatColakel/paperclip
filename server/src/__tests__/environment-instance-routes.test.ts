@@ -134,6 +134,26 @@ function createApp(actor: Record<string, unknown>) {
 const OWNER_COMPANY_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("environment instance routes", () => {
+  it.each(["post", "patch"])("rejects client-written sandbox platform evidence on %s", async method => {
+    mockEnvironmentService.getById.mockResolvedValue(createEnvironment());
+    const app = createApp({ type: "board", source: "local_implicit", isInstanceAdmin: true });
+    const payload = { ...(method === "post" ? { name: "Fixture", driver: "local", config: {} } : {}), metadata: { paperclipSandboxPlatformProbes: { "company-1": { v: 1 } } } };
+    const res = method === "post" ? await request(app).post("/api/companies/company-1/environments").send(payload)
+      : await request(app).patch("/api/environments/env-1").send(payload);
+    expect(res.status).toBe(422);
+    expect(res.body.details?.code ?? res.body.code).toBe("environment_platform_probe_reserved");
+    expect(mockEnvironmentService.create).not.toHaveBeenCalled();
+  });
+  it.each([null, { userNote: "replacement" }])("passes explicit user metadata replacement through without copying an old probe (%j)", async metadata => {
+    const existing = createEnvironment({ metadata: { userNote: "old", paperclipSandboxPlatformProbes: { "company-1": { v: 1, marker: "stale" } } } });
+    mockEnvironmentService.getById.mockResolvedValue(existing);
+    mockEnvironmentService.update.mockResolvedValue({ ...existing, metadata });
+    const app = createApp({ type: "board", source: "local_implicit", isInstanceAdmin: true });
+    const res = await request(app).patch("/api/environments/env-1").send({ metadata });
+    expect(res.status).toBe(200);
+    expect(mockEnvironmentService.update).toHaveBeenCalledExactlyOnceWith("env-1", { metadata }, { db: expect.anything() });
+    expect(res.body.metadata).toEqual(metadata);
+  });
   beforeEach(() => {
     mockIssueService.clearExecutionWorkspaceEnvironmentSelection.mockReset();
     mockProjectService.clearExecutionWorkspaceEnvironmentSelection.mockReset();

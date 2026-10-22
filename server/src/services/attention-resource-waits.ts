@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, sql, type SQL } from "drizzle-orm";
 import {
   type Db,
   agents,
@@ -51,11 +51,14 @@ import {
  * by `resourceEpisodeKeyOf`, so a failed probe, a replacement run or a second
  * waiting task never adds a row. Skipped: episodes whose current run is no
  * longer live (the issue gate cancelled it), episodes of closed or hidden
- * tasks, reasons that never notify (`stopped`, `auth_unconfirmed`), and
- * device outages younger than the company's notify-after hours. An item
- * disappears when its episodes resolve. No board recovery action is ever
- * created, and an account's label appears only where its owner is an active
- * member of the company.
+ * tasks, episodes of tasks the viewer cannot read (private tasks,
+ * doc/ISSUE-PRIVACY.md: dropped like upstream's own feed sources drop them, so
+ * no title, identifier, project, workspace, task or run id of theirs reaches an
+ * item, nor their count), reasons that never notify (`stopped`,
+ * `auth_unconfirmed`), and device outages younger than the company's
+ * notify-after hours. An item disappears when its episodes resolve. No board
+ * recovery action is ever created, and an account's label appears only where
+ * its owner is an active member of the company.
  */
 
 /** What attention.ts's `createItem` takes for one resource-wait item. */
@@ -158,8 +161,12 @@ function readDeviceNotices(value: unknown): DeviceNotice[] {
  * wait settings, its device notices that still match their device's flag, and
  * every open episode with what its item needs: the current run, the agent, the
  * task, the account, the device, the environment and its registry row.
+ * `readCondition` (the viewer's `issueReadSqlCondition`) sits in the task's
+ * join, not in the filter: a task the viewer cannot read joins as no task (so
+ * its project and workspace too) and the caller skips its episode, while the
+ * company row, its device notices and its settings still come back.
  */
-function loadCompanyWaits(db: Db, companyId: string) {
+function loadCompanyWaits(db: Db, companyId: string, readCondition: SQL<boolean> = sql<boolean>`true`) {
   const accountOwner = sql<string | null>`coalesce(${aiAccounts.ownerUserId}, ${aiAccounts.createdByUserId})`;
   return db
     .select({
@@ -237,7 +244,7 @@ function loadCompanyWaits(db: Db, companyId: string) {
     .leftJoin(resourceWaitEpisodes, and(eq(resourceWaitEpisodes.companyId, companies.id), isNull(resourceWaitEpisodes.resolvedAt)))
     .leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, resourceWaitEpisodes.currentRunId), eq(heartbeatRuns.companyId, companies.id)))
     .leftJoin(agents, and(eq(agents.id, resourceWaitEpisodes.agentId), eq(agents.companyId, companies.id)))
-    .leftJoin(issues, and(eq(issues.id, resourceWaitEpisodes.issueId), eq(issues.companyId, companies.id)))
+    .leftJoin(issues, and(eq(issues.id, resourceWaitEpisodes.issueId), eq(issues.companyId, companies.id), readCondition))
     .leftJoin(projects, and(eq(projects.id, issues.projectId), eq(projects.companyId, companies.id)))
     .leftJoin(projectWorkspaces, and(eq(projectWorkspaces.id, issues.projectWorkspaceId), eq(projectWorkspaces.companyId, companies.id)))
     .leftJoin(aiAccounts, eq(aiAccounts.id, resourceWaitEpisodes.accountId))
@@ -402,15 +409,17 @@ function overLimitText(notice: DeviceNotice, waiting: number): ItemText {
 
 /**
  * The company's resource-wait inbox items (one query). `prefix` is the
- * company's issue prefix, `now` the feed's clock.
+ * company's issue prefix, `now` the feed's clock, `readCondition` the viewer's
+ * task read predicate (`issueReadSqlCondition`; every task when omitted, for
+ * system callers).
  */
 export async function resourceWaitAttentionInputs(
   db: Db,
   companyId: string,
-  options: { prefix: string; now?: number | Date; deploymentMode?: DeploymentMode; env?: NodeJS.ProcessEnv },
+  options: { prefix: string; now?: number | Date; deploymentMode?: DeploymentMode; env?: NodeJS.ProcessEnv; readCondition?: SQL<boolean> },
 ): Promise<ResourceWaitAttentionInput[]> {
   const now = options.now === undefined ? new Date() : new Date(options.now);
-  const rows = await loadCompanyWaits(db, companyId);
+  const rows = await loadCompanyWaits(db, companyId, options.readCondition);
   if (rows.length === 0) return [];
   const deploymentMode = deploymentModeOf(options.deploymentMode);
   const notifyHours = rows[0]!.notifyAfterHours ?? instanceDefaultNotifyHours(options.env);
@@ -420,6 +429,7 @@ export async function resourceWaitAttentionInputs(
     if (!isWaitRow(row)) continue;
     // The issue gate cancelled the current run, or it ended: its episode is about to close.
     if (!row.runStatus || !LIVE_RUN_STATUSES.has(row.runStatus)) continue;
+    // A task with no status is gone, or one the viewer cannot read (it joined as no task).
     if (row.issueId && (!row.issueStatus || CLOSED_ISSUE_STATUSES.has(row.issueStatus) || row.issueHiddenAt)) continue;
     const policy = RESOURCE_WAIT_NOTICE_POLICY[row.reason];
     if (policy === "never") continue;

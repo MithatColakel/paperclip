@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
+  agentHarnessType,
   approveApprovalSchema,
   createApprovalSchema,
   supportedEnvironmentDriversForAdapter,
@@ -22,12 +23,17 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
-import { unprocessable } from "../errors.js";
+import { HttpError, unprocessable } from "../errors.js";
 import { environmentService } from "../services/environments.js";
-import { aiAccountPoolService } from "../services/ai-account-pool.js";
+import { aiAccountPoolService, type PlacementMove } from "../services/ai-account-pool.js";
+import { isAdapterDisabled } from "../services/adapter-plugin-store.js";
+import { agentRunnerAvailability, resolveAgentRunnerTargetForCompany, resolveNewAgentRunner } from "../services/agent-runner-selection.js";
+import { isPlainRecord } from "../lib/agent-records.js";
+import { resolvableApprovalStatuses } from "../lib/approval-records.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
+import { approvalReadSqlCondition, canActorReadApproval } from "../services/authorization.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
@@ -51,6 +57,15 @@ export function approvalRoutes(
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
 ) {
   const router = Router();
+  router.param("id", async (req, res, next, id) => {
+    try {
+      if (!(await canActorReadApproval(db, req.actor, id))) {
+        res.status(404).json({ error: "Approval not found" });
+        return;
+      }
+      next();
+    } catch (error) { next(error); }
+  });
   const svc = approvalService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -62,6 +77,72 @@ export function approvalRoutes(
   // Fork: the Claude account pool's placement rules (spec 5.6).
   const aiAccountPool = aiAccountPoolService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  /**
+   * Fork: a hire's runner is resolved for the device it asked for (the hire
+   * route records the runner choice in the payload). When the board picks the
+   * device at approval (null: the company's default), a Codex or Claude hire
+   * on Paperclip Runner is checked against that device before anything is
+   * written. Where Paperclip Runner cannot run, an automatic choice
+   * (`runner: "auto"`) falls back to Legacy, as it would have at hire; any
+   * other hire asked for Paperclip Runner and is refused. Returns the payload
+   * fields the approval changes.
+   */
+  async function hireRunnerForPickedEnvironment(
+    companyId: string,
+    payload: Record<string, unknown>,
+    environmentId: string | null,
+  ): Promise<Record<string, unknown>> {
+    const adapterConfig = isPlainRecord(payload.adapterConfig) ? payload.adapterConfig : {};
+    const harness = agentHarnessType("paperclip_runner", adapterConfig);
+    if (payload.adapterType !== "paperclip_runner" || (harness !== "codex_local" && harness !== "claude_local")) return {};
+    let supported = false;
+    let probed = true;
+    try {
+      const target = await resolveAgentRunnerTargetForCompany(db, companyId, environmentId, harness);
+      supported = agentRunnerAvailability(harness, target).supportedRunners.includes("paperclip");
+    } catch (error) {
+      // An SSH host that cannot be reached leaves its platform unknown.
+      const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
+      if (code !== "agent_runner_platform_probe_failed") throw error;
+      probed = false;
+    }
+    if (supported) return {};
+    if (payload.runner !== "auto") {
+      throw probed
+        ? unprocessable("This hire asks for Paperclip Runner, which cannot run on the chosen environment. Choose another environment, or request a revision for Legacy runner.", { code: "agent_runner_unavailable" })
+        : unprocessable("Could not check the chosen SSH host's platform for this hire's Paperclip Runner. Check its connection and retry, or choose another environment.", { code: "agent_runner_platform_probe_failed" });
+    }
+    const legacy = resolveNewAgentRunner({ adapterType: "paperclip_runner", adapterConfig, runner: "legacy" });
+    if (isAdapterDisabled(legacy.adapterType)) {
+      throw unprocessable(`${harness === "claude_local" ? "Claude" : "Codex"} is disabled on this instance, and Paperclip Runner cannot run this hire on the chosen environment.`, { code: "agent_runner_unavailable" });
+    }
+    return { adapterType: legacy.adapterType, adapterConfig: legacy.adapterConfig };
+  }
+
+  /**
+   * Fork: approving a hire passes the account pool's placement checks (spec
+   * 5.6). When the approved payload moves a pending agent that holds a pool
+   * account, they run under the bindings lock in the transaction that decides
+   * the approval, before activation writes the environment, so a refusal
+   * leaves the approval and the agent as they were. The move's wakes and the
+   * cap re-check of the devices the agent left must read the committed
+   * activation: the caller runs `afterCommit` once the approval has returned.
+   */
+  function hirePlacementCheck(req: Request): {
+    beforeActivate: (tx: Db, approval: { companyId: string; payload: unknown }) => Promise<void>;
+    afterCommit: () => Promise<void>;
+  } {
+    let move: PlacementMove | null = null;
+    return {
+      beforeActivate: async (tx, approval) => {
+        move = await aiAccountPool.checkHireActivationInWrite(tx, req.actor, approval);
+      },
+      afterCommit: async () => {
+        if (move) await aiAccountPool.afterPlacementMove(move);
+      },
+    };
+  }
 
   async function lostReviewPathIssueIds(
     companyId: string,
@@ -215,7 +296,7 @@ export function approvalRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     const status = req.query.status as string | undefined;
-    const result = await svc.list(companyId, status);
+    const result = await svc.list(companyId, status, await approvalReadSqlCondition(db, req.actor));
     res.json(result.map((approval) => redactApprovalPayload(approval)));
   });
 
@@ -300,6 +381,7 @@ export function approvalRoutes(
     }
     const decidedByUserId = req.actor.userId ?? "board";
     let payloadPatch: Record<string, unknown> | undefined;
+    let placement: ReturnType<typeof hirePlacementCheck> | undefined;
     const pending = await svc.getById(id);
     if (req.body.defaultEnvironmentId !== undefined && pending?.type !== "hire_agent") {
       throw unprocessable("An environment can only be chosen when approving a hire.");
@@ -323,15 +405,23 @@ export function approvalRoutes(
         environmentId,
         { allowedDrivers: supportedEnvironmentDriversForAdapter(adapterType) },
       );
-      // Fork: a pool-bound hire's environment pick passes the placement checks (spec 5.6).
-      await aiAccountPool.placeHireForApproval(req.actor, pending, req.body.defaultEnvironmentId);
+      // Fork: the runner follows the board's device pick. Checked before
+      // anything is written; a decided approval is left to the idempotent
+      // approve.
+      const runnerPatch = req.body.defaultEnvironmentId !== undefined && resolvableApprovalStatuses.includes(pending.status)
+        ? await hireRunnerForPickedEnvironment(pending.companyId, payload, req.body.defaultEnvironmentId)
+        : {};
       if (req.body.defaultEnvironmentId !== undefined) {
-        payloadPatch = { defaultEnvironmentId: req.body.defaultEnvironmentId };
+        payloadPatch = { ...runnerPatch, defaultEnvironmentId: req.body.defaultEnvironmentId };
       }
+      // Fork: a pool-bound hire's move passes the placement checks inside its activation (spec 5.6).
+      placement = hirePlacementCheck(req);
     }
-    const { approval, applied } = payloadPatch
-      ? await svc.approve(id, decidedByUserId, req.body.decisionNote, { payloadPatch })
+    const { approval, applied } = placement
+      ? await svc.approve(id, decidedByUserId, req.body.decisionNote, { payloadPatch, beforeActivate: placement.beforeActivate })
       : await svc.approve(id, decidedByUserId, req.body.decisionNote);
+    // Fork: the move's wakes and device re-check, now that the activation has committed.
+    await placement?.afterCommit();
 
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);

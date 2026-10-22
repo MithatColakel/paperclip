@@ -6,6 +6,7 @@ import {
   FlaskConical,
   KeyRound,
   Laptop,
+  Link2,
   MonitorCog,
   Puzzle,
   ServerCog,
@@ -159,6 +160,7 @@ export function CompanySettingsSidebar() {
               end
             />
           )}
+          <SidebarNavItem to="/company/settings/connections" label="Connections" icon={Link2} end />
           {showPage("instance.access") && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/access`}

@@ -8,6 +8,7 @@ import {
   aiAccountHosts,
   aiAccountProjects,
   aiAccounts,
+  approvals,
   authUsers,
   companies,
   companyMemberships,
@@ -36,9 +37,13 @@ import {
   mayEditBinding,
   poolPlacementOf,
   recheckDeviceLimits,
+  type PlacementMove,
   type PoolActor,
   type PoolContext,
 } from "../services/ai-account-pool.js";
+import { agentService } from "../services/agents.js";
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { approvalService } from "../services/approvals.js";
 import { credentialHint, credentialRefForAccount } from "../services/ai-account-credentials.js";
 import { deviceForEnvironment, upsertPluginTargetByTargetKey } from "../services/execution-devices.js";
 import { readWakeEpochs } from "../services/resource-waits/epochs.js";
@@ -424,17 +429,54 @@ describeEmbeddedPostgres("account pool service (database)", () => {
       expect(await pool.savePlacement({ type: "agent", agentId: mover1.id }, mover1, { name: "Renamed" }, async () => "plain")).toBe("plain");
     });
 
-    it("checks and writes a pool-bound hire's environment before approval activates it", async () => {
-      const { companyId, crowded, a3 } = await fullDevice();
-      const pending = await agent(companyId, { status: "pending_approval" });
-      await bind(pending, a3.id);
-      await db.insert(aiAccountAgentBindings).values({ agentId: (await agent(companyId, { defaultEnvironmentId: crowded.id })).id, companyId, mode: "pool_account", accountId: (await account("o5")).id });
-      const approval = { companyId, type: "hire_agent", status: "pending", payload: { agentId: pending.id, defaultEnvironmentId: crowded.id } };
-      await expect(pool.placeHireForApproval(board("admin", [[companyId, "admin"]]), approval, undefined))
-        .rejects.toMatchObject({ status: 409, details: { code: "device_account_limit" } });
-      await pool.placeHireForApproval(board("admin", [[companyId, "admin"]]), approval, localEnvironment.id);
-      const [row] = await db.select({ defaultEnvironmentId: agents.defaultEnvironmentId }).from(agents).where(eq(agents.id, pending.id));
-      expect(row!.defaultEnvironmentId).toBe(localEnvironment.id);
+    /** Approves a hire as the approvals route does, with the pool's check of its activation. */
+    function approveHire(actor: PoolActor, approvalId: string, payloadPatch?: Record<string, unknown>) {
+      let move: PlacementMove | null | undefined;
+      return approvalService(db).approve(approvalId, "board", null, {
+        payloadPatch,
+        beforeActivate: async (tx, approved) => { move = await pool.checkHireActivationInWrite(tx, actor, approved); },
+      }).then((result) => ({ ...result, move }));
+    }
+
+    it("checks a pool-bound hire's move inside its approval, which activation writes, and re-checks the devices it left after the commit", async () => {
+      const { companyId, crowded, quiet } = await fullDevice();
+      const admin = board("admin", [[companyId, "admin"]]);
+      // A third account fills the crowded device; the hire's own makes three on the quiet one.
+      await bind(await agent(companyId, { defaultEnvironmentId: crowded.id }), (await account("o1")).id);
+      const pending = await agent(companyId, { status: "pending_approval", defaultEnvironmentId: quiet.id });
+      await bind(pending, (await account("o5")).id);
+      const [approval] = await db.insert(approvals).values({
+        companyId, type: "hire_agent", status: "pending", payload: { agentId: pending.id, defaultEnvironmentId: crowded.id },
+      }).returning();
+      const current = async () => ({
+        approval: (await db.select({ status: approvals.status }).from(approvals).where(eq(approvals.id, approval!.id)))[0]!.status,
+        agent: (await db.select({ status: agents.status, defaultEnvironmentId: agents.defaultEnvironmentId }).from(agents).where(eq(agents.id, pending.id)))[0]!,
+      });
+      const before = await readWakeEpochs(db, { environmentId: quiet.id, agentId: pending.id });
+
+      // Onto the full device: refused, and neither the approval nor the hire changes.
+      await expect(approveHire(admin, approval!.id)).rejects.toMatchObject({ status: 409, details: { code: "device_account_limit" } });
+      expect(await current()).toEqual({ approval: "pending", agent: { status: "pending_approval", defaultEnvironmentId: quiet.id } });
+
+      // Lowered to two accounts, the quiet device is over its limit until the hire leaves it.
+      const device = (await deviceForEnvironment(db, quiet))!;
+      await db.update(aiAccountHosts).set({ maxAccounts: 2 }).where(eq(aiAccountHosts.id, device.id));
+      expect(await recheckDeviceLimits(db, { deviceIds: [device.id] })).toEqual([expect.objectContaining({ inUse: 3, change: "flagged" })]);
+      const overLimitAt = async () => (await db.select({ overLimitAt: aiAccountHosts.overLimitAt }).from(aiAccountHosts).where(eq(aiAccountHosts.id, device.id)))[0]!.overLimitAt;
+
+      const { applied, move } = await approveHire(admin, approval!.id, { defaultEnvironmentId: localEnvironment.id });
+      expect(applied).toBe(true);
+      expect(move).toEqual({ agentId: pending.id, companyId, previousEnvironmentId: quiet.id, holdsAccount: true });
+      // Activation wrote the checked environment; the binding's updated_at committed with it, nothing re-checked yet.
+      expect(await current()).toEqual({ approval: "approved", agent: { status: "paused", defaultEnvironmentId: localEnvironment.id } });
+      const committed = await readWakeEpochs(db, { environmentId: quiet.id, agentId: pending.id });
+      expect(committed.bindingUpdatedAt! > before.bindingUpdatedAt!).toBe(true);
+      expect(committed.environmentEpoch).toBe(before.environmentEpoch);
+      expect(await overLimitAt()).not.toBeNull();
+
+      await pool.afterPlacementMove(move!);
+      expect((await readWakeEpochs(db, { environmentId: quiet.id, agentId: pending.id })).environmentEpoch!).toBeGreaterThan(before.environmentEpoch!);
+      expect(await overLimitAt()).toBeNull();
     });
 
     it("leaves the environment of a hire without a pool account to activation", async () => {
@@ -444,12 +486,12 @@ describeEmbeddedPostgres("account pool service (database)", () => {
       const emptyBinding = await agent(companyId, { status: "pending_approval" });
       await bind(emptyBinding, null);
       for (const pending of [unbound, emptyBinding]) {
-        const approval = { companyId, type: "hire_agent", status: "pending", payload: { agentId: pending.id } };
-        await pool.placeHireForApproval(admin, approval, crowded.id);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "hire_agent", status: "pending", payload: { agentId: pending.id } }).returning();
+        const { applied, move } = await approveHire(admin, approval!.id, { defaultEnvironmentId: crowded.id });
+        expect({ applied, move }).toEqual({ applied: true, move: null });
         const [row] = await db.select({ defaultEnvironmentId: agents.defaultEnvironmentId }).from(agents).where(eq(agents.id, pending.id));
-        expect(row!.defaultEnvironmentId).toBeNull();
+        expect(row!.defaultEnvironmentId).toBe(crowded.id);
       }
-      expect(await pool.assertPlacementAndWriteEnvironment(admin, unbound, crowded.id)).toBe(false);
     });
 
     it("moves the binding's updated_at and the old environment's wake epoch on a move", async () => {
@@ -467,6 +509,74 @@ describeEmbeddedPostgres("account pool service (database)", () => {
         expect(after.bindingUpdatedAt! > before.bindingUpdatedAt!).toBe(true);
         expect(after.environmentEpoch!).toBeGreaterThan(before.environmentEpoch!);
       }
+    });
+
+    it("checks a move inside the configuration write's transaction, and wakes and re-checks devices only after it commits", async () => {
+      const { companyId, crowded, quiet, mover1 } = await fullDevice();
+      const admin = board("admin", [[companyId, "admin"]]);
+      // Lowered to one account, the device of both movers is over its limit.
+      const device = (await deviceForEnvironment(db, quiet))!;
+      await db.update(aiAccountHosts).set({ maxAccounts: 1 }).where(eq(aiAccountHosts.id, device.id));
+      expect(await recheckDeviceLimits(db, { deviceIds: [device.id] })).toEqual([expect.objectContaining({ inUse: 2, change: "flagged" })]);
+      const overLimitAt = async () => (await db.select({ overLimitAt: aiAccountHosts.overLimitAt }).from(aiAccountHosts).where(eq(aiAccountHosts.id, device.id)))[0]!.overLimitAt;
+      const waiting = await waitingRun(mover1, { reason: "unassigned" });
+      const before = await readWakeEpochs(db, { environmentId: quiet.id, agentId: mover1.id });
+      const write = (row: typeof mover1, patch: { defaultEnvironmentId: string }) => {
+        let move: PlacementMove | null = null;
+        const saved = agentService(db).update(mover1.id, patch, {
+          beforeWrite: async (tx) => { move = await pool.checkPlacementInWrite(tx, admin, row, patch); },
+        });
+        return saved.then((agent) => ({ agent, move }));
+      };
+
+      // A refused check rolls the write back.
+      await expect(write({ ...mover1, defaultEnvironmentId: crowded.id }, { defaultEnvironmentId: localEnvironment.id }))
+        .rejects.toMatchObject({ status: 409, details: { code: "placement_conflict" } });
+      const { agent: moved, move } = await write(mover1, { defaultEnvironmentId: localEnvironment.id });
+      expect(moved!.defaultEnvironmentId).toBe(localEnvironment.id);
+      expect(move).toEqual({ agentId: mover1.id, companyId, previousEnvironmentId: quiet.id, holdsAccount: true });
+      // Committed with the move: the binding's updated_at; nothing woken or re-checked yet.
+      const committed = await readWakeEpochs(db, { environmentId: quiet.id, agentId: mover1.id });
+      expect(committed.bindingUpdatedAt! > before.bindingUpdatedAt!).toBe(true);
+      expect(committed.environmentEpoch).toBe(before.environmentEpoch);
+      expect(await dueAtOf(waiting.id)).toBeGreaterThan(Date.now());
+      expect(await overLimitAt()).not.toBeNull();
+
+      await pool.afterPlacementMove(move!);
+      expect(await dueAtOf(waiting.id)).toBeLessThanOrEqual(Date.now());
+      expect((await readWakeEpochs(db, { environmentId: quiet.id, agentId: mover1.id })).environmentEpoch!).toBeGreaterThan(before.environmentEpoch!);
+      // The re-check reads the committed move: the device fits its limit again.
+      expect(await overLimitAt()).toBeNull();
+      // A patch that moves nothing checks nothing.
+      expect(await pool.checkPlacementInWrite(db, admin, moved!, { name: "Renamed", defaultEnvironmentId: localEnvironment.id })).toBeNull();
+    });
+
+    it("checks a move that comes with a status change inside that write, so a refused move pauses nothing", async () => {
+      const { companyId, crowded, quiet, mover1 } = await fullDevice();
+      const admin = board("admin", [[companyId, "admin"]]);
+      const waiting = await waitingRun(mover1, { reason: "unassigned" });
+      const patch = { defaultEnvironmentId: localEnvironment.id };
+      const pauseAndMove = (row: typeof mover1) => {
+        let move: PlacementMove | null = null;
+        // PATCH /agents/:id with a status runs upstream's updateAndTransition.
+        const saved = createAgentLifecycle(db).updateAndTransition(mover1.id, "pause", patch, {
+          beforeWrite: async (tx) => { move = await pool.checkPlacementInWrite(tx, admin, row, patch); },
+        });
+        return saved.then((agent) => ({ agent, move }));
+      };
+      const current = async () => (await db.select({ status: agents.status, lifecycleState: agents.lifecycleState, defaultEnvironmentId: agents.defaultEnvironmentId })
+        .from(agents).where(eq(agents.id, mover1.id)))[0]!;
+
+      await expect(pauseAndMove({ ...mover1, defaultEnvironmentId: crowded.id }))
+        .rejects.toMatchObject({ status: 409, details: { code: "placement_conflict" } });
+      expect(await current()).toEqual({ status: mover1.status, lifecycleState: mover1.lifecycleState, defaultEnvironmentId: quiet.id });
+
+      const { agent: paused, move } = await pauseAndMove(mover1);
+      expect(paused).toMatchObject({ status: "paused", lifecycleState: "pausing", defaultEnvironmentId: localEnvironment.id });
+      expect(move).toEqual({ agentId: mover1.id, companyId, previousEnvironmentId: quiet.id, holdsAccount: true });
+      expect(await dueAtOf(waiting.id)).toBeGreaterThan(Date.now());
+      await pool.afterPlacementMove(move!);
+      expect(await dueAtOf(waiting.id)).toBeLessThanOrEqual(Date.now());
     });
 
     it("flags a device that a project default pushes over its limit and tells the company", async () => {

@@ -17,6 +17,8 @@ import {
   heartbeatRuns,
   inboxDismissals,
   issues,
+  projectWorkspaces,
+  projects,
   resourceWaitEpisodes,
   resourceWaitNotices,
   type Db,
@@ -28,7 +30,7 @@ import {
 import { captureQueries, explainAnalyze, rowsExamined, scansOf } from "./helpers/query-plan.js";
 import { recheckDeviceLimits } from "../services/ai-account-pool.js";
 import { attentionService } from "../services/attention.js";
-import type { AuthorizationActor } from "../services/authorization.js";
+import { issueReadSqlCondition, type AuthorizationActor } from "../services/authorization.js";
 import { canReadDecisionSource, decisionQueueService, type DecisionMutationActor } from "../services/decision-queues.js";
 import {
   deviceOverLimitNoticeKey,
@@ -203,8 +205,25 @@ describeEmbeddedPostgres("resource-wait inbox items", () => {
     return { task, run, episode: row };
   }
 
-  const collect = (companyId: string, prefix: string, extra: { deploymentMode?: "local_trusted" | "authenticated"; database?: Db } = {}) =>
-    resourceWaitAttentionInputs(extra.database ?? db, companyId, { prefix, now, env, deploymentMode: extra.deploymentMode ?? "authenticated" });
+  /** Makes a task private to `ownerUserId` (doc/ISSUE-PRIVACY.md): its creator and responsible user. */
+  async function makePrivate(taskId: string, ownerUserId: string, fields: Partial<typeof issues.$inferInsert> = {}) {
+    await db.update(issues)
+      .set({ visibility: "private", privacyRootIssueId: taskId, responsibleUserId: ownerUserId, createdByUserId: ownerUserId, ...fields })
+      .where(eq(issues.id, taskId));
+  }
+
+  /** A board session of a company member who is not an instance admin. */
+  const session = (userId: string, companyId: string): AuthorizationActor =>
+    ({ type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: false });
+
+  const collect = async (companyId: string, prefix: string, extra: { deploymentMode?: "local_trusted" | "authenticated"; database?: Db; actor?: AuthorizationActor } = {}) =>
+    resourceWaitAttentionInputs(extra.database ?? db, companyId, {
+      prefix,
+      now,
+      env,
+      deploymentMode: extra.deploymentMode ?? "authenticated",
+      ...(extra.actor ? { readCondition: await issueReadSqlCondition(db, extra.actor) } : {}),
+    });
 
   it("shows exactly one item per account limit episode, however many tasks wait or probes fail", async () => {
     const acme = await company("Acme");
@@ -529,5 +548,72 @@ describeEmbeddedPostgres("resource-wait inbox items", () => {
     const next = await service.list(acme.id, { userId: "board-user", all: true, allowUnscopedAll: true });
     expect(next.items.filter((entry) => entry.sourceKind === "resource_wait_alert").map((entry) => entry.dedupKey))
       .toEqual([`resource_wait:ai_account:account:${max.id}:${minutesAgo(1).toISOString()}`]);
+  });
+
+  it("leaves waits on private tasks out of the items, feed and triage of a member who cannot read them", async () => {
+    const acme = await company();
+    await user("owner", [acme.id]);
+    await user("private-owner", [acme.id]);
+    await user("bystander", [acme.id]);
+    const bystander = session("bystander", acme.id);
+    const privateOwner = session("private-owner", acme.id);
+    const limitStart = minutesAgo(30);
+    const max = await account("owner", "Max", { limitEpisodeStartedAt: limitStart });
+    const worker = await agent(acme.id, "Worker");
+    const [project] = await db.insert(projects).values({ companyId: acme.id, name: "Acquisition project" }).returning();
+    const [workspace] = await db.insert(projectWorkspaces).values({ companyId: acme.id, projectId: project!.id, name: "Acquisition workspace" }).returning();
+    // The limit episode's first wait is on a private task, a later one on an open task.
+    const secret = await limitWait(worker, acme.prefix, max.id, minutesAgo(29));
+    await makePrivate(secret.task.id, "private-owner", { title: "Acquisition of X", projectId: project!.id, projectWorkspaceId: workspace!.id });
+    const open = await limitWait(worker, acme.prefix, max.id, minutesAgo(10));
+    // A sign-out keeps one item per task: this item's only task is private.
+    const signedOut = await account("owner", "Team key", { status: "auth_failed" });
+    const lonelyTask = await issue(acme.id, acme.prefix, worker.id);
+    await makePrivate(lonelyTask.id, "private-owner", { title: "Board seat memo" });
+    const lonelyRun = await laneRun(worker, lonelyTask.id, "ai_account_wait");
+    await episode({ agent: worker, issueId: lonelyTask.id, kind: "ai_account", reason: "signed_out", scope: "account", resourceKey: `account:${signedOut.id}`, accountId: signedOut.id, since: minutesAgo(5), currentRunId: lonelyRun.id });
+    const limitKey = `resource_wait:ai_account:account:${max.id}:${limitStart.toISOString()}`;
+    const lonelyKey = `resource_wait:ai_account:account:${signedOut.id}:${minutesAgo(5).toISOString()}:signed_out`;
+    const hidden = [
+      secret.task.id, secret.task.identifier!, secret.run.id, "Acquisition of X", "Acquisition project", "Acquisition workspace",
+      lonelyTask.id, lonelyTask.identifier!, lonelyRun.id, "Board seat memo", lonelyKey,
+    ];
+
+    // A member who cannot read the private tasks: the limit item names the open task alone.
+    const forBystander = await collect(acme.id, acme.prefix, { actor: bystander });
+    expect(forBystander.map((item) => item.dedupKey)).toEqual([limitKey]);
+    expect(forBystander[0]).toMatchObject({ relatedIssue: { id: open.task.id }, project: null, workspace: null });
+    expect(forBystander[0]!.subject.metadata).toMatchObject({ waitingCount: 1, issueIds: [open.task.id], runIds: [open.run.id] });
+    expect(forBystander[0]!.whyNow).toContain("A task waits for the limit to reset");
+    for (const value of hidden) expect(JSON.stringify(forBystander)).not.toContain(value);
+
+    // Their owner sees both items, the private task with its project and workspace.
+    const forOwner = await collect(acme.id, acme.prefix, { actor: privateOwner });
+    expect(forOwner.map((item) => item.dedupKey)).toEqual([limitKey, lonelyKey]);
+    expect(forOwner[0]).toMatchObject({
+      relatedIssue: { id: secret.task.id, title: "Acquisition of X" },
+      project: { id: project!.id, name: "Acquisition project" },
+      workspace: { id: workspace!.id, name: "Acquisition workspace" },
+    });
+    expect(forOwner[0]!.subject.metadata).toMatchObject({ waitingCount: 2, issueIds: [secret.task.id, open.task.id] });
+
+    // The feed reads in the viewer's scope.
+    const service = attentionService(db, { now: () => now.getTime() });
+    const waitKeys = (feed: Awaited<ReturnType<typeof service.list>>) =>
+      feed.items.filter((entry) => entry.sourceKind === "resource_wait_alert").map((entry) => entry.dedupKey);
+    const feed = await service.list(acme.id, { userId: "bystander", actor: bystander, all: true, allowUnscopedAll: true });
+    expect(waitKeys(feed)).toEqual([limitKey]);
+    for (const value of hidden) expect(JSON.stringify(feed)).not.toContain(value);
+    const ownerFeed = await service.list(acme.id, { userId: "private-owner", actor: privateOwner, all: true, allowUnscopedAll: true });
+    expect(waitKeys(ownerFeed).sort()).toEqual([limitKey, lonelyKey].sort());
+
+    // Triage follows the item the viewer sees: the member may triage the limit item, which names the open task.
+    const mutation: DecisionMutationActor = { actorType: "user", actorId: "bystander", agentId: null, userId: "bystander", runId: null, agentApiKeyId: null, responsibleUserId: "bystander" };
+    expect(await canReadDecisionSource(db, bystander, acme.id, "resource_wait_alert", limitKey)).toBe(true);
+    expect(await decisionQueueService(db).updateTriage({ companyId: acme.id, sourceKind: "resource_wait_alert", sourceId: limitKey, decideBy: "today", authActor: bystander, actor: mutation }))
+      .toMatchObject({ sourceKind: "resource_wait_alert", sourceId: limitKey, decideBy: "today" });
+    // An item whose only task is private is no source for the member, and still one for its owner.
+    expect(await canReadDecisionSource(db, bystander, acme.id, "resource_wait_alert", lonelyKey)).toBe(false);
+    expect(await canReadDecisionSource(db, privateOwner, acme.id, "resource_wait_alert", lonelyKey)).toBe(true);
   });
 });

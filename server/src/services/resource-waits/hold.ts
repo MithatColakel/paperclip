@@ -301,7 +301,11 @@ export function createHold(runtime: HoldRuntime) {
 
   async function runEnvironment(run: HeartbeatRunRow, agent: AgentRow, policy: RunEnvironmentPolicy) {
     const projectId = typeof run.contextSnapshot?.projectId === "string" ? run.contextSnapshot.projectId : null;
-    return resolveRunEnvironment(db, { companyId: run.companyId, agent, issueId: chainOfRun(run).issueId, projectId }, policy);
+    // The run's retained policy, as executeRun's "run" source: a low-trust boundary stays with the run.
+    return resolveRunEnvironment(db, {
+      companyId: run.companyId, agent, issueId: chainOfRun(run).issueId, projectId,
+      executionPolicy: run.contextSnapshot?.executionPolicy,
+    }, policy);
   }
 
   /**

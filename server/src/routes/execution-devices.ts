@@ -30,6 +30,7 @@ import {
   recheckDeviceLimits,
 } from "../services/ai-account-pool.js";
 import { noteDeviceOverLimit } from "../services/attention-resource-waits.js";
+import { issueReadSqlCondition } from "../services/authorization.js";
 import {
   acquireBindingsLock,
   boundAccountsByDevice,
@@ -39,6 +40,7 @@ import {
   lockDevice,
   summariesForCompany,
   summariesForInstance,
+  type DeviceSummaryOptions,
 } from "../services/execution-devices.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -67,7 +69,8 @@ export interface ExecutionDeviceRoutesOptions {
  * - Company routes, for board users with access to the company: the devices
  *   the company sees (its agents' candidate environments reach them, or the
  *   managing plugin lists the company as served); one device with the
- *   company's waits on it (404 when the company cannot see it); "Check now"
+ *   company's waits on it (404 when the company cannot see it), each naming
+ *   its task only where the viewer may read it (private tasks); "Check now"
  *   (active non-viewer members and company admins, once a minute per device):
  *   forced checks of the device's environments available to the company, in
  *   its context, then a wake that starts the waits; and the company's
@@ -101,6 +104,14 @@ export function executionDeviceRoutes(db: Db, options: ExecutionDeviceRoutesOpti
       }
     }
     return configuredMode;
+  }
+
+  /**
+   * The company view for this viewer: its waits name a task only where the
+   * viewer may read it (private tasks, doc/ISSUE-PRIVACY.md).
+   */
+  async function companyViewOptions(req: Request): Promise<DeviceSummaryOptions> {
+    return { deploymentMode: deploymentMode(), issueReadCondition: await issueReadSqlCondition(db, req.actor) };
   }
 
   /** Company device routes are for board users; agents never see account or device metadata. */
@@ -150,7 +161,7 @@ export function executionDeviceRoutes(db: Db, options: ExecutionDeviceRoutesOpti
     if (!companyId) return;
     const body: CompanyExecutionDevicesResponse = {
       limitPerDevice: DEVICE_POOL_ACCOUNT_LIMIT,
-      devices: await summariesForCompany(db, companyId, { deploymentMode: deploymentMode() }),
+      devices: await summariesForCompany(db, companyId, await companyViewOptions(req)),
     };
     res.json(body);
   });
@@ -160,7 +171,7 @@ export function executionDeviceRoutes(db: Db, options: ExecutionDeviceRoutesOpti
     if (!companyId) return;
     const deviceId = deviceIdParam(req, res);
     if (!deviceId) return;
-    const detail = await detailForCompany(db, companyId, deviceId, { deploymentMode: deploymentMode() });
+    const detail = await detailForCompany(db, companyId, deviceId, await companyViewOptions(req));
     if (!detail) {
       res.status(404).json({ error: "Device not found" });
       return;
@@ -176,7 +187,8 @@ export function executionDeviceRoutes(db: Db, options: ExecutionDeviceRoutesOpti
     }
     const deviceId = deviceIdParam(req, res);
     if (!deviceId) return;
-    const before = await detailForCompany(db, companyId, deviceId, { deploymentMode: deploymentMode() });
+    const viewOptions = await companyViewOptions(req);
+    const before = await detailForCompany(db, companyId, deviceId, viewOptions);
     if (!before) {
       res.status(404).json({ error: "Device not found" });
       return;
@@ -191,7 +203,7 @@ export function executionDeviceRoutes(db: Db, options: ExecutionDeviceRoutesOpti
     const result = await service.resourceWaits.checkEnvironmentsNow({ companyId, environmentIds });
     // The check made the company's waits there due; start them now (the hold still re-checks each).
     if (environmentIds.length > 0) await service.wakeResourceWaitsNow({ environmentIds, companyId });
-    const device = (await detailForCompany(db, companyId, before.id, { deploymentMode: deploymentMode() })) ?? before;
+    const device = (await detailForCompany(db, companyId, before.id, viewOptions)) ?? before;
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,

@@ -21,8 +21,8 @@ import {
 
 // Fork: the snapshot rehearsal of the Claude account binding backfill (spec
 // 15.1, 15.3 and 17 step 1): its refusals, go, no-go and error runs on a
-// production-shaped snapshot (the 0308 schema with host-pool history), and the
-// command line as the image runs it.
+// production-shaped snapshot (the fork's 0308 schema with host-pool history),
+// and the command line as the image runs it.
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const daysAgo = (days: number) => new Date(Date.now() - days * DAY_MS);
@@ -113,7 +113,7 @@ if (!embeddedPostgresSupport.supported) {
 type LegacyClient = ReturnType<typeof drizzle>;
 type Ref = { id: string; name: string };
 
-/** Rows as the previous image left them, written with the 0308 columns only. */
+/** Rows as the previous image left them, written with the fork's 0308 columns only. */
 function legacySeeder(url: string) {
   const client: LegacyClient = drizzle({ connection: { url, max: 1, onnotice: () => {} } });
   const secrets: string[] = [];
@@ -229,7 +229,12 @@ describeEmbeddedPostgres("AI account pool rehearsal on a restored snapshot", () 
     vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", "authenticated");
     database = await startEmbeddedPostgresTestDatabase("paperclip-ai-account-rehearsal-");
 
-    // The snapshot template: every migration before the release's DDL, the state production runs today.
+    // The snapshot template: the database the account pool release met in
+    // production, the fork's 0308. That is upstream's 0000–0305 followed by the
+    // fork's first pool migrations, the ones right before the DDL. The upstream
+    // files the 2026-10 sync numbered ahead of them are not on it, and Drizzle's
+    // stock migrate() could not build them anyway: it runs one transaction,
+    // which their CONCURRENTLY and batch-committing statements refuse.
     type JournalEntry = { idx: number; tag: string; when: number; version: string; breakpoints: boolean };
     const migrationsDir = new URL("../../../packages/db/src/migrations/", import.meta.url);
     const journal = JSON.parse(await readFile(new URL("meta/_journal.json", migrationsDir), "utf8")) as { entries: JournalEntry[] };
@@ -239,14 +244,24 @@ describeEmbeddedPostgres("AI account pool rehearsal on a restored snapshot", () 
       if (content.includes('CREATE TABLE "ai_account_agent_bindings"')) ddlPosition = position;
     }
     expect(ddlPosition).toBeGreaterThan(0);
-    releaseMigrations = journal.entries.slice(ddlPosition).map((entry) => `${entry.tag}.sql`);
+    const forkBase = journal.entries.findIndex((entry) => entry.tag === "0305_chubby_vin_gonzales") + 1;
+    expect(forkBase).toBeGreaterThan(0);
+    let forkStart = -1;
+    for (let position = forkBase; position < ddlPosition && forkStart < 0; position += 1) {
+      const content = await readFile(new URL(`${journal.entries[position]!.tag}.sql`, migrationsDir), "utf8");
+      if (content.includes('CREATE TABLE "ai_connection_pool_members"')) forkStart = position;
+    }
+    expect(forkStart).toBeGreaterThanOrEqual(forkBase);
+    const prior = [...journal.entries.slice(0, forkBase), ...journal.entries.slice(forkStart, ddlPosition)];
+    // The release applies every other file: upstream's files from the sync, the
+    // pool DDL and data migration, and any fork file after them.
+    releaseMigrations = journal.entries.filter((entry) => !prior.includes(entry)).map((entry) => `${entry.tag}.sql`);
 
     template = `rehearsal_template_${suffix()}`;
     expect(await ensurePostgresDatabase(database.connectionString, template)).toBe("created");
     const legacyDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-account-rehearsal-"));
     try {
       await mkdir(path.join(legacyDir, "meta"));
-      const prior = journal.entries.slice(0, ddlPosition);
       for (const entry of prior) {
         await writeFile(path.join(legacyDir, `${entry.tag}.sql`), await readFile(new URL(`${entry.tag}.sql`, migrationsDir)));
       }

@@ -99,8 +99,9 @@ Company-scoped:
 - `execution_wait_settings`: notify-after hours and the two manager-wake
   switches.
 
-Migrations: `0309` holds the DDL and `0310` four data backfills. `0310` inserts
-no bindings; a boot job does that with the full binding checks.
+Migrations: `0374_smooth_killmonger` (applied in production as `0309`) holds
+the DDL and `0375_productive_veda` (applied as `0310`) four data backfills.
+`0375` inserts no bindings; a boot job does that with the full binding checks.
 
 ## Flows
 
@@ -230,7 +231,8 @@ into one device; hostname aliases and matching labels flag likely duplicates.
 
 1. **Before deploy:** run the read-only report script, copy production with a
    read-only `pg_dump` into a throwaway database (not a built-in backup: its
-   format keeps no CHECK constraints, which `0309` alters), and run the rehearsal script
+   format keeps no CHECK constraints, which `0374`, applied in production as
+   `0309`, alters), and run the rehearsal script
    (`server/dist/scripts/ai-account-pool-rehearsal.js --snapshot`) from the new
    image against it. It applies the migrations and the binding backfill to the
    copy and prints the report and the go/no-go (exit 0 go, 2 no-go, 1 error or
@@ -242,7 +244,7 @@ into one device; hostname aliases and matching labels flag likely duplicates.
    a deliberate binding, to bind it right after boot. Booting a copy of the new
    image with the heartbeat scheduler off on an isolated host remains an
    optional extra check.
-2. **`0310`:** owner = creator; origin `legacy_host_pool`; "Not in pool" becomes
+2. **`0375` (applied in production as `0310`):** owner = creator; origin `legacy_host_pool`; "Not in pool" becomes
    paused, which the owner can resume; device keys for hosts whose environments
    agree on one host and port, and `local` for the server host.
 3. **Binding backfill (at boot, once, idempotent):** candidates are Claude agents
@@ -301,7 +303,10 @@ into one device; hostname aliases and matching labels flag likely duplicates.
    devices.
 7. **After one stable release**, remove the legacy `host_pool` slot counting, the
    `ai_connection_failover` handling and the 410 routes. At the next upstream
-   rebase, renumber `0309` and `0310` with byte-identical SQL.
+   rebase, renumber `0309` and `0310` with byte-identical SQL. (Done in the
+   2026-10 upstream sync: production's `0306`–`0310` are now `0371`–`0375`,
+   byte-identical; `packages/db/src/fork-migration-receipts.test.ts` checks
+   their hashes and order.)
 
 ## Rollback
 
@@ -333,7 +338,9 @@ balanced host-pool selection and failover for mapped hosts.
 - **The backfill** can bind an agent to an account it never used (the company's
   most-used account on its device). Every migrated binding is marked for review.
 - **Migration numbers** collide with upstream's and must be renumbered without
-  changing the SQL, because the migrator matches on content.
+  changing the SQL, because the migrator matches on content. The 2026-10 sync
+  moved them to `0371`–`0375`; a later sync that brings upstream migrations
+  numbered from `0371` renumbers them again the same way.
 - **Proxies.** A network that needs a proxy cannot run pool agents until a vetted
   proxy option exists.
 - **SSH staging** adds one ssh round trip per command that carries a secret, and

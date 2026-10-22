@@ -1,8 +1,9 @@
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, principalPermissionGrants,
+  activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, principalPermissionGrants,
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET, type PermissionKey } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -64,7 +65,7 @@ describeDatabase("new agent configuration defaults", () => {
       role = "engineer",
       coordinator = false,
     ) =>
-      agentService(db).create(companyId, {
+      createAgentLifecycle(db).requestHire(companyId, {
         name,
         role,
         adapterType: "process",
@@ -152,7 +153,7 @@ describeDatabase("new agent configuration defaults", () => {
     })).toMatchObject({ allowed: false });
     for (const permissionKey of [
       "agents:create", "environments:manage", "tools:admin", "users:invite",
-      "users:manage_permissions", "pipelines:write", "joins:approve",
+      "users:manage_permissions", "joins:approve",
     ] as const) {
       expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey)).toBe(false);
       expect(await accessService(db).hasPermission(companyId, "agent", projectManager.id, permissionKey)).toBe(false);
@@ -181,6 +182,7 @@ describeDatabase("new agent configuration defaults", () => {
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.principalId, standard.id))).toEqual([]);
 
+    await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, peer.id));
     await agentService(db).remove(peer.id);
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.principalId, peer.id))).toEqual([]);
@@ -188,6 +190,7 @@ describeDatabase("new agent configuration defaults", () => {
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
@@ -229,6 +232,7 @@ describeDatabase("new agent configuration defaults", () => {
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
@@ -239,7 +243,7 @@ describeDatabase("new agent configuration defaults", () => {
       name: "Pending permission default",
       issuePrefix: `PP${companyId.slice(0, 6).toUpperCase()}`,
     });
-    const createPending = (name: string, role: string) => agentService(db).create(companyId, {
+    const createPending = (name: string, role: string) => createAgentLifecycle(db).requestHire(companyId, {
       name,
       status: "pending_approval",
       role,
@@ -258,17 +262,18 @@ describeDatabase("new agent configuration defaults", () => {
       .map((grant) => grant.permissionKey).sort();
     const configureScopeFor = async (agentId: string) => (await grantsFor(agentId))
       .find((grant) => grant.permissionKey === "agents:configure")?.scope;
-    const result = await agentService(db).activatePendingApproval(pending.id);
+    const result = await createAgentLifecycle(db).approveHire(pending.id);
     expect(result?.activated).toBe(true);
     expect(await grantKeysFor(pending.id)).toEqual(expectedNewAgentGrantKeys);
     expect(await configureScopeFor(pending.id)).toEqual({ agentIds: [pending.id] });
-    const coordinatorResult = await agentService(db).activatePendingApproval(pendingCoordinator.id);
+    const coordinatorResult = await createAgentLifecycle(db).approveHire(pendingCoordinator.id);
     expect(coordinatorResult?.activated).toBe(true);
     expect(await grantKeysFor(pendingCoordinator.id)).toEqual(expectedCoordinatorGrantKeys);
     expect(await configureScopeFor(pendingCoordinator.id)).toBeNull();
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
@@ -279,7 +284,7 @@ describeDatabase("new agent configuration defaults", () => {
       name: "Invited permission default",
       issuePrefix: `PI${companyId.slice(0, 6).toUpperCase()}`,
     });
-    const invited = await agentService(db).create(companyId, {
+    const invited = await createAgentLifecycle(db).requestHire(companyId, {
       name: "Invited agent",
       role: "engineer",
       adapterType: "process",
@@ -298,6 +303,7 @@ describeDatabase("new agent configuration defaults", () => {
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
@@ -312,7 +318,7 @@ describeDatabase("new agent configuration defaults", () => {
     await db.insert(authUsers).values({
       id: userId, name: "Owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date(),
     });
-    const create = (name: string) => agentService(db).create(companyId, {
+    const create = (name: string) => createAgentLifecycle(db).requestHire(companyId, {
       name,
       role: "engineer",
       adapterType: "process",
@@ -356,6 +362,7 @@ describeDatabase("new agent configuration defaults", () => {
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
+    await db.delete(activityLog).where(eq(activityLog.companyId, companyId));
     await db.delete(authUsers).where(eq(authUsers.id, userId));
     await db.delete(companies).where(eq(companies.id, companyId));
   });

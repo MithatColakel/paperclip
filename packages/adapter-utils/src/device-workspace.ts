@@ -458,6 +458,7 @@ export async function finishDeviceWorkspaceRun(input: FinishDeviceWorkspaceRunIn
       'default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed "s#^origin/##")',
       'unpushed=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)',
       'if [ "$branch" != "HEAD" ] && [ "$branch" != "$default" ] && [ "$branch" != main ] && [ "$branch" != master ] && [ "${unpushed:-0}" -gt 0 ] && git remote get-url origin >/dev/null 2>&1; then',
+      // paperclip:allow-git-push: Fork SSH device mode keeps the task's workspace on the operator's device, so the run's own issue branch is pushed from there (never the default branch, only unpushed commits, only when origin exists).
       '  if out=$(git push --quiet origin "HEAD:refs/heads/$branch" 2>&1); then',
       '    echo "pushed=$unpushed"',
       '    unpushed=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)',

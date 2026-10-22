@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -31,6 +31,7 @@ import { logActivity } from "./activity-log.js";
 import { resourceWaitAttentionInputs } from "./attention-resource-waits.js";
 import {
   authorizationService,
+  issueReadSqlCondition,
   type AuthorizationActor,
   type AuthorizationResource,
 } from "./authorization.js";
@@ -204,6 +205,8 @@ async function sourceIssueId(
   companyId: string,
   sourceKind: AttentionSourceKind,
   sourceId: string,
+  // Fork: the reader's task read predicate, for a resource-wait alert (derived per viewer).
+  readCondition?: SQL<boolean>,
 ): Promise<{ exists: boolean; issueId: string | null; ownerAgentId?: string | null; agentId?: string | null }> {
   switch (sourceKind) {
     case "approval": {
@@ -284,9 +287,11 @@ async function sourceIssueId(
     }
     // Fork: resource-wait alerts are derived on read from open wait episodes,
     // keyed by their dedup key. One exists while its wait lasts, so triage and
-    // queues work on it; once the wait ends it fails closed.
+    // queues work on it; once the wait ends it fails closed. It is derived in
+    // the reader's scope, as their feed shows it: waits on tasks they cannot
+    // read are left out, so the task checked is the one their item names.
     case "resource_wait_alert": {
-      const item = (await resourceWaitAttentionInputs(db, companyId, { prefix: "" }))
+      const item = (await resourceWaitAttentionInputs(db, companyId, { prefix: "", readCondition }))
         .find((entry) => entry.subject.id === sourceId);
       return { exists: Boolean(item), issueId: item?.relatedIssue?.id ?? null };
     }
@@ -300,7 +305,14 @@ export async function canReadDecisionSource(
   sourceKind: AttentionSourceKind,
   sourceId: string,
 ) {
-  const source = await sourceIssueId(db, companyId, sourceKind, sourceId);
+  const source = await sourceIssueId(
+    db,
+    companyId,
+    sourceKind,
+    sourceId,
+    // Fork: only a resource-wait alert depends on the reader's task scope.
+    sourceKind === "resource_wait_alert" ? await issueReadSqlCondition(db, actor) : undefined,
+  );
   if (!source.exists) return false;
   const authz = authorizationService(db);
   if (source.issueId) {

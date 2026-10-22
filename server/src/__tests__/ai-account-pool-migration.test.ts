@@ -47,7 +47,47 @@ const dataEntry = journal.entries[ddlPosition + 1]!;
 const ddlSql = await readFile(new URL(`${ddlEntry.tag}.sql`, migrationsDir), "utf8");
 const dataSql = await readFile(new URL(`${dataEntry.tag}.sql`, migrationsDir), "utf8");
 
-// What the d6f6d1cad image knows about `ai_accounts`: exactly the 0308 columns.
+// Production reached the fork's 0308 as upstream's 0000–0305 followed by the
+// fork's first pool migrations, the ones right before the DDL. The upstream
+// files the 2026-10 sync numbered ahead of them are not on such a database, and
+// Drizzle's stock migrate() could not build them anyway: it runs one
+// transaction, which their CONCURRENTLY and batch-committing statements refuse.
+const forkBasePosition = journal.entries.findIndex((entry) => entry.tag === "0305_chubby_vin_gonzales") + 1;
+if (forkBasePosition === 0) throw new Error("The fork's base migration is missing from the journal");
+const forkStartPosition = await (async () => {
+  for (let position = forkBasePosition; position < ddlPosition; position += 1) {
+    const content = await readFile(new URL(`${journal.entries[position]!.tag}.sql`, migrationsDir), "utf8");
+    if (content.includes('CREATE TABLE "ai_connection_pool_members"')) return position;
+  }
+  throw new Error("The fork's first account pool migration is missing from the journal");
+})();
+const priorEntries = [...journal.entries.slice(0, forkBasePosition), ...journal.entries.slice(forkStartPosition, ddlPosition)];
+// Pending on that database: upstream's files from the sync, the DDL, the data migration and later files.
+const upgradeMigrations = journal.entries.filter((entry) => !priorEntries.includes(entry)).map((entry) => `${entry.tag}.sql`);
+
+/** The public schema, ordered by name. Column order is left out: where upstream
+ * and the fork both added columns to one table, it follows the order the
+ * migrations ran in, and nothing reads columns by position. */
+async function publicSchemaOf(target: ReturnType<typeof createDb>) {
+  return {
+    columns: [...await target.execute(sql`SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default
+      FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, column_name`)],
+    indexes: [...await target.execute(sql`SELECT tablename, indexname, indexdef FROM pg_indexes
+      WHERE schemaname = 'public' ORDER BY tablename, indexname`)],
+    constraints: [...await target.execute(sql`SELECT c.relname, k.conname, pg_get_constraintdef(k.oid) AS definition
+      FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' ORDER BY c.relname, k.conname`)],
+    triggers: [...await target.execute(sql`SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid) AS definition
+      FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND NOT t.tgisinternal ORDER BY c.relname, t.tgname`)],
+    functions: [...await target.execute(sql`SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS arguments,
+        md5(pg_get_functiondef(p.oid)) AS definition
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p') ORDER BY 1, 2`)],
+  };
+}
+
+// What the d6f6d1cad image knows about `ai_accounts`: exactly the columns of the fork's 0308.
 // Drizzle names every one of them in its inserts and selects.
 const oldImageAiAccounts = pgTable("ai_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -86,7 +126,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describe("account pool migration files", () => {
-  it("0309 is DDL that frees credentials from devices and scopes e-mail hints per owner", () => {
+  it("the DDL migration frees credentials from devices and scopes e-mail hints per owner", () => {
     expect(ddlEntry.idx).toBe(dataEntry.idx - 1);
     expect(ddlSql).toContain('ALTER TABLE "ai_accounts" DROP CONSTRAINT "ai_accounts_host_id_ai_account_hosts_id_fk"');
     expect(ddlSql).toContain('ALTER TABLE "ai_accounts" ALTER COLUMN "host_id" DROP NOT NULL');
@@ -132,7 +172,7 @@ describe("account pool migration files", () => {
     }
   });
 
-  it("0310 holds only the four backfills, schema-qualified, and inserts no bindings", () => {
+  it("the data migration holds only the four backfills, schema-qualified, and inserts no bindings", () => {
     const statements = dataSql.split("--> statement-breakpoint").map((part) => part.trim()).filter(Boolean);
     expect(statements).toHaveLength(5);
     for (const statement of statements) {
@@ -149,7 +189,7 @@ describe("account pool migration files", () => {
   });
 });
 
-describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
+describeEmbeddedPostgres("account pool migration on a database at the fork's 0308", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let legacyUrl: string;
   let legacyMigrationsDir: string;
@@ -187,11 +227,10 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     url.pathname = `/${name}`;
     legacyUrl = url.href;
 
-    // Build the real 0308 schema with the migration engine, from a journal that
-    // stops right before the pool DDL.
+    // Build the fork's 0308 schema with the migration engine, from a journal of
+    // upstream's base and the fork's files before the pool DDL.
     legacyMigrationsDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-account-pool-0308-"));
     await mkdir(path.join(legacyMigrationsDir, "meta"));
-    const priorEntries = journal.entries.slice(0, ddlPosition);
     for (const entry of priorEntries) {
       await writeFile(
         path.join(legacyMigrationsDir, `${entry.tag}.sql`),
@@ -271,9 +310,10 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     reservationsBefore = (await db.execute(sql`SELECT account_id, project_id FROM ai_account_projects ORDER BY account_id`) as unknown as Array<{ account_id: string; project_id: string }>)
       .map((row) => ({ accountId: row.account_id, projectId: row.project_id }));
 
+    expect(upgradeMigrations).toEqual(expect.arrayContaining([`${ddlEntry.tag}.sql`, `${dataEntry.tag}.sql`]));
     expect(await inspectMigrations(legacyUrl)).toMatchObject({
       status: "needsMigrations",
-      pendingMigrations: [`${ddlEntry.tag}.sql`, `${dataEntry.tag}.sql`],
+      pendingMigrations: upgradeMigrations,
     });
     await applyPendingMigrations(legacyUrl);
   }, 240_000);
@@ -337,7 +377,7 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
   });
 
   it("derives SSH device keys exactly as the shared helper does", async () => {
-    // The key expression of the 0310 backfill, run as written in the file.
+    // The key expression of the data migration's backfill, run as written in the file.
     const keyExpression = dataSql.match(/CASE\s+WHEN[\s\S]*?\bEND(?=\s+AS "key")/)?.[0];
     expect(keyExpression).toBeDefined();
     const configs: Array<Record<string, unknown>> = [
@@ -467,4 +507,102 @@ describeEmbeddedPostgres("account pool migration on a 0308 database", () => {
     expect(await db.select().from(aiAccountAgentBindings).where(eq(aiAccountAgentBindings.agentId, agentId)))
       .toMatchObject([{ mode: "pool_account", accountId: null, source: "manual", reviewedAt: null }]);
   });
+});
+
+describeEmbeddedPostgres("account pool migrations on production's ledger", () => {
+  // Production applied the five pool migrations as 0306–0310, right after
+  // upstream's 0305, and its ledger holds their hashes and these timestamps.
+  // The 2026-10 sync renumbered them behind upstream's files with
+  // byte-identical SQL, so only the files around them are pending there.
+  const deployed = [
+    { tag: "0306_faulty_the_executioner", when: 1791882144293 },
+    { tag: "0307_many_the_fury", when: 1791882242616 },
+    { tag: "0308_spicy_silk_fever", when: 1791972189545 },
+    { tag: "0309_smooth_killmonger", when: 1792177610956 },
+    { tag: "0310_productive_veda", when: 1792177623369 },
+  ];
+  const forkEntries = journal.entries.slice(forkStartPosition, ddlPosition + 2);
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let productionUrl: string;
+  let productionMigrationsDir: string;
+
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-ai-account-pool-ledger-");
+    const name = `pool_0310_${randomUUID().replaceAll("-", "")}`;
+    expect(await ensurePostgresDatabase(database.connectionString, name)).toBe("created");
+    const url = new URL(database.connectionString);
+    url.pathname = `/${name}`;
+    productionUrl = url.href;
+
+    // The journal production ran: upstream's base, then today's pool files
+    // under their deployed tags and timestamps.
+    productionMigrationsDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-account-pool-0310-"));
+    await mkdir(path.join(productionMigrationsDir, "meta"));
+    const baseEntries = journal.entries.slice(0, forkBasePosition);
+    for (const entry of baseEntries) {
+      await writeFile(path.join(productionMigrationsDir, `${entry.tag}.sql`), await readFile(new URL(`${entry.tag}.sql`, migrationsDir)));
+    }
+    expect(forkEntries.map((entry) => entry.tag.slice(5))).toEqual(deployed.map((entry) => entry.tag.slice(5)));
+    const deployedEntries = forkEntries.map((entry, offset) => ({
+      ...entry,
+      idx: baseEntries.at(-1)!.idx + 1 + offset,
+      tag: deployed[offset]!.tag,
+      when: deployed[offset]!.when,
+    }));
+    for (const [offset, entry] of deployedEntries.entries()) {
+      await writeFile(path.join(productionMigrationsDir, `${entry.tag}.sql`), await readFile(new URL(`${forkEntries[offset]!.tag}.sql`, migrationsDir)));
+    }
+    await writeFile(
+      path.join(productionMigrationsDir, "meta", "_journal.json"),
+      JSON.stringify({ ...journal, entries: [...baseEntries, ...deployedEntries] }),
+    );
+    const migrator = drizzle({ connection: { url: productionUrl, max: 1, onnotice: () => {} } });
+    try {
+      await migrate(migrator, { migrationsFolder: productionMigrationsDir });
+    } finally {
+      await migrator.$client.end();
+    }
+  }, 240_000);
+
+  afterAll(async () => {
+    if (productionUrl) await closeRegisteredClients(productionUrl);
+    await database?.cleanup();
+    if (productionMigrationsDir) await rm(productionMigrationsDir, { recursive: true, force: true });
+  });
+
+  it("runs only upstream's and later files, keeps the pool receipts, never replays the data migration, and matches a fresh install", async () => {
+    const db = createDb(productionUrl);
+    const ledger = async () => [...await db.execute(sql`SELECT id, hash, created_at::text AS created_at
+      FROM drizzle.__drizzle_migrations ORDER BY id`)];
+    // Added after the release and switched off by an admin. A replayed data
+    // migration would give it an owner, relabel its origin and disable it.
+    const accountId = randomUUID();
+    await db.execute(sql`INSERT INTO ai_accounts (id, credential_type, label, credential_material, credential_fingerprint, created_by_user_id, pool_enabled)
+      VALUES (${accountId}, 'subscription', 'Paused by an admin', ${JSON.stringify(material(30))}::jsonb, 'fp-30', 'user-z', false)`);
+    const before = await ledger();
+    expect(before).toHaveLength(forkBasePosition + deployed.length);
+
+    const pending = [...journal.entries.slice(forkBasePosition, forkStartPosition), ...journal.entries.slice(ddlPosition + 2)]
+      .map((entry) => `${entry.tag}.sql`);
+    expect(pending).not.toContain(`${ddlEntry.tag}.sql`);
+    expect(await inspectMigrations(productionUrl)).toMatchObject({ status: "needsMigrations", pendingMigrations: pending });
+    await applyPendingMigrations(productionUrl);
+
+    expect((await inspectMigrations(productionUrl)).status).toBe("upToDate");
+    const after = await ledger();
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after).toHaveLength(before.length + pending.length);
+    expect([...await db.execute(sql`SELECT owner_user_id, origin, status, pool_enabled FROM ai_accounts WHERE id = ${accountId}`)])
+      .toEqual([{ owner_user_id: null, origin: "pool", status: "active", pool_enabled: false }]);
+    const upgraded = await publicSchemaOf(db);
+    expect(upgraded.triggers.length).toBeGreaterThan(0);
+    expect(upgraded.constraints).toContainEqual(expect.objectContaining({
+      conname: "ai_connection_pool_members_provider_check",
+      definition: expect.stringContaining("'github'"),
+    }));
+    expect(upgraded).toEqual(await publicSchemaOf(createDb(database.connectionString)));
+
+    await applyPendingMigrations(productionUrl);
+    expect(await ledger()).toEqual(after);
+  }, 240_000);
 });

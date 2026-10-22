@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, companies, createDb } from "@paperclipai/db";
 import {
@@ -10,6 +10,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { teamsCatalogService } from "../services/teams-catalog.js";
+
+vi.mock("../services/agent-runner-selection.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/agent-runner-selection.js")>();
+  return { ...actual, resolveNewAgentRunnerForCompany: async (_db: unknown, _companyId: string, input: Parameters<typeof actual.resolveNewAgentRunnerForCompany>[2]) =>
+    actual.resolveNewAgentRunner({ ...input, target: { driver: "local", platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" } }) };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -58,14 +64,18 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
         name: agents.name,
         role: agents.role,
         adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
         permissions: agents.permissions,
       })
       .from(agents)
       .where(eq(agents.companyId, companyId));
+    for (const row of rows.filter(row => row.adapterType === "paperclip_runner")) {
+      expect(row.adapterConfig).toMatchObject({ provider: "acpx", acpxAgent: "claude" });
+    }
     return new Map(rows.map((row) => [row.name, row]));
   }
 
-  it("installs core-exec-team end-to-end with no caller overrides and creates 3 claude_local agents", async () => {
+  it("installs core-exec-team end-to-end with no caller overrides and creates 3 Claude agents", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 
@@ -83,7 +93,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     expect(adapterTypes).not.toContain("http");
   });
 
-  it("installs product-design end-to-end with no caller overrides and uses claude_local", async () => {
+  it("installs product-design end-to-end with no caller overrides and uses Claude", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 
@@ -99,7 +109,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     expect(adapterTypes).not.toContain("process");
   });
 
-  it("installs product-engineering end-to-end with no caller overrides and uses claude_local for every agent", async () => {
+  it("installs product-engineering end-to-end with no caller overrides and uses Claude for every agent", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 
@@ -116,7 +126,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     expect(byName.get("CTO")?.permissions).toMatchObject({ canCreateAgents: true });
   });
 
-  it("honors an explicit caller adapter override for a single slug while defaulting the rest to claude_local", async () => {
+  it("honors an explicit caller adapter override for a single slug while defaulting the rest to Claude", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 

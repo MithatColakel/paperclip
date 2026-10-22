@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { aiProviderRoutingSchema, aiRoutingHarness, isAiRoutingCompatible, type AiProviderRouting } from "./ai-provider-routing.js";
 
 /** Runtime authentication is a separate transport, never a tool or channel. */
 export const connectionPurposeTransportSchema = z.discriminatedUnion(
@@ -10,11 +11,11 @@ export const connectionPurposeTransportSchema = z.discriminatedUnion(
     }),
     z.object({
       connectionPurpose: z.literal("channel"),
-      transport: z.enum(["chat_sdk", "rest_api"]),
+      transport: z.enum(["chat_sdk", "rest_api", "voice"]),
       config: z.object({ provider: z.string().optional() }).passthrough().optional(),
     }).refine(
-      (connection) => connection.transport === "chat_sdk" || connection.config?.provider === "agentmail",
-      { message: "REST channel connections require the AgentMail provider", path: ["config", "provider"] },
+      (connection) => connection.transport === "voice" ? connection.config?.provider === "speko" : connection.transport === "chat_sdk" ? connection.config?.provider !== "speko" : connection.config?.provider === "agentmail",
+      { message: "Channel transport must match its provider: voice for Speko, REST for AgentMail, Chat SDK otherwise", path: ["config", "provider"] },
     ),
     z.object({
       connectionPurpose: z.literal("ai"),
@@ -31,6 +32,8 @@ export const AI_PROVIDERS = [
   "openai",
   "openrouter",
   "xai",
+  "github",
+  "google",
 ] as const;
 export const aiProviderSchema = z.enum(AI_PROVIDERS);
 export const aiAuthMethodSchema = z.enum(["subscription", "api_key"]);
@@ -63,7 +66,7 @@ export const aiConnectionBindingSchema = z.discriminatedUnion("mode", [
   z
     .object({
       ...requirement,
-      // Legacy wire format only; human access still applies. New UI never creates it.
+      // Explicit personal selection. Human access still applies on every run.
       mode: z.literal("delegated"),
       connectionId: z.string().uuid(),
       grantId: z.string().uuid(),
@@ -71,7 +74,7 @@ export const aiConnectionBindingSchema = z.discriminatedUnion("mode", [
     .strict(),
 ]);
 export type AiConnectionBinding = z.infer<typeof aiConnectionBindingSchema>;
-export const aiConnectionMetadataSchema = z.object(requirement).strict();
+export const aiConnectionMetadataSchema = z.object({ ...requirement, routing: aiProviderRoutingSchema.optional() }).strict();
 export type AiConnectionMetadata = z.infer<typeof aiConnectionMetadataSchema>;
 
 /** Existing integrations only. This table describes compatibility, never routing. */
@@ -84,6 +87,11 @@ export const AI_CONNECTION_CAPABILITIES: Record<
     >;
   }
 > = {
+  github: {
+    name: "GitHub Copilot",
+    methods: { api_key: { adapters: ["copilot_runtime"], envKey: "COPILOT_GITHUB_TOKEN" } },
+  },
+  google: { name: "Google", methods: { api_key: { adapters: ["gemini_local"], envKey: "GEMINI_API_KEY" } } },
   anthropic: {
     name: "Claude",
     methods: {
@@ -122,18 +130,12 @@ export function isAiConnectionCompatible(
   runnerProvider?: unknown,
   acpxAgent?: unknown,
 ): boolean {
-  if (adapterType === "paperclip_runner")
-    adapterType =
-      runnerProvider === "claude" ||
-      (runnerProvider === "acpx" && acpxAgent === "claude")
-        ? "claude_local"
-        : runnerProvider === "acpx" && acpxAgent === "grok"
-          ? "grok_local"
-        : runnerProvider === "codex"
-          ? "codex_local"
-          : runnerProvider === "opencode"
-            ? "opencode_local"
-            : "unsupported";
+  adapterType = aiRoutingHarness(adapterType, runnerProvider, acpxAgent);
+  if ("routing" in requirement && requirement.routing) return requirement.method === "api_key" && isAiRoutingCompatible(requirement.routing, adapterType);
+  // A fixed binding contains identity only. The service checks authoritative
+  // connection metadata before resolving credentials or running the harness.
+  if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
+    return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "copilot_runtime"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
   const candidates = "mode" in requirement && (requirement.mode === "responsible_user" || requirement.mode === "company_pool")
     ? Object.values(methods)
@@ -155,6 +157,8 @@ export type AiConnectionUnavailableReason =
   | "credential_missing"
   | "pool_exhausted";
 export interface AiConnectionAttribution {
+  /** Billing account at execution time; never resolved again from mutable settings. */
+  subscriptionId?: string;
   connectionId: string;
   grantId: string;
   provider: AiProvider;
@@ -175,6 +179,7 @@ export interface AiManagedConnectionSummary {
   provider: AiProvider;
   method: AiAuthMethod;
   name: string;
+  routing?: AiProviderRouting;
   accountLabel?: string;
   ownership: "personal" | "shared";
   ownerUserId?: string;
@@ -198,7 +203,9 @@ export const createAiConnectionSchema = z
     ...requirement,
     name: z.string().trim().min(1).max(160),
     ownership: z.enum(["personal", "shared"]),
+    routing: aiProviderRoutingSchema.optional(),
     apiKey: z.string().trim().min(1).max(32768).optional(),
+    environmentId: z.string().uuid().nullable().optional(),
     loginSessionId: z.string().max(128).optional(),
     // Lets a Claude subscription connect where no environment can run the
     // browser sign-in (SSH hosts, hosted instances): the user runs
@@ -212,6 +219,14 @@ export const createAiConnectionSchema = z
   .superRefine((v, ctx) => {
     if (!AI_CONNECTION_CAPABILITIES[v.provider].methods[v.method])
       ctx.addIssue({ code: "custom", message: "Unsupported sign-in method" });
+    if (v.routing && (v.method !== "api_key" || (v.routing.kind === "openrouter" && v.provider !== "openrouter") || (v.routing.kind === "bedrock" && v.provider !== "anthropic")))
+      ctx.addIssue({ code: "custom", message: "Routing requires the matching provider and API authentication." });
+    if (v.routing && ["gateway", "local"].includes(v.routing.kind) && v.provider !== (v.routing.protocol === "messages" ? "anthropic" : "openai"))
+      ctx.addIssue({ code: "custom", message: "The provider must match the endpoint’s API format." });
+    if (v.routing?.auth === "none") {
+      if (v.apiKey || v.loginSessionId || v.setupToken) ctx.addIssue({ code: "custom", message: "Provide only the selected authentication method." });
+      return;
+    }
     const credentials = [v.apiKey, v.loginSessionId, v.setupToken].filter(Boolean).length;
     if (
       credentials !== 1 ||
@@ -234,7 +249,7 @@ export type CreateAiConnection = z.infer<typeof createAiConnectionSchema>;
 
 export const aiConnectionLoginIntentSchema = z
   .object({
-    provider: aiProviderSchema,
+    provider: z.enum(["anthropic", "openai", "xai"]),
     method: z.literal("subscription"),
     name: z.string().trim().min(1).max(160),
     ownership: z.enum(["personal", "shared"]),
@@ -253,10 +268,14 @@ export const localAiConnectionSchema = aiConnectionLoginIntentSchema.extend({
 export const localAiLoginStartSchema = aiConnectionLoginIntentSchema.extend({ restart: z.boolean().optional() });
 export interface LocalAiLoginStatus {
   status: "ready" | "sign_in_required" | "expired";
+  authorizationUrl?: string;
+  code?: string;
+  error?: string;
 }
 export interface LocalAiLoginAttempt {
   sessionId: string;
-  command: string;
+  /** Grok still uses terminal sign-in until it has an in-app login runner. */
+  command?: string;
   expiresAt: string;
 }
 

@@ -252,6 +252,14 @@ describeEmbeddedPostgres("heartbeat Claude account pool (integration)", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    // A run acts for its responsible user, who must be an active member of the company.
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "ai-account-pool@example.test", createdAt: now, updatedAt: now,
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId: id, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
+    });
     return id;
   }
 

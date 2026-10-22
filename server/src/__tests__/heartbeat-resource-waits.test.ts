@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   environmentAvailability,
   environments,
@@ -34,6 +36,7 @@ import { HttpError } from "../errors.js";
 import { isResolvedInteractionContinuationWakeContext } from "../modules/run-dispatch/index.js";
 import { executionFailureRetryCount } from "../services/execution-recovery-attempt.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { scheduledIssueMonitorWait } from "../services/issue-monitors.js";
 import { pluginEnvironmentTargetsService } from "../services/plugin-environment-targets.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -198,6 +201,14 @@ describeEmbeddedPostgres("heartbeat resource waits (integration)", () => {
       issuePrefix: `W${id.replaceAll("-", "").slice(0, 7).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    // A run acts for its responsible user, who must be an active member of the company.
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "resource-waits@example.test", createdAt: now, updatedAt: now,
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId: id, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     return id;
   }
@@ -688,6 +699,28 @@ describeEmbeddedPostgres("heartbeat resource waits (integration)", () => {
       expect(row.monitorNextCheckAt!.getTime()).toBeGreaterThanOrEqual(now.getTime() + 15 * MINUTE);
       expect(row).toMatchObject({ monitorAttemptCount: 0, monitorWakeRequestedAt: null, executionRunId: successor.id });
       expect(await runRow(successor.id)).toMatchObject({ status: "scheduled_retry" });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "issue_monitor_due"))).toHaveLength(0);
+    }, 30_000);
+
+    it("moves the saved monitor policy with the monitor, so the moved monitor stays the task's scheduled wait", async () => {
+      const { task, builder, successor } = await offlineDevice();
+      const due = new Date(Date.now() - MINUTE);
+      const policy = {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: { nextCheckAt: due.toISOString(), notes: "Check the deploy", scheduledBy: "assignee", maxAttempts: 3 },
+      };
+      await db.update(issues).set({ monitorNextCheckAt: due, monitorAttemptCount: 0, executionPolicy: policy }).where(eq(issues.id, task.id));
+      const now = new Date();
+      await heartbeat!.tickTimers(now);
+
+      const row = await issueRow(task.id);
+      expect(row.monitorNextCheckAt!.getTime()).toBeGreaterThanOrEqual(now.getTime() + 15 * MINUTE);
+      expect(row).toMatchObject({ monitorAttemptCount: 0, monitorWakeRequestedAt: null, executionRunId: successor.id });
+      // Only the monitor's time moved; the rest of the policy is as it was.
+      expect(row.executionPolicy).toEqual({ ...policy, monitor: { ...policy.monitor, nextCheckAt: row.monitorNextCheckAt!.toISOString() } });
+      expect(scheduledIssueMonitorWait(row, builder.id)).toBe(row.monitorNextCheckAt!.toISOString());
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "issue_monitor_due"))).toHaveLength(0);
     }, 30_000);
 

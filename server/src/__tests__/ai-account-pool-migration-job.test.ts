@@ -906,7 +906,7 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
   });
 
   describe("pre-deploy report on a production-shaped database", () => {
-    it("runs read-only on the 0308 schema and again after the upgrade", async () => {
+    it("runs read-only on the fork's 0308 schema and again after the upgrade", async () => {
       type JournalEntry = { idx: number; tag: string; when: number; version: string; breakpoints: boolean };
       const migrationsDir = new URL("../../../packages/db/src/migrations/", import.meta.url);
       const journal = JSON.parse(await readFile(new URL("meta/_journal.json", migrationsDir), "utf8")) as { entries: JournalEntry[] };
@@ -916,6 +916,19 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
         if (content.includes('CREATE TABLE "ai_account_agent_bindings"')) ddlPosition = position;
       }
       expect(ddlPosition).toBeGreaterThan(0);
+      // Production reached the fork's 0308 as upstream's 0000–0305 followed by the
+      // fork's first pool migrations, the ones right before the DDL. The upstream
+      // files the 2026-10 sync numbered ahead of them came later, and Drizzle's
+      // stock migrate() could not build them anyway: it runs one transaction,
+      // which their CONCURRENTLY and batch-committing statements refuse.
+      const forkBase = journal.entries.findIndex((entry) => entry.tag === "0305_chubby_vin_gonzales") + 1;
+      expect(forkBase).toBeGreaterThan(0);
+      let forkStart = -1;
+      for (let position = forkBase; position < ddlPosition && forkStart < 0; position += 1) {
+        const content = await readFile(new URL(`${journal.entries[position]!.tag}.sql`, migrationsDir), "utf8");
+        if (content.includes('CREATE TABLE "ai_connection_pool_members"')) forkStart = position;
+      }
+      expect(forkStart).toBeGreaterThanOrEqual(forkBase);
 
       const name = `pool_report_${randomUUID().replaceAll("-", "")}`;
       expect(await ensurePostgresDatabase(database.connectionString, name)).toBe("created");
@@ -925,7 +938,7 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
       const legacyMigrationsDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-account-report-0308-"));
       try {
         await mkdir(path.join(legacyMigrationsDir, "meta"));
-        const priorEntries = journal.entries.slice(0, ddlPosition);
+        const priorEntries = [...journal.entries.slice(0, forkBase), ...journal.entries.slice(forkStart, ddlPosition)];
         for (const entry of priorEntries) {
           await writeFile(path.join(legacyMigrationsDir, `${entry.tag}.sql`), await readFile(new URL(`${entry.tag}.sql`, migrationsDir)));
         }
@@ -937,7 +950,7 @@ describeEmbeddedPostgres("Claude account binding backfill (spec 15.3)", () => {
           await migrator.$client.end();
         }
 
-        // Production-shaped rows, written with the 0308 columns only.
+        // Production-shaped rows, written with the fork's 0308 columns only.
         const legacy = createDb(legacyUrl);
         const companyId = randomUUID();
         const agentId = randomUUID();

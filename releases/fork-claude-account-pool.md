@@ -1,6 +1,8 @@
 # Paperclip fork: Claude account pool
 
 > Fork release on top of v2026.1012.0. It replaces the fork's host account pools; the previous image is fork commit `d6f6d1cad`.
+>
+> Since the [upstream sync of 2026-10-21](fork-upstream-sync-2026-10-21.md) the fork migrations this note names `0309` and `0310` are `0374_smooth_killmonger` and `0375_productive_veda`, and the fork's `0306`–`0308` are `0371`–`0373`. Production applied them under the old numbers; their content is unchanged.
 
 This fork release replaces the host account pools with a Claude account pool that users own. Each user adds their own Claude accounts once and uses them in every company where they are an active member; the owner or a company admin binds an account to each Claude agent, and the agent's runs use it on whatever device they run on. One product rule holds everywhere: Paperclip never moves a task to another account. When an account hits its limit, its tasks wait for the reset, start again on the same account, and the task's manager agent and the board get a notice at once. Around that: hosts become execution devices with at most 3 accounts each, an unavailable device or account makes a task wait with a clear banner instead of failing it, a one-time boot job binds the agents that used a host pool, and environment driver plugins get an API to report their targets. Underneath, remote targets no longer receive the server's environment, SSH runs keep secret values off the command line, and only the Claude CLI's own output can mark an account limited or signed out. The full contract is in [AI Connections](../doc/connections/AI-CONNECTIONS.md#claude-account-pool-fork); the design is in [the plan](../doc/plans/2026-10-16-claude-account-pool.md).
 

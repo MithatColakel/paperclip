@@ -274,6 +274,14 @@ export interface DeviceSummaryOptions extends DeviceResolutionOptions {
   /** In `local_trusted` mode the implicit local board user counts as a member of every company. */
   deploymentMode?: DeploymentMode;
   now?: Date;
+  /**
+   * Fork: the viewer's task read predicate (`issueReadSqlCondition`) for the
+   * company's waits. A wait on a task the viewer cannot read (a private task,
+   * doc/ISSUE-PRIVACY.md) keeps its run, agent, reason and times and still
+   * counts in `waitingCount`, but carries no task id, identifier or title.
+   * Every task when omitted (system callers).
+   */
+  issueReadCondition?: SQL<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,14 +1586,19 @@ interface CompanyWait {
   resumeAt: Date | null;
 }
 
-async function openCompanyWaits(db: DeviceDb, companyId: string): Promise<CompanyWait[]> {
+async function openCompanyWaits(
+  db: DeviceDb,
+  companyId: string,
+  issueReadCondition: SQL<boolean> = sql<boolean>`true`,
+): Promise<CompanyWait[]> {
   return db
     .select({
       episodeId: resourceWaitEpisodes.id,
       runId: resourceWaitEpisodes.currentRunId,
       agentId: resourceWaitEpisodes.agentId,
       agentName: agents.name,
-      issueId: resourceWaitEpisodes.issueId,
+      // The task only where the viewer may read it (the join below); otherwise the wait shows under its agent.
+      issueId: issues.id,
       issueIdentifier: issues.identifier,
       issueTitle: issues.title,
       kind: resourceWaitEpisodes.kind,
@@ -1597,7 +1610,7 @@ async function openCompanyWaits(db: DeviceDb, companyId: string): Promise<Compan
     })
     .from(resourceWaitEpisodes)
     .innerJoin(agents, and(eq(agents.id, resourceWaitEpisodes.agentId), eq(agents.companyId, resourceWaitEpisodes.companyId)))
-    .leftJoin(issues, and(eq(issues.id, resourceWaitEpisodes.issueId), eq(issues.companyId, resourceWaitEpisodes.companyId)))
+    .leftJoin(issues, and(eq(issues.id, resourceWaitEpisodes.issueId), eq(issues.companyId, resourceWaitEpisodes.companyId), issueReadCondition))
     .where(and(eq(resourceWaitEpisodes.companyId, companyId), isNull(resourceWaitEpisodes.resolvedAt)))
     .orderBy(asc(resourceWaitEpisodes.since));
 }
@@ -1652,7 +1665,7 @@ async function companyDeviceView(db: DeviceDb, companyId: string, opts: DeviceSu
     return Boolean(account && owner && members.has(owner));
   };
   const users = await usersById(db, visibleDevices.map((device) => device.ownerUserId).filter((id): id is string => Boolean(id)));
-  const waits = await openCompanyWaits(db, companyId);
+  const waits = await openCompanyWaits(db, companyId, opts.issueReadCondition);
 
   const environmentFilter = (environment: ExecutionEnvironmentRow) => isEnvironmentAvailableToCompany(environment, companyId);
   const deviceEnvironmentIds = (deviceId: string) =>
@@ -1728,7 +1741,8 @@ async function companyDeviceView(db: DeviceDb, companyId: string, opts: DeviceSu
  * member of the company; every other account is a count. The device owner is
  * shown for display only. An SSH environment's availability carries no label
  * or message here, since those can name its host (instance view only). Each
- * device carries the company's own waits on it (`waits`).
+ * device carries the company's own waits on it (`waits`), each naming its task
+ * only where `opts.issueReadCondition` lets the viewer read it.
  */
 export async function summariesForCompany(
   db: DeviceDb,

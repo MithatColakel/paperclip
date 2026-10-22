@@ -1,5 +1,6 @@
 import express from "express";
 import request from "supertest";
+import { getTableName } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
@@ -10,6 +11,12 @@ import { HttpError } from "../errors.js";
  * heartbeat-resource-waits.test.ts covers the heartbeat half (the comment wake
  * merges into the waiting run; the check answers without promoting).
  */
+
+// A person's comment commits with its fast-response receipt; mocked as in
+// issue-comment-reopen-routes.test.ts.
+vi.mock("../services/fast-responses.js", () => ({
+  enqueueFastResponse: vi.fn(async () => undefined),
+}));
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -65,7 +72,7 @@ const mockDbSelectWhere = vi.hoisted(() =>
   })),
 );
 const mockDbSelectFrom = vi.hoisted(() =>
-  vi.fn(() => ({ where: mockDbSelectWhere })),
+  vi.fn((_table: unknown) => ({ where: mockDbSelectWhere })),
 );
 const mockDbSelect = vi.hoisted(() =>
   vi.fn(() => ({ from: mockDbSelectFrom })),
@@ -345,7 +352,18 @@ describe("issue comments on a task waiting for a resource", () => {
         onRejected?: (reason: unknown) => unknown,
       ) => Promise.resolve([]).then(onFulfilled, onRejected),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    // An agent's comment checks the run's case handoff first (no handoff here).
+    mockDbSelectFrom.mockImplementation((table) => {
+      const name = getTableName(table as Parameters<typeof getTableName>[0]);
+      if (name === "case_handoffs") return { where: vi.fn(() => ({
+        orderBy: vi.fn(() => ({ limit: vi.fn(async () => []) })),
+      })) };
+      if (name === "heartbeat_runs") return { where: vi.fn(() => {
+        const query = mockDbSelectWhere();
+        return { ...query, limit: vi.fn((count: number) => Promise.resolve(query).then(rows => rows.slice(0, count))) };
+      }) };
+      return { where: mockDbSelectWhere };
+    });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(
       async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx),
@@ -629,7 +647,7 @@ describe("issue comments on a task waiting for a resource", () => {
 
     expect(res.status).toBe(201);
     expect(mockIssueService.update).toHaveBeenCalledWith(issueId, { status: "todo" });
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
     expect(mockHeartbeatService.checkResourceWaitNow).not.toHaveBeenCalled();
   });

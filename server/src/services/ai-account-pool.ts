@@ -869,6 +869,19 @@ function summarizeUsedBy(
 // Service
 // ---------------------------------------------------------------------------
 
+/**
+ * An environment move checked inside the transaction of the write that makes
+ * it (`checkPlacementInWrite`, or `checkHireActivationInWrite` for a hire's
+ * activation); `afterPlacementMove` finishes it once that write has committed.
+ */
+export interface PlacementMove {
+  agentId: string;
+  companyId: string;
+  previousEnvironmentId: string | null;
+  /** The agent holds a pool account, which leaves the devices of its previous placement. */
+  holdsAccount: boolean;
+}
+
 export interface AiAccountPoolServiceOptions {
   /** In `local_trusted` the local board user is a member of every company. Defaults to the server's configured mode. */
   deploymentMode?: DeploymentMode;
@@ -1821,16 +1834,63 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     if (previousEnvironmentId) await wake({ agentIds: [agentId], environmentIds: [previousEnvironmentId] });
   }
 
+  /** The environment move `patch` asks of `agent`; null when it moves nothing. */
+  function requestedMove(
+    agent: Pick<PoolAgentRow, "defaultEnvironmentId">,
+    patch: object,
+  ): { previousEnvironmentId: string | null; nextEnvironmentId: string | null } | null {
+    if (!hasOwn(patch, "defaultEnvironmentId")) return null;
+    const requested = (patch as { defaultEnvironmentId?: unknown }).defaultEnvironmentId;
+    const nextEnvironmentId = typeof requested === "string" ? requested : null;
+    const previousEnvironmentId = agent.defaultEnvironmentId ?? null;
+    return nextEnvironmentId === previousEnvironmentId ? null : { previousEnvironmentId, nextEnvironmentId };
+  }
+
   /**
    * The placement hook of PATCH /agents/:id and the revision rollback (spec
-   * 5.6). When `patch.defaultEnvironmentId` moves the agent, `save` (the
-   * upstream write, given a transaction-bound handle) runs inside one
-   * transaction under the bindings lock, after the placement checks and a
+   * 5.6), run inside `tx`, the transaction of the write that moves the agent
+   * (upstream's configuration write runs it as `beforeWrite`). When
+   * `patch.defaultEnvironmentId` moves the agent, the placement checks and a
    * compare-and-set on the environment the caller validated
-   * (`agent.defaultEnvironmentId`; 409 `placement_conflict`). The write
+   * (`agent.defaultEnvironmentId`; 409 `placement_conflict`) run under the
+   * bindings lock, which `tx` holds until that write commits. The write
    * itself stays upstream's, so config revisions and the pending-approval
-   * freeze see the move. Otherwise `save` runs as it is. The agent's waits
-   * are woken after a move.
+   * freeze see the move. Returns the move, or null when the patch moves
+   * nothing. Nothing here wakes or re-checks: the caller hands the move to
+   * `afterPlacementMove` once the write has committed.
+   */
+  async function checkPlacementInWrite(
+    tx: PoolDb,
+    actor: PoolActor,
+    agent: Pick<PoolAgentRow, "id" | "companyId" | "defaultEnvironmentId">,
+    patch: object,
+  ): Promise<PlacementMove | null> {
+    const move = requestedMove(agent, patch);
+    if (!move) return null;
+    const placement = await assertPlacementIn(tx as Tx, actor, agent, move.previousEnvironmentId, move.nextEnvironmentId);
+    return { agentId: agent.id, companyId: agent.companyId, previousEnvironmentId: move.previousEnvironmentId, holdsAccount: placement?.holdsAccount ?? false };
+  }
+
+  /**
+   * After the write of a checked move has committed: the agent's wakes, and
+   * the cap re-check of the devices its pool account left. Both read the
+   * committed move, so a device that fits again loses its `over_limit_at`,
+   * and no wake runs while the write's transaction holds the agent row.
+   * Failures are only logged.
+   */
+  async function afterPlacementMove(move: PlacementMove): Promise<void> {
+    await wakeAfterMove(move.agentId, move.previousEnvironmentId);
+    if (move.holdsAccount) {
+      await refreshDeviceFlags([poolPlacementOf({ id: move.agentId, companyId: move.companyId, defaultEnvironmentId: move.previousEnvironmentId })]);
+    }
+  }
+
+  /**
+   * `checkPlacementInWrite` for a write that opens no transaction of its
+   * own: when `patch.defaultEnvironmentId` moves the agent, `save` (given a
+   * transaction-bound handle) runs after the checks inside one transaction,
+   * and `afterPlacementMove` follows its commit. Otherwise `save` runs as it
+   * is.
    */
   async function savePlacement<T>(
     actor: PoolActor,
@@ -1838,85 +1898,45 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     patch: object,
     save: (executor: Db) => Promise<T>,
   ): Promise<T> {
-    if (!hasOwn(patch, "defaultEnvironmentId")) return save(db);
-    const requested = (patch as { defaultEnvironmentId?: unknown }).defaultEnvironmentId;
-    const nextEnvironmentId = typeof requested === "string" ? requested : null;
-    const previousEnvironmentId = agent.defaultEnvironmentId ?? null;
-    if (nextEnvironmentId === previousEnvironmentId) return save(db);
+    if (!requestedMove(agent, patch)) return save(db);
     // A handle without transactions (a unit-test stub) cannot hold the lock;
     // the agent service makes the same allowance for its own write.
     if (typeof (db as { transaction?: unknown }).transaction !== "function") return save(db);
-    const { result, holdsAccount } = await db.transaction(async (tx) => {
-      const placement = await assertPlacementIn(tx, actor, agent, previousEnvironmentId, nextEnvironmentId);
-      return { result: await save(asDb(tx)), holdsAccount: placement?.holdsAccount ?? false };
+    const { result, move } = await db.transaction(async (tx) => {
+      const checked = await checkPlacementInWrite(tx, actor, agent, patch);
+      return { result: await save(asDb(tx)), move: checked };
     });
-    await wakeAfterMove(agent.id, previousEnvironmentId);
-    // The account left the devices of the previous placement.
-    if (holdsAccount) await refreshDeviceFlags([poolPlacementOf({ ...agent, defaultEnvironmentId: previousEnvironmentId })]);
+    if (move) await afterPlacementMove(move);
     return result;
   }
 
   /**
-   * Spec 5.6 as written, for an agent that holds a pool account: checks the
-   * move and writes `agents.default_environment_id` itself, compare-and-set
-   * on the previous value, in one transaction under the bindings lock. For
-   * callers whose own write happens elsewhere and later writes the same
-   * value. Any other agent is left as it is (false): the caller's own write
-   * applies its environment, as upstream does.
-   */
-  async function assertPlacementAndWriteEnvironment(
-    actor: PoolActor,
-    agent: Pick<PoolAgentRow, "id" | "companyId" | "defaultEnvironmentId">,
-    nextEnvironmentId: string | null,
-    opts: { onlyStatus?: string } = {},
-  ): Promise<boolean> {
-    const previousEnvironmentId = agent.defaultEnvironmentId ?? null;
-    if (nextEnvironmentId === previousEnvironmentId) return false;
-    const now = clock();
-    const outcome = await db.transaction(async (tx) => {
-      const row = await assertPlacementIn(tx, actor, agent, previousEnvironmentId, nextEnvironmentId);
-      if (!row || !row.holdsAccount || (opts.onlyStatus && row.status !== opts.onlyStatus)) return null;
-      const updated = await tx.update(agents)
-        .set({ defaultEnvironmentId: nextEnvironmentId, updatedAt: now })
-        .where(and(
-          eq(agents.id, agent.id),
-          eq(agents.companyId, agent.companyId),
-          sql`${agents.defaultEnvironmentId} is not distinct from ${previousEnvironmentId}`,
-        ))
-        .returning({ id: agents.id });
-      if (updated.length === 0) {
-        throw conflict("This agent's environment changed while you were editing it. Reload and try again.", { code: "placement_conflict" });
-      }
-      return row;
-    });
-    if (!outcome) return false;
-    await wakeAfterMove(agent.id, previousEnvironmentId);
-    await refreshDeviceFlags([poolPlacementOf({ ...agent, defaultEnvironmentId: previousEnvironmentId })]);
-    return true;
-  }
-
-  /**
-   * The hire-approval hook (spec 5.6): when approving a hire moves a pending
+   * The hire-approval hook (spec 5.6), run inside `tx`, the transaction that
+   * decides a hire approval, before activation applies the approved payload
+   * (the lifecycle's `beforeActivate`). When that payload moves a pending
    * agent that holds a pool account to another environment, the move passes
-   * the placement checks and is written now, under the bindings lock;
-   * activation then writes the same value. Any other hire is left to
-   * activation, which applies the approved payload's environment as
-   * upstream does. The environment applies only when the approved payload
-   * carries one, as activation reads it.
+   * the placement checks under the bindings lock, which `tx` holds until
+   * activation has written the environment and committed; a refusal rolls
+   * the decision back. Nothing here writes the agent (upstream's lifecycle
+   * owns that write). Returns the move for `afterPlacementMove`, or null when
+   * the approval moves nothing or the hire holds no pool account: activation
+   * then applies its environment as upstream does. The environment applies
+   * only when the approved payload carries one, as activation reads it.
    */
-  async function placeHireForApproval(
+  async function checkHireActivationInWrite(
+    tx: PoolDb,
     actor: PoolActor,
-    approval: { companyId: string; type: string; status: string; payload: unknown },
-    requestedEnvironmentId: unknown,
-  ): Promise<void> {
-    if (approval.type !== "hire_agent" || !["pending", "revision_requested"].includes(approval.status)) return;
+    approval: { companyId: string; payload: unknown },
+  ): Promise<PlacementMove | null> {
     const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as Record<string, unknown> : {};
-    const merged = requestedEnvironmentId !== undefined ? { ...payload, defaultEnvironmentId: requestedEnvironmentId } : payload;
-    if (!hasOwn(merged, "defaultEnvironmentId") || typeof payload.agentId !== "string") return;
-    const nextEnvironmentId = typeof merged.defaultEnvironmentId === "string" ? merged.defaultEnvironmentId : null;
-    const agent = await getAgent(payload.agentId);
-    if (!agent || agent.companyId !== approval.companyId || agent.status !== "pending_approval") return;
-    await assertPlacementAndWriteEnvironment(actor, agent, nextEnvironmentId, { onlyStatus: "pending_approval" });
+    if (!hasOwn(payload, "defaultEnvironmentId") || typeof payload.agentId !== "string") return null;
+    const agent = await getAgent(payload.agentId, tx);
+    if (!agent || agent.companyId !== approval.companyId || agent.status !== "pending_approval") return null;
+    const move = requestedMove(agent, payload);
+    if (!move) return null;
+    const placement = await assertPlacementIn(tx as Tx, actor, agent, move.previousEnvironmentId, move.nextEnvironmentId);
+    if (!placement?.holdsAccount || placement.status !== "pending_approval") return null;
+    return { agentId: agent.id, companyId: agent.companyId, previousEnvironmentId: move.previousEnvironmentId, holdsAccount: true };
   }
 
   // --- Instance admin operations ----------------------------------------------
@@ -2053,8 +2073,9 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
     confirmMigratedBinding,
     // Placement
     savePlacement,
-    assertPlacementAndWriteEnvironment,
-    placeHireForApproval,
+    checkPlacementInWrite,
+    checkHireActivationInWrite,
+    afterPlacementMove,
     // Instance admin
     listAll,
     updateInstanceAccount,

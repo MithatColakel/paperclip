@@ -21,7 +21,9 @@ export const aiConnectionPoolMembers = pgTable("ai_connection_pool_members", {
   uniqueIndex("ai_connection_pool_members_priority_uq").on(t.companyId, t.provider, t.priority),
   foreignKey({ columns: [t.companyId, t.connectionId], foreignColumns: [toolConnections.companyId, toolConnections.id], name: "ai_connection_pool_members_company_connection_fk" }).onDelete("cascade"),
   foreignKey({ columns: [t.companyId, t.grantId], foreignColumns: [connectionGrants.companyId, connectionGrants.id], name: "ai_connection_pool_members_company_grant_fk" }).onDelete("cascade"),
-  check("ai_connection_pool_members_provider_check", sql`${t.provider} in ('anthropic','openai','openrouter','xai')`),
+  // Fork: every AI_PROVIDERS entry, since the pool API accepts any of them; a
+  // narrower CHECK turns a valid request into a 500.
+  check("ai_connection_pool_members_provider_check", sql`${t.provider} in ('anthropic','openai','openrouter','xai','google','github')`),
   check("ai_connection_pool_members_priority_check", sql`${t.priority} >= 0`),
 ]);
 

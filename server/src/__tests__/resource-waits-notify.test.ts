@@ -15,6 +15,7 @@ import {
   environments,
   executionWaitSettings,
   heartbeatRuns,
+  issueAccessGrants,
   issues,
   resourceWaitEpisodes,
   resourceWaitNotices,
@@ -308,6 +309,39 @@ describeEmbeddedPostgres("resource wait notices (database)", () => {
     const third = await waiting({ agent: worker, kind: "ai_account", reason: "signed_out", scope: "account", since: now, accountId: pool.id });
     const quiet = notifier();
     expect(await quiet.service.notifyImmediate(third.episode)).toMatchObject({ pmWake: false });
+  });
+
+  it("lists in the PM's wake only the waiting tasks the PM may read", async () => {
+    const now = new Date();
+    const companyId = await company();
+    await member(companyId, "owner-1");
+    await member(companyId, "private-owner");
+    const lead = await agent(companyId, { name: "Lead" });
+    const worker = await agent(companyId, { reportsTo: lead.id });
+    const pool = await account("owner-1", { label: "Max-2", exhaustedUntil: hours(now, 2), limitEpisodeStartedAt: now, limitReason: "provider_quota", limitSource: "provider", limitStrikes: 1 });
+    const task = async (title: string, visibility: "open" | "private") => {
+      const id = randomUUID();
+      const [row] = await db.insert(issues).values({
+        id, companyId, title, status: "in_progress", priority: "medium", assigneeAgentId: worker.id, createdByAgentId: lead.id,
+        ...(visibility === "private" ? { visibility, privacyRootIssueId: id, responsibleUserId: "private-owner", createdByUserId: "private-owner" } : {}),
+      }).returning();
+      const wait = await waiting({ agent: worker, issueId: row!.id, kind: "ai_account", reason: "usage_limit", scope: "account", since: now, accountId: pool.id, resumeAt: hours(now, 2) });
+      return { id: row!.id, episode: wait.episode };
+    };
+    const open = await task("Open task", "open");
+    // Private to its owner: neither the lead's own nor shared with it (creating it as an agent grants nothing).
+    const unreadable = await task("Private task", "private");
+    // Private, but shared with the lead.
+    const shared = await task("Private task shared with the lead", "private");
+    await db.insert(issueAccessGrants).values({ issueId: shared.id, subjectType: "agent", subjectId: lead.id, source: "explicit", grantedByUserId: "private-owner" });
+
+    const { service, wakes } = notifier();
+    expect(await service.notifyImmediate(open.episode, now)).toMatchObject({ pmWake: true });
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.agentId).toBe(lead.id);
+    const listed = (wakes[0]!.opts.contextSnapshot.resourceWaitNotice as { issueIds: string[] }).issueIds;
+    expect([...listed].sort()).toEqual([open.id, shared.id].sort());
+    expect(JSON.stringify(wakes[0]!.opts)).not.toContain(unreadable.id);
   });
 
   it("reports a long device wait once after the threshold, and the PM only when the company asks", async () => {

@@ -18,6 +18,7 @@ const items = [
   { value: "claude-accounts", label: "Claude accounts", href: "/company/settings/claude-accounts" },
   { value: "devices", label: "Devices", href: "/company/settings/devices" },
   { value: "instance-ai-accounts", label: "Devices & Claude accounts", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/ai-accounts` },
+  { value: "connections", label: "Connections", href: "/company/settings/connections" },
   { value: "instance-access", label: "Access", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/access` },
   { value: "instance-experimental", label: "Experimental", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/experimental` },
   { value: "instance-plugins", label: "Plugins", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/plugins` },
@@ -41,6 +42,10 @@ const hiddenSettingKeyByTab: Partial<Record<CompanySettingsTab, string>> = {
 };
 
 export function getCompanySettingsTab(pathname: string): CompanySettingsTab {
+  if (pathname.includes("/company/settings/connections")) {
+    return "connections";
+  }
+
   if (pathname.includes(`${INSTANCE_SETTINGS_PATH_PREFIX}/profile`)) {
     return "instance-profile";
   }

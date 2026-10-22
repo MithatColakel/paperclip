@@ -68,6 +68,7 @@ describe("CompanySettingsNav", () => {
   it("maps company settings routes to the expected shared tab value", () => {
     expect(getCompanySettingsTab("/company/settings")).toBe("general");
     expect(getCompanySettingsTab("/PAP/company/settings")).toBe("general");
+    expect(getCompanySettingsTab("/PAP/company/settings/connections")).toBe("connections");
     expect(getCompanySettingsTab("/company/settings/environments")).toBe("instance-environments");
     expect(getCompanySettingsTab("/company/export")).toBe("export");
     expect(getCompanySettingsTab("/PAP/company/export")).toBe("export");
@@ -97,8 +98,10 @@ describe("CompanySettingsNav", () => {
     hiddenSettings?: string[],
     cloud?: { managed: boolean },
     boardAccess?: { isInstanceAdmin: boolean; source: string },
+    fastResponsesEnabled = true,
   ) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.instance.experimentalSettings, { enableFastResponses: fastResponsesEnabled });
     queryClient.setQueryData(queryKeys.health, {
       status: "ok",
       ...(hiddenSettings ? { hiddenSettings } : {}),
@@ -111,6 +114,13 @@ describe("CompanySettingsNav", () => {
       </QueryClientProvider>,
     );
   }
+
+  it("shows Connections while fast responses are disabled", async () => {
+    const root = createRoot(container);
+    await act(async () => { renderNav(root, undefined, undefined, undefined, false); });
+    expect(pageTabBarMock.mock.calls.at(-1)?.[0]?.items).toContainEqual({ value: "connections", label: "Connections" });
+    await act(async () => { root.unmount(); });
+  });
 
   it("renders the active tab and navigates when a different tab is selected", async () => {
     currentPathname = "/PAP/company/settings/members";
@@ -134,6 +144,7 @@ describe("CompanySettingsNav", () => {
           { value: "instance-environments", label: "Environments" },
           { value: "claude-accounts", label: "Claude accounts" },
           { value: "devices", label: "Devices" },
+          { value: "connections", label: "Connections" },
           { value: "instance-access", label: "Access" },
           { value: "instance-experimental", label: "Experimental" },
           { value: "instance-plugins", label: "Plugins" },
@@ -224,6 +235,7 @@ describe("CompanySettingsNav", () => {
       "instance-environments",
       "claude-accounts",
       "devices",
+      "connections",
       "instance-access",
       "instance-experimental",
       "instance-adapters",

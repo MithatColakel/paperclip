@@ -50,6 +50,7 @@ afterEach(() => {
 
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const argv = process.argv.slice(2);
 if (argv.includes("--help")) {
   process.stdout.write("Usage: claude [options]\\n  --print\\n  --model <id>\\n");
@@ -306,8 +307,9 @@ describe("claude_local environment diagnostics", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { model: "claude-opus-5",
+      config: {
         engine: "cli",
+        model: "claude-opus-5",
         command: "claude",
       },
       executionTarget: {
@@ -381,6 +383,7 @@ describe("claude_local environment diagnostics", () => {
     await fs.writeFile(path.join(sourceConfigDir, "credentials.json"), JSON.stringify({ token: "local" }), "utf8");
     await fs.writeFile(path.join(remoteHome, ".claude", ".credentials.json"), JSON.stringify({ token: "remote" }), "utf8");
     await fs.writeFile(commandPath, `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("fs");
 const path = require("path");
 const configDir = process.env.CLAUDE_CONFIG_DIR || "";

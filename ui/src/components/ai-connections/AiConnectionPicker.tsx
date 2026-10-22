@@ -125,8 +125,8 @@ export function AiConnectionPicker({
               })),
             ]}
             onSelect={(id) => {
-              if (id === "responsible_user") onChange({provider: requirement.provider, method: personalDefault?.method ?? requirement.method ?? (requirement.provider === "openrouter" ? "api_key" : "subscription"), mode: "responsible_user"});
-              else if (id === "company_pool") onChange({provider: requirement.provider, method: requirement.method ?? (requirement.provider === "openrouter" ? "api_key" : "subscription"), mode: "company_pool"});
+              if (id === "responsible_user") onChange({provider: requirement.provider, method: personalDefault?.method ?? requirement.method ?? ((requirement.provider === "openrouter" || requirement.provider === "github") ? "api_key" : "subscription"), mode: "responsible_user"});
+              else if (id === "company_pool") onChange({provider: requirement.provider, method: requirement.method ?? ((requirement.provider === "openrouter" || requirement.provider === "github") ? "api_key" : "subscription"), mode: "company_pool"});
               else { const connection = compatible.find((item) => item.id === id)!; select("shared", connection); }
             }}
           />

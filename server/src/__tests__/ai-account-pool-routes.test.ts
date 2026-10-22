@@ -34,7 +34,9 @@ import { projectRoutes } from "../routes/projects.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { aiConnectionPoolService } from "../services/ai-connection-pool.js";
+import { recheckDeviceLimits } from "../services/ai-account-pool.js";
 import { deviceForEnvironment } from "../services/execution-devices.js";
+import { readWakeEpochs } from "../services/resource-waits/epochs.js";
 
 type Actor = Express.Request["actor"];
 
@@ -471,6 +473,55 @@ describeEmbeddedPostgres("account pool routes", () => {
       expect(rolledBack.body.defaultEnvironmentId).toBe(ssh.id);
     });
 
+    it("clears the over-limit flag of the device a PATCH or a rollback moves a bound agent off, once the move commits", async () => {
+      const companyId = await company("Crowded");
+      actors.local = { type: "board", source: "local_implicit", userId: "local-board", isInstanceAdmin: true };
+      const server = agentsApp();
+      const ssh = await sshEnvironment();
+      const [mover, stayer] = [await agent(companyId, { defaultEnvironmentId: ssh.id }), await agent(companyId, { defaultEnvironmentId: ssh.id })];
+      for (const [label, pinned] of [["Mover", mover], ["Stayer", stayer]] as const) {
+        expect((await put(server, "local", pinned.id, { mode: "pool_account", accountId: (await addAccount(server, "local", label)).id })).status).toBe(200);
+      }
+      const device = (await deviceForEnvironment(db, ssh))!;
+      const overLimitAt = async () =>
+        (await db.select({ overLimitAt: aiAccountHosts.overLimitAt }).from(aiAccountHosts).where(eq(aiAccountHosts.id, device.id)))[0]!.overLimitAt;
+      /** Both bound agents on the runner, lowered to one account: flagged over its limit, with a wait of the mover's to wake. */
+      async function crowd() {
+        await db.update(agents).set({ defaultEnvironmentId: ssh.id }).where(eq(agents.id, mover.id));
+        await db.update(aiAccountHosts).set({ maxAccounts: 1 }).where(eq(aiAccountHosts.id, device.id));
+        expect(await recheckDeviceLimits(db, { deviceIds: [device.id] })).toEqual([expect.objectContaining({ inUse: 2, limit: 1, change: "flagged" })]);
+        const [waiting] = await db.insert(heartbeatRuns).values({
+          companyId,
+          agentId: mover.id,
+          status: "scheduled_retry",
+          scheduledRetryReason: "environment_wait",
+          scheduledRetryAt: new Date(Date.now() + 60 * 60_000),
+          contextSnapshot: { resourceWait: { version: 1, episodeId: randomUUID(), kind: "environment", reason: "offline" } },
+        }).returning();
+        return { waiting: waiting!, before: await readWakeEpochs(db, { environmentId: ssh.id, agentId: mover.id }) };
+      }
+      async function expectMovedOff(response: { status: number; body: { defaultEnvironmentId?: unknown } }, crowded: Awaited<ReturnType<typeof crowd>>) {
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        expect(response.body.defaultEnvironmentId).toBe(localEnvironment.id);
+        // The re-check read the committed move: the runner fits its limit again.
+        expect(await overLimitAt()).toBeNull();
+        const [woken] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, crowded.waiting.id));
+        expect(woken!.scheduledRetryAt!.getTime()).toBeLessThanOrEqual(Date.now());
+        const after = await readWakeEpochs(db, { environmentId: ssh.id, agentId: mover.id });
+        expect(after.bindingUpdatedAt! > crowded.before.bindingUpdatedAt!).toBe(true);
+        expect(after.environmentEpoch!).toBeGreaterThan(crowded.before.environmentEpoch!);
+      }
+
+      const patched = await crowd();
+      await expectMovedOff(await request(server).patch(`/api/agents/${mover.id}`).set("x-actor", "local").send({ defaultEnvironmentId: localEnvironment.id }), patched);
+      const [revision] = await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, mover.id)).orderBy(desc(agentConfigRevisions.createdAt)).limit(1);
+      expect(revision!.afterConfig).toMatchObject({ defaultEnvironmentId: localEnvironment.id });
+
+      // A rollback to that revision moves the agent off the runner again.
+      const rolledBack = await crowd();
+      await expectMovedOff(await request(server).post(`/api/agents/${mover.id}/config-revisions/${revision!.id}/rollback`).set("x-actor", "local").send({}), rolledBack);
+    });
+
     it("refuses new company pool bindings and routers for Claude agents", async () => {
       const companyId = await company("Retired");
       actors.local = { type: "board", source: "local_implicit", userId: "local-board", isInstanceAdmin: true };
@@ -626,14 +677,15 @@ describeEmbeddedPostgres("account pool routes", () => {
       expect(await environmentOf(bound.id)).toEqual({ defaultEnvironmentId: null, status: "pending_approval" });
       const approved = await approve(boundApproval.id, { defaultEnvironmentId: localEnvironment.id });
       expect(approved.status, JSON.stringify(approved.body)).toBe(200);
-      expect(await environmentOf(bound.id)).toEqual({ defaultEnvironmentId: localEnvironment.id, status: "idle" });
+      expect(await environmentOf(bound.id)).toEqual({ defaultEnvironmentId: localEnvironment.id, status: "paused" });
 
+      // Upstream leaves an approved hire paused while it prepares.
       // A hire without a pool account takes its environment at activation, as upstream does.
       const unbound = await agent(a, { status: "pending_approval" });
       const unboundApproval = await hireApproval(a, unbound);
       const activated = await approve(unboundApproval.id, { defaultEnvironmentId: full.id });
       expect(activated.status, JSON.stringify(activated.body)).toBe(200);
-      expect(await environmentOf(unbound.id)).toEqual({ defaultEnvironmentId: full.id, status: "idle" });
+      expect(await environmentOf(unbound.id)).toEqual({ defaultEnvironmentId: full.id, status: "paused" });
 
       // An approval that fails leaves such a hire where it was.
       const broken = await agent(a, { status: "pending_approval" });
@@ -643,6 +695,42 @@ describeEmbeddedPostgres("account pool routes", () => {
       expect(await environmentOf(broken.id)).toEqual({ defaultEnvironmentId: null, status: "pending_approval" });
       const [stillPending] = await db.select({ status: approvals.status }).from(approvals).where(eq(approvals.id, brokenApproval.id));
       expect(stillPending!.status).toBe("pending");
+
+      // A pool-bound hire too: only the activation writes its checked move.
+      const brokenBound = await agent(a, { status: "pending_approval" });
+      expect((await put(poolServer, "owner", brokenBound.id, { mode: "pool_account", accountId: x.id })).status).toBe(200);
+      const brokenBoundApproval = await hireApproval(a, brokenBound, { appearance: { schemaVersion: 2 } });
+      const failedBound = await approve(brokenBoundApproval.id, { defaultEnvironmentId: localEnvironment.id });
+      expect(failedBound.status).toBeGreaterThanOrEqual(400);
+      expect(await environmentOf(brokenBound.id)).toEqual({ defaultEnvironmentId: null, status: "pending_approval" });
+      const [boundStillPending] = await db.select({ status: approvals.status }).from(approvals).where(eq(approvals.id, brokenBoundApproval.id));
+      expect(boundStillPending!.status).toBe("pending");
+    });
+
+    it("clears the over-limit flag of the device an approved pool-bound hire leaves, once its activation commits", async () => {
+      const { a, x, y } = await world();
+      const server = approvalsApp();
+      const poolServer = app();
+      const ssh = await sshEnvironment("crowded runner");
+      const hired = await agent(a, { status: "pending_approval", defaultEnvironmentId: ssh.id });
+      expect((await put(poolServer, "owner", hired.id, { mode: "pool_account", accountId: x.id })).status).toBe(200);
+      expect((await put(poolServer, "other", (await agent(a, { defaultEnvironmentId: ssh.id })).id, { mode: "pool_account", accountId: y.id })).status).toBe(200);
+      // Lowered to one account, the runner is over its limit until the hire leaves it.
+      const device = (await deviceForEnvironment(db, ssh))!;
+      await db.update(aiAccountHosts).set({ maxAccounts: 1 }).where(eq(aiAccountHosts.id, device.id));
+      expect(await recheckDeviceLimits(db, { deviceIds: [device.id] })).toEqual([expect.objectContaining({ inUse: 2, limit: 1, change: "flagged" })]);
+      const before = await readWakeEpochs(db, { environmentId: ssh.id, agentId: hired.id });
+
+      const approval = await hireApproval(a, hired);
+      const approved = await request(server).post(`/api/approvals/${approval.id}/approve`).set("x-actor", "admin").send({ defaultEnvironmentId: localEnvironment.id });
+      expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+      expect(await environmentOf(hired.id)).toEqual({ defaultEnvironmentId: localEnvironment.id, status: "paused" });
+      // The re-check read the committed activation: the runner fits its limit again.
+      const [runner] = await db.select({ overLimitAt: aiAccountHosts.overLimitAt }).from(aiAccountHosts).where(eq(aiAccountHosts.id, device.id));
+      expect(runner!.overLimitAt).toBeNull();
+      const after = await readWakeEpochs(db, { environmentId: ssh.id, agentId: hired.id });
+      expect(after.bindingUpdatedAt! > before.bindingUpdatedAt!).toBe(true);
+      expect(after.environmentEpoch!).toBeGreaterThan(before.environmentEpoch!);
     });
   });
 
