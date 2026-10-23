@@ -100,7 +100,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     Awaited<ReturnType<ReturnType<typeof createHeartbeatRunState>["getRun"]>> | null
   >;
   environmentRuntime: ReturnType<typeof environmentRuntimeService>;
-  environmentsSvc: Pick<ReturnType<typeof environmentService>, "getById" | "getLeaseById" | "releaseLease">;
+  environmentsSvc: Pick<ReturnType<typeof environmentService>, "getById" | "getLeaseById" | "releaseLease" | "settleSupersededReusableLease">;
   instructionCopies: Pick<ReturnType<typeof agentInstructionWorkingCopyService>, "recoverStopped" | "recoverCaptured">;
   runtimeEnv: Record<string, string | undefined>;
   // Preserve the module-wide sets shared by scheduler and route service instances.
@@ -1648,6 +1648,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // environment still exists tears down through `destroyRunLease`. That
       // path uses the provider and configuration recorded on the lease first;
       // the environment is lifecycle context and only a legacy fallback.
+      // Fork: the agent's next run may already hold this reusable sandbox
+      // through a newer live lease. A teardown now would stop and delete that
+      // run's workspace, so the stale row settles without one.
+      if (lease.leasePolicy === "reuse_by_environment" && !hasStopOnlyCleanup(lease)
+        && await environmentsSvc.settleSupersededReusableLease(lease.id)) {
+        logger.info({ leaseId: row.id }, "settled a pending_cleanup lease whose sandbox a live lease reused");
+        continue;
+      }
+
       const isOrphanEphemeralLease = lease.leasePolicy === "ephemeral";
       const useRecordedTeardown = isOrphanEphemeralLease || !environment || hasStopOnlyCleanup(lease);
 
