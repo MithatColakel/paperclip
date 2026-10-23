@@ -14116,9 +14116,9 @@ export function issueRoutes(
         }
       };
       // Every step below that cannot be undone awaits this first. It checks
-      // the row read above once for each version of the patch: the
-      // scheduled-retry cancel runs before the policy transition adds its
-      // fields, so a step after the transition checks the final patch again.
+      // the row read above once for each version of the patch: when the
+      // scheduled-retry cancel loses its retry, the transition runs again
+      // without the move to todo, and the next step checks that patch.
       let issueUpdatePrecheck: {
         fields: Record<string, unknown>;
         result: Promise<void>;
@@ -14176,16 +14176,297 @@ export function issueRoutes(
         }
       };
 
-      // Whether this cancel succeeds decides whether the comment moves the
-      // task to todo, which the policy transition below reads. So the cancel
-      // runs here, as late as its result allows, and the precheck sees the
-      // patch without the transition's fields.
-      let cancelledScheduledRetryRunId: string | null = null;
-      if (
-        commentBody &&
+      // A human comment supersedes a parked retry: it cancels the retry and
+      // moves the task to todo. Only the cancel knows whether it wins the
+      // retry, and the policy transition and the route checks below read the
+      // status it decides. So they run first on the patch that assumes the
+      // cancel wins, and the cancel runs after them, before any other step
+      // that stops work. If the retry started in the meantime, nothing has
+      // been stopped yet: they run again on the patch without the move, and
+      // the task stays in progress, as the cancel fence promises.
+      const cancelsScheduledRetrySupersededByComment =
+        Boolean(commentBody) &&
         shouldResumeInProgressScheduledRetry &&
-        updateFields.status === "todo"
-      ) {
+        updateFields.status === "todo";
+      const updateFieldsBeforeTransition = { ...updateFields };
+      // The policy transition and the route checks that read its result.
+      // Returns null when a check has already sent the response.
+      const applyTransitionAndRouteChecks = async () => {
+        const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
+          ? { patch: {} }
+          : applyIssueExecutionPolicyTransition({
+          issue: existing,
+          policy: nextExecutionPolicy,
+          previousPolicy: previousExecutionPolicy,
+          requestedStatus:
+            typeof updateFields.status === "string"
+              ? updateFields.status
+              : undefined,
+          requestedAssigneePatch: {
+            assigneeAgentId: normalizedAssigneeAgentId,
+            assigneeUserId:
+              req.body.assigneeUserId === undefined
+                ? undefined
+                : (req.body.assigneeUserId as string | null),
+          },
+          actor: {
+            agentId: actor.agentId ?? null,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+          allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+          commentBody,
+          reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+          monitorExplicitlyUpdated:
+            req.body.executionPolicy !== undefined && monitorChanged,
+        });
+        const decisionId = transition.decision ? randomUUID() : null;
+        if (decisionId) {
+          const nextExecutionState = transition.patch.executionState;
+          if (!nextExecutionState || typeof nextExecutionState !== "object") {
+            throw new Error(
+              "Execution policy decision patch is missing executionState",
+            );
+          }
+          transition.patch.executionState = {
+            ...nextExecutionState,
+            lastDecisionId: decisionId,
+          };
+        }
+        if (expectedExecutionPolicy !== undefined && (
+          (transition.patch.status !== undefined && transition.patch.status !== existing.status) ||
+          (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== existing.assigneeAgentId) ||
+          (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== existing.assigneeUserId)
+        )) {
+          throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
+        }
+        Object.assign(updateFields, transition.patch);
+
+        const nextStatus = updateFields.status ?? existing.status;
+        if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
+          throw unprocessable("unblockDescriptor requires blocked status");
+        }
+        const descriptor = updateFields.unblockDescriptor ?? null;
+        if (descriptor && typeof descriptor === "object") {
+          const owner = descriptor.owner;
+          if (
+            req.actor.type === "agent" &&
+            (owner === "board" || "userId" in owner)
+          ) {
+            throw forbidden(
+              "Agents may only name themselves as an unblock owner",
+            );
+          }
+          if (owner !== "board" && "agentId" in owner) {
+            const target = await db
+              .select({ id: agents.id })
+              .from(agents)
+              .where(
+                and(
+                  eq(agents.id, owner.agentId),
+                  eq(agents.companyId, existing.companyId),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (!target)
+              throw unprocessable(
+                "Unblock owner agent must belong to the issue company",
+              );
+            if (
+              req.actor.type === "agent" &&
+              req.actor.agentId !== owner.agentId
+            ) {
+              throw forbidden(
+                "Agents may only name themselves as an unblock owner",
+              );
+            }
+          } else if (owner !== "board" && "userId" in owner) {
+            const member = await db
+              .select({ id: companyMemberships.id })
+              .from(companyMemberships)
+              .where(
+                and(
+                  eq(companyMemberships.companyId, existing.companyId),
+                  eq(companyMemberships.principalType, "user"),
+                  eq(companyMemberships.principalId, owner.userId),
+                  eq(companyMemberships.status, "active"),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (!member)
+              throw unprocessable(
+                "Unblock owner user must be an active company member",
+              );
+          }
+        }
+        const enteringBlocked =
+          existing.status !== "blocked" && updateFields.status === "blocked";
+        if (enteringBlocked) {
+          const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
+            ? [...new Set(req.body.blockedByIssueIds as string[])]
+            : null;
+          const hasUnresolvedBlocker = requestedBlockerIds
+            ? requestedBlockerIds.length > 0 &&
+              (await db
+                .select({ id: issueRows.id })
+                .from(issueRows)
+                .where(
+                  and(
+                    eq(issueRows.companyId, existing.companyId),
+                    inArray(issueRows.id, requestedBlockerIds),
+                    notInArray(issueRows.status, ["done", "cancelled"]),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows.length > 0))
+            : (await svc.getDependencyReadiness(existing.id))
+                .unresolvedBlockerCount > 0;
+          const [pendingInteraction, pendingApproval] = await Promise.all([
+            db
+              .select({ id: issueThreadInteractions.id })
+              .from(issueThreadInteractions)
+              .where(
+                and(
+                  eq(issueThreadInteractions.companyId, existing.companyId),
+                  eq(issueThreadInteractions.issueId, existing.id),
+                  eq(issueThreadInteractions.status, "pending"),
+                  activeIssueInteractionCondition(),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null),
+            db
+              .select({ id: approvals.id })
+              .from(issueApprovals)
+              .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+              .where(
+                and(
+                  eq(issueApprovals.companyId, existing.companyId),
+                  eq(issueApprovals.issueId, existing.id),
+                  eq(approvals.status, "pending"),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null),
+          ]);
+          if (
+            !hasUnresolvedBlocker &&
+            !pendingInteraction &&
+            !pendingApproval &&
+            !descriptor
+          ) {
+            res.status(422).json({
+              error:
+                "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            });
+            return null;
+          }
+        }
+        if (
+          reviewRequest !== undefined &&
+          transition.patch.executionState === undefined
+        ) {
+          const existingExecutionState = parseIssueExecutionState(
+            existing.executionState,
+          );
+          if (
+            !existingExecutionState ||
+            existingExecutionState.status !== "pending"
+          ) {
+            if (reviewRequest !== null) {
+              res.status(422).json({
+                error:
+                  "reviewRequest requires an active review or approval stage",
+              });
+              return null;
+            }
+          } else {
+            updateFields.executionState = {
+              ...existingExecutionState,
+              reviewRequest,
+            };
+          }
+        }
+
+        const reviewInteractionId = await assertInReviewReviewPath({
+          existing,
+          updateFields,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          actorAgentId: actor.agentId,
+          actorRunId: actor.runId,
+          reviewInteractionId: requestedReviewInteractionId,
+        });
+        const enteringReviewRequested =
+          existing.status !== "in_review" && updateFields.status === "in_review";
+        const persistReviewActivityTransactionally =
+          enteringReviewRequested || Boolean(reviewInteractionId);
+
+        const nextAssigneeAgentId =
+          updateFields.assigneeAgentId === undefined
+            ? existing.assigneeAgentId
+            : (updateFields.assigneeAgentId as string | null);
+        const nextAssigneeUserId =
+          updateFields.assigneeUserId === undefined
+            ? existing.assigneeUserId
+            : (updateFields.assigneeUserId as string | null);
+        const assigneeWillChange =
+          nextAssigneeAgentId !== existing.assigneeAgentId ||
+          nextAssigneeUserId !== existing.assigneeUserId;
+        const isAgentReturningIssueToCreator =
+          req.actor.type === "agent" &&
+          !!req.actor.agentId &&
+          existing.assigneeAgentId === req.actor.agentId &&
+          nextAssigneeAgentId === null &&
+          typeof nextAssigneeUserId === "string" &&
+          !!existing.createdByUserId &&
+          nextAssigneeUserId === existing.createdByUserId;
+
+        if (assigneeWillChange && actor.actorType === "agent" &&
+            existing.assigneeAgentId === actor.agentId && updateFields.status === "in_review" &&
+            await hasQueuedInteractionResponse(db, existing.companyId, existing.id, existing.assigneeAgentId)) {
+          throw conflict("The user already responded. Keep the current assignee so the queued response can continue after this run.", {
+            code: "interaction_response_queued",
+          });
+        }
+        if (assigneeWillChange && !transition.workflowControlledAssignment) {
+          if (!isAgentReturningIssueToCreator) {
+            await assertCanAssignTasks(req, existing.companyId, {
+              issueId: existing.id,
+              projectId: await resolveAssignmentProjectId({
+                companyId: existing.companyId,
+                projectId:
+                  updateFields.projectId === undefined
+                    ? existing.projectId
+                    : (updateFields.projectId as string | null | undefined),
+                parentIssueId: (updateFields.parentId === undefined
+                  ? existing.parentId
+                  : updateFields.parentId) as string | null | undefined,
+              }),
+              parentIssueId: (updateFields.parentId === undefined
+                ? existing.parentId
+                : updateFields.parentId) as string | null | undefined,
+              assigneeAgentId: nextAssigneeAgentId,
+              assigneeUserId: nextAssigneeUserId,
+            });
+          }
+        }
+        return {
+          transition,
+          decisionId,
+          enteringBlocked,
+          reviewInteractionId,
+          persistReviewActivityTransactionally,
+          nextAssigneeAgentId,
+          nextAssigneeUserId,
+          assigneeWillChange,
+        };
+      };
+      let routeChecks = await applyTransitionAndRouteChecks();
+      if (!routeChecks) return;
+      let cancelledScheduledRetryRunId: string | null = null;
+      if (cancelsScheduledRetrySupersededByComment) {
         cancelledScheduledRetryRunId =
           await cancelScheduledRetrySupersededByComment({
             scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
@@ -14196,271 +14477,24 @@ export function issueRoutes(
         if (!cancelledScheduledRetryRunId) {
           shouldResumeInProgressScheduledRetry = false;
           if (!explicitMoveToTodoRequested && req.body.status === undefined) {
+            for (const key of Object.keys(updateFields)) delete updateFields[key];
+            Object.assign(updateFields, updateFieldsBeforeTransition);
             delete updateFields.status;
+            routeChecks = await applyTransitionAndRouteChecks();
+            if (!routeChecks) return;
           }
         }
       }
-
-      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
-        ? { patch: {} }
-        : applyIssueExecutionPolicyTransition({
-        issue: existing,
-        policy: nextExecutionPolicy,
-        previousPolicy: previousExecutionPolicy,
-        requestedStatus:
-          typeof updateFields.status === "string"
-            ? updateFields.status
-            : undefined,
-        requestedAssigneePatch: {
-          assigneeAgentId: normalizedAssigneeAgentId,
-          assigneeUserId:
-            req.body.assigneeUserId === undefined
-              ? undefined
-              : (req.body.assigneeUserId as string | null),
-        },
-        actor: {
-          agentId: actor.agentId ?? null,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-        allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
-        commentBody,
-        reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-        monitorExplicitlyUpdated:
-          req.body.executionPolicy !== undefined && monitorChanged,
-      });
-      const decisionId = transition.decision ? randomUUID() : null;
-      if (decisionId) {
-        const nextExecutionState = transition.patch.executionState;
-        if (!nextExecutionState || typeof nextExecutionState !== "object") {
-          throw new Error(
-            "Execution policy decision patch is missing executionState",
-          );
-        }
-        transition.patch.executionState = {
-          ...nextExecutionState,
-          lastDecisionId: decisionId,
-        };
-      }
-      if (expectedExecutionPolicy !== undefined && (
-        (transition.patch.status !== undefined && transition.patch.status !== existing.status) ||
-        (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== existing.assigneeAgentId) ||
-        (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== existing.assigneeUserId)
-      )) {
-        throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
-      }
-      Object.assign(updateFields, transition.patch);
-
-      const nextStatus = updateFields.status ?? existing.status;
-      if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
-        throw unprocessable("unblockDescriptor requires blocked status");
-      }
-      const descriptor = updateFields.unblockDescriptor ?? null;
-      if (descriptor && typeof descriptor === "object") {
-        const owner = descriptor.owner;
-        if (
-          req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
-        ) {
-          throw forbidden(
-            "Agents may only name themselves as an unblock owner",
-          );
-        }
-        if (owner !== "board" && "agentId" in owner) {
-          const target = await db
-            .select({ id: agents.id })
-            .from(agents)
-            .where(
-              and(
-                eq(agents.id, owner.agentId),
-                eq(agents.companyId, existing.companyId),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!target)
-            throw unprocessable(
-              "Unblock owner agent must belong to the issue company",
-            );
-          if (
-            req.actor.type === "agent" &&
-            req.actor.agentId !== owner.agentId
-          ) {
-            throw forbidden(
-              "Agents may only name themselves as an unblock owner",
-            );
-          }
-        } else if (owner !== "board" && "userId" in owner) {
-          const member = await db
-            .select({ id: companyMemberships.id })
-            .from(companyMemberships)
-            .where(
-              and(
-                eq(companyMemberships.companyId, existing.companyId),
-                eq(companyMemberships.principalType, "user"),
-                eq(companyMemberships.principalId, owner.userId),
-                eq(companyMemberships.status, "active"),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!member)
-            throw unprocessable(
-              "Unblock owner user must be an active company member",
-            );
-        }
-      }
-      const enteringBlocked =
-        existing.status !== "blocked" && updateFields.status === "blocked";
-      if (enteringBlocked) {
-        const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
-          ? [...new Set(req.body.blockedByIssueIds as string[])]
-          : null;
-        const hasUnresolvedBlocker = requestedBlockerIds
-          ? requestedBlockerIds.length > 0 &&
-            (await db
-              .select({ id: issueRows.id })
-              .from(issueRows)
-              .where(
-                and(
-                  eq(issueRows.companyId, existing.companyId),
-                  inArray(issueRows.id, requestedBlockerIds),
-                  notInArray(issueRows.status, ["done", "cancelled"]),
-                ),
-              )
-              .limit(1)
-              .then((rows) => rows.length > 0))
-          : (await svc.getDependencyReadiness(existing.id))
-              .unresolvedBlockerCount > 0;
-        const [pendingInteraction, pendingApproval] = await Promise.all([
-          db
-            .select({ id: issueThreadInteractions.id })
-            .from(issueThreadInteractions)
-            .where(
-              and(
-                eq(issueThreadInteractions.companyId, existing.companyId),
-                eq(issueThreadInteractions.issueId, existing.id),
-                eq(issueThreadInteractions.status, "pending"),
-                activeIssueInteractionCondition(),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null),
-          db
-            .select({ id: approvals.id })
-            .from(issueApprovals)
-            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-            .where(
-              and(
-                eq(issueApprovals.companyId, existing.companyId),
-                eq(issueApprovals.issueId, existing.id),
-                eq(approvals.status, "pending"),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null),
-        ]);
-        if (
-          !hasUnresolvedBlocker &&
-          !pendingInteraction &&
-          !pendingApproval &&
-          !descriptor
-        ) {
-          res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
-          });
-          return;
-        }
-      }
-      if (
-        reviewRequest !== undefined &&
-        transition.patch.executionState === undefined
-      ) {
-        const existingExecutionState = parseIssueExecutionState(
-          existing.executionState,
-        );
-        if (
-          !existingExecutionState ||
-          existingExecutionState.status !== "pending"
-        ) {
-          if (reviewRequest !== null) {
-            res.status(422).json({
-              error:
-                "reviewRequest requires an active review or approval stage",
-            });
-            return;
-          }
-        } else {
-          updateFields.executionState = {
-            ...existingExecutionState,
-            reviewRequest,
-          };
-        }
-      }
-
-      const reviewInteractionId = await assertInReviewReviewPath({
-        existing,
-        updateFields,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        actorAgentId: actor.agentId,
-        actorRunId: actor.runId,
-        reviewInteractionId: requestedReviewInteractionId,
-      });
-      const enteringReviewRequested =
-        existing.status !== "in_review" && updateFields.status === "in_review";
-      const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
-
-      const nextAssigneeAgentId =
-        updateFields.assigneeAgentId === undefined
-          ? existing.assigneeAgentId
-          : (updateFields.assigneeAgentId as string | null);
-      const nextAssigneeUserId =
-        updateFields.assigneeUserId === undefined
-          ? existing.assigneeUserId
-          : (updateFields.assigneeUserId as string | null);
-      const assigneeWillChange =
-        nextAssigneeAgentId !== existing.assigneeAgentId ||
-        nextAssigneeUserId !== existing.assigneeUserId;
-      const isAgentReturningIssueToCreator =
-        req.actor.type === "agent" &&
-        !!req.actor.agentId &&
-        existing.assigneeAgentId === req.actor.agentId &&
-        nextAssigneeAgentId === null &&
-        typeof nextAssigneeUserId === "string" &&
-        !!existing.createdByUserId &&
-        nextAssigneeUserId === existing.createdByUserId;
-
-      if (assigneeWillChange && actor.actorType === "agent" &&
-          existing.assigneeAgentId === actor.agentId && updateFields.status === "in_review" &&
-          await hasQueuedInteractionResponse(db, existing.companyId, existing.id, existing.assigneeAgentId)) {
-        throw conflict("The user already responded. Keep the current assignee so the queued response can continue after this run.", {
-          code: "interaction_response_queued",
-        });
-      }
-      if (assigneeWillChange && !transition.workflowControlledAssignment) {
-        if (!isAgentReturningIssueToCreator) {
-          await assertCanAssignTasks(req, existing.companyId, {
-            issueId: existing.id,
-            projectId: await resolveAssignmentProjectId({
-              companyId: existing.companyId,
-              projectId:
-                updateFields.projectId === undefined
-                  ? existing.projectId
-                  : (updateFields.projectId as string | null | undefined),
-              parentIssueId: (updateFields.parentId === undefined
-                ? existing.parentId
-                : updateFields.parentId) as string | null | undefined,
-            }),
-            parentIssueId: (updateFields.parentId === undefined
-              ? existing.parentId
-              : updateFields.parentId) as string | null | undefined,
-            assigneeAgentId: nextAssigneeAgentId,
-            assigneeUserId: nextAssigneeUserId,
-          });
-        }
-      }
+      const {
+        transition,
+        decisionId,
+        enteringBlocked,
+        reviewInteractionId,
+        persistReviewActivityTransactionally,
+        nextAssigneeAgentId,
+        nextAssigneeUserId,
+        assigneeWillChange,
+      } = routeChecks;
 
       if (interruptRequested) {
         const runToInterrupt = await resolveActiveIssueRun(existing);

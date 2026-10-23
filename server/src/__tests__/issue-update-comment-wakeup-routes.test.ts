@@ -616,6 +616,9 @@ describe("issue update comment wakeups", () => {
     mockIssueService.precheckUpdate.mockRejectedValue(
       unprocessable("Issue can only have one assignee"),
     );
+    mockIssueService.update.mockRejectedValue(
+      unprocessable("Issue can only have one assignee"),
+    );
     mockHeartbeatService.getRun.mockResolvedValue({
       id: "run-4",
       companyId: existing.companyId,
@@ -623,22 +626,27 @@ describe("issue update comment wakeups", () => {
       status: "running",
       contextSnapshot: { issueId: existing.id },
     });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-4",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    });
 
     const res = await request(await createApp(undefined, { source: "mcp_oauth" }))
       .patch(`/api/issues/${existing.id}`)
       .send({ comment: "stop and look at this", interrupt: true });
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("checks the patch before a comment cancels its scheduled retry, and the final patch again before the interrupt", async () => {
-    // The retry cancel decides whether the comment moves the task to todo, so it
-    // runs before the policy transition. Here the transition then clears a
-    // stale execution state, so the interrupt checks the final patch again.
+  function arrangeRetrySupersededByComment(retryCancelResult: "cancelled" | "running") {
+    // A stale execution state that the policy transition clears when the
+    // comment moves the task to todo.
     const existing = makeIssue({
       assigneeAgentId: PREVIOUS_AGENT_ID,
       assigneeUserId: null,
@@ -663,7 +671,10 @@ describe("issue update comment wakeups", () => {
       status: "scheduled_retry",
       scheduledRetryReason: "transient_failure",
     });
-    mockIssueService.update.mockResolvedValue({ ...existing, status: "todo", executionState: null });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      ...patch,
+    }));
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-retry",
       issueId: existing.id,
@@ -681,8 +692,17 @@ describe("issue update comment wakeups", () => {
       id: runId,
       companyId: existing.companyId,
       agentId: PREVIOUS_AGENT_ID,
-      status: "cancelled",
+      // The retry either is still parked when its cancel runs, or has started.
+      status: runId === "retry-5" ? retryCancelResult : "cancelled",
     }));
+    return existing;
+  }
+
+  it("checks the final patch once, before a comment cancels its scheduled retry and interrupts the run", async () => {
+    // The transition and the route checks run before the retry cancel, so the
+    // one check sees the patch the update writes, and the cancel comes first
+    // among the steps that stop work.
+    const existing = arrangeRetrySupersededByComment("cancelled");
 
     const res = await request(await createApp())
       .patch(`/api/issues/${existing.id}`)
@@ -691,18 +711,42 @@ describe("issue update comment wakeups", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const cancelledRunIds = mockHeartbeatService.cancelRun.mock.calls.map((call) => call[0]);
     expect(cancelledRunIds).toEqual(["retry-5", "run-5"]);
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    const [, checkedPatch] = mockIssueService.precheckUpdate.mock
+      .calls[0] as unknown as [Record<string, unknown>, Record<string, unknown>];
+    expect(checkedPatch).toMatchObject({ status: "todo", executionState: null });
+    const precheckOrder = mockIssueService.precheckUpdate.mock.invocationCallOrder;
+    const cancelOrder = mockHeartbeatService.cancelRun.mock.invocationCallOrder;
+    expect(precheckOrder[0]).toBeLessThan(cancelOrder[0]!);
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject(checkedPatch);
+  });
+
+  it("runs the transition and the precheck again without the move to todo when the retry starts before its cancel", async () => {
+    const existing = arrangeRetrySupersededByComment("running");
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "try again with the new settings", interrupt: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const cancelledRunIds = mockHeartbeatService.cancelRun.mock.calls.map((call) => call[0]);
+    expect(cancelledRunIds).toEqual(["retry-5", "run-5"]);
+    // The first check covered the move to todo; the interrupt checks the
+    // patch the second transition left, which keeps the task in progress.
     expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(2);
     const [[, retryPatch], [, interruptPatch]] = mockIssueService.precheckUpdate.mock
       .calls as unknown as Array<[Record<string, unknown>, Record<string, unknown>]>;
-    expect(retryPatch).toMatchObject({ status: "todo" });
-    expect(retryPatch).not.toHaveProperty("executionState");
-    expect(interruptPatch).toMatchObject({ status: "todo", executionState: null });
+    expect(retryPatch).toMatchObject({ status: "todo", executionState: null });
+    expect(interruptPatch).not.toHaveProperty("status");
+    expect(interruptPatch).toMatchObject({ executionState: null });
     const precheckOrder = mockIssueService.precheckUpdate.mock.invocationCallOrder;
     const cancelOrder = mockHeartbeatService.cancelRun.mock.invocationCallOrder;
     expect(precheckOrder[0]).toBeLessThan(cancelOrder[0]!);
     expect(cancelOrder[0]).toBeLessThan(precheckOrder[1]!);
     expect(precheckOrder[1]).toBeLessThan(cancelOrder[1]!);
-    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject(interruptPatch);
+    const writtenPatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(writtenPatch).toMatchObject(interruptPatch);
+    expect(writtenPatch).not.toHaveProperty("status");
   });
 
   it("interrupts the active run without waking an agent when the handoff assigns a user", async () => {
