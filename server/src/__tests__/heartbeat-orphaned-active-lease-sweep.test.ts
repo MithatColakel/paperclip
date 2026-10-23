@@ -40,6 +40,10 @@ import { logger } from "../middleware/logger.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { nativeWorkspaceExportPendingForLease } from "../services/native-runtime/native-workspace-finalization-state.js";
+import {
+  CONVERSATION_CONTINUATION_POLICY,
+  getConversationOwnershipBlocker,
+} from "../services/conversation-continuation.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -265,6 +269,116 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
     expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
     expect((await leaseRow(leaseId))?.releasedAt).toBeInstanceOf(Date);
+  });
+
+  describe("SSH bookkeeping leases", () => {
+    const sshTarget = "ssh://agent@10.0.0.2:22/home/agent/work";
+
+    async function useSshEnvironment(environmentId: string) {
+      await db.update(environments).set({
+        driver: "ssh",
+        name: "SSH host",
+        config: { host: "10.0.0.2", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/work" },
+      }).where(eq(environments.id, environmentId));
+    }
+
+    async function insertSshRun(input: { companyId: string; agentId: string; status: string; issueId?: string }) {
+      const runId = await insertHeartbeatRun(input);
+      await db.update(heartbeatRuns).set({
+        // A conversation run, so conversation continuation weighs its lease.
+        resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY },
+        contextSnapshot: input.issueId ? { issueId: input.issueId } : {},
+      }).where(eq(heartbeatRuns.id, runId));
+      return runId;
+    }
+
+    async function insertSshLease(input: {
+      companyId: string;
+      environmentId: string;
+      heartbeatRunId: string;
+      status: "active" | "pending_cleanup";
+      providerLeaseId?: string;
+    }) {
+      const id = randomUUID();
+      const pending = input.status === "pending_cleanup";
+      await db.insert(environmentLeases).values({
+        id,
+        companyId: input.companyId,
+        environmentId: input.environmentId,
+        heartbeatRunId: input.heartbeatRunId,
+        status: input.status,
+        leasePolicy: "ephemeral",
+        provider: "ssh",
+        providerLeaseId: input.providerLeaseId ?? sshTarget,
+        metadata: { driver: "ssh", host: "10.0.0.2", port: 22, username: "agent", remoteCwd: "/home/agent/work" },
+        releasedAt: pending ? oldEnough() : null,
+        cleanupStatus: pending ? "failed" : null,
+        acquiredAt: oldEnough(),
+        lastUsedAt: oldEnough(),
+        createdAt: oldEnough(),
+        updatedAt: oldEnough(),
+      });
+      return id;
+    }
+
+    it("releases a finished run's lease while another run uses the same host, which unblocks its task", async () => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      await useSshEnvironment(environmentId);
+      const issueId = randomUUID();
+      const cancelledRunId = await insertSshRun({ companyId, agentId, status: "cancelled", issueId });
+      const orphanLeaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: cancelledRunId, status: "active" });
+      // Another run on the same host holds a live lease with the same target id.
+      const liveRunId = await insertSshRun({ companyId, agentId, status: "running" });
+      const liveLeaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: liveRunId, status: "active" });
+      expect(await getConversationOwnershipBlocker(db, companyId, issueId))
+        .toMatchObject({ runId: cancelledRunId, cause: "execution_owner_active" });
+
+      const heartbeat = heartbeatService(db);
+      expect(await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 5 * 60 * 1000 })).toEqual({ recovered: 1 });
+      await heartbeat.sweepPendingCleanupLeases();
+
+      const settled = await leaseRow(orphanLeaseId);
+      expect(settled).toMatchObject({ status: "expired", cleanupStatus: "success" });
+      expect(settled?.releasedAt).toBeInstanceOf(Date);
+      // SSH proves no remote termination, so the lease carries no receipt.
+      expect(settled?.metadata).not.toHaveProperty("remoteExecutionTermination");
+      expect(await leaseRow(liveLeaseId)).toMatchObject({ status: "active", releasedAt: null });
+      expect(await getConversationOwnershipBlocker(db, companyId, issueId)).toBeNull();
+    });
+
+    it("settles a stranded pending_cleanup lease of a finished run", async () => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      await useSshEnvironment(environmentId);
+      const runId = await insertSshRun({ companyId, agentId, status: "succeeded" });
+      const leaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: runId, status: "pending_cleanup" });
+
+      await heartbeatService(db).sweepPendingCleanupLeases();
+
+      expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    });
+
+    it("keeps the pending lease of a run that may still execute", async () => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      await useSshEnvironment(environmentId);
+      const runId = await insertSshRun({ companyId, agentId, status: "running" });
+      const leaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: runId, status: "pending_cleanup" });
+
+      await heartbeatService(db).sweepPendingCleanupLeases();
+
+      expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    });
+
+    it("does not settle an SSH lease that names an unexpected provider resource", async () => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      await useSshEnvironment(environmentId);
+      const runId = await insertSshRun({ companyId, agentId, status: "failed" });
+      const leaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: runId,
+        status: "pending_cleanup", providerLeaseId: "sandbox://fake/unexpected-resource" });
+
+      await heartbeatService(db).sweepPendingCleanupLeases();
+
+      expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    });
   });
 
   it("does not discard an unexpected provider resource from a local lease", async () => {

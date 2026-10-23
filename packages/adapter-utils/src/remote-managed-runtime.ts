@@ -104,6 +104,28 @@ export async function removeRemoteRunScratchDir(
   scratchDir: string,
   runId: string,
 ): Promise<void> {
+  await cleanUpRemoteRunScratchDir(spec, scratchDir, runId, { keepFiles: false });
+}
+
+/**
+ * Stops every process still running from a run's scratch directory, such as its
+ * callback-bridge server, but keeps the files. Used when the workspace restore
+ * failed: the run is over, yet its remote copy may hold its only work.
+ */
+export async function stopRemoteRunScratchProcesses(
+  spec: SshRemoteExecutionSpec,
+  scratchDir: string,
+  runId: string,
+): Promise<void> {
+  await cleanUpRemoteRunScratchDir(spec, scratchDir, runId, { keepFiles: true });
+}
+
+async function cleanUpRemoteRunScratchDir(
+  spec: SshRemoteExecutionSpec,
+  scratchDir: string,
+  runId: string,
+  options: { keepFiles: boolean },
+): Promise<void> {
   if (!/^[a-zA-Z0-9_-]+$/.test(runId) || path.posix.basename(scratchDir) !== runId) return;
   const parentDir = path.posix.dirname(scratchDir);
   if (!path.posix.isAbsolute(parentDir) || parentDir === "/") return;
@@ -114,11 +136,61 @@ export async function removeRemoteRunScratchDir(
     'dir="$parent/$run"',
     '[ -d "$dir" ] || exit 0',
     `pkill -TERM -f ${shellQuote(pattern)} >/dev/null 2>&1 || true`,
-    'rm -rf -- "$dir"',
+    ...(options.keepFiles ? [] : ['rm -rf -- "$dir"']),
   ].join("\n");
   await runSshCommand(spec, script, { timeoutMs: 120_000, maxBuffer: 64 * 1024 }).catch((error) => {
-    console.warn(`[paperclip] Could not remove the run's remote scratch directory ${scratchDir}: ${String(error)}`);
+    const action = options.keepFiles ? "stop the processes of" : "remove";
+    console.warn(`[paperclip] Could not ${action} the run's remote scratch directory ${scratchDir}: ${String(error)}`);
   });
+}
+
+/**
+ * A run's scratch directory stays on the host when its restore failed or its
+ * process was lost, so that its work can still be recovered. Copies older than
+ * this are removed when a later run prepares on the same host, which keeps the
+ * host's disk bounded whatever made the copies stay.
+ */
+export const REMOTE_RUN_SCRATCH_RETENTION_DAYS = 7;
+
+/**
+ * Removes sibling run scratch directories older than the retention period and
+ * stops the processes still running from them (leaked bridge servers). Never
+ * touches the current run's directory or a name that is not a run id. Best
+ * effort: a failure is logged and the run continues.
+ */
+export async function pruneStaleRemoteRunScratchDirs(
+  spec: SshRemoteExecutionSpec,
+  runsDir: string,
+  currentRunId: string,
+  retentionDays: number = REMOTE_RUN_SCRATCH_RETENTION_DAYS,
+): Promise<string[]> {
+  if (!path.posix.isAbsolute(runsDir) || runsDir === "/" || !/^[a-zA-Z0-9_-]+$/.test(currentRunId)) return [];
+  if (!Number.isInteger(retentionDays) || retentionDays < 1) return [];
+  // The bracket keeps the match from finding this cleanup command itself.
+  const pattern = `[${runsDir[0]}]${escapeExtendedRegex(runsDir.slice(1))}/`;
+  const script = [
+    `runs=${shellQuote(runsDir)}`,
+    `keep=${shellQuote(currentRunId)}`,
+    `pattern=${shellQuote(pattern)}`,
+    '[ -d "$runs" ] || exit 0',
+    `find "$runs" -mindepth 1 -maxdepth 1 -type d -mtime +${retentionDays} | while IFS= read -r stale; do`,
+    '  name=${stale##*/}',
+    '  case "$name" in "$keep"|""|*[!A-Za-z0-9_-]*) continue ;; esac',
+    '  pkill -TERM -f "$pattern$name/" >/dev/null 2>&1 || true',
+    '  rm -rf -- "$stale" && echo "$name"',
+    "done",
+  ].join("\n");
+  const result = await runSshCommand(spec, script, { timeoutMs: 120_000, maxBuffer: 256 * 1024 }).catch((error) => {
+    console.warn(`[paperclip] Could not prune old run scratch directories in ${runsDir}: ${String(error)}`);
+    return null;
+  });
+  const removed = (result?.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+  if (removed.length > 0) {
+    console.warn(
+      `[paperclip] Removed ${removed.length} run scratch director${removed.length === 1 ? "y" : "ies"} older than ${retentionDays} days in ${spec.username}@${spec.host}:${runsDir}: ${removed.join(", ")}`,
+    );
+  }
+  return removed;
 }
 
 async function readRemoteFile(spec: SshRemoteExecutionSpec, remotePath: string): Promise<Buffer> {
@@ -190,6 +262,10 @@ export async function prepareRemoteManagedRuntime(input: {
   const runtimeRootDir = input.runtimeRemoteDir
     ? path.posix.join(input.runtimeRemoteDir, input.adapterKey)
     : path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+
+  // Copies that earlier runs had to keep (failed restore, lost process) stay
+  // only for the retention period, so the host's disk stays bounded.
+  if (runScratchDir) await pruneStaleRemoteRunScratchDirs(input.spec, path.posix.dirname(runScratchDir), input.runId);
 
   let preparedWorkspace: Awaited<ReturnType<typeof prepareWorkspaceForSshExecution>> | null = null;
   if (syncWorkspace) {
@@ -336,11 +412,13 @@ export async function prepareRemoteManagedRuntime(input: {
             repositories: repositoryBaselines,
           });
         } catch (error) {
-          // The remote copy may now hold the run's only copy of its work.
+          // The remote copy may now hold the run's only copy of its work, so it
+          // stays. The run is over, so nothing may keep running from it.
           if (runScratchDir) {
             console.warn(
               `[paperclip] Workspace restore failed; the run's remote copy stays at ${input.spec.username}@${input.spec.host}:${runScratchDir}.`,
             );
+            await stopRemoteRunScratchProcesses(input.spec, runScratchDir, input.runId);
           }
           throw error;
         }

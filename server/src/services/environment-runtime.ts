@@ -1296,6 +1296,29 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
     },
 
+    async retryPendingSandboxTeardown({ lease }) {
+      // A hung, cancelled or interrupted run can strand an SSH bookkeeping lease
+      // after the run ends. The lease names the shared host target, not a
+      // provider resource, so there is nothing to destroy, and SSH gives no
+      // termination receipt. Process ownership is checked separately by
+      // conversation continuation before another run is admitted. Never settle
+      // the lease of a run that may still execute, and never treat an
+      // unexpected provider resource as SSH bookkeeping.
+      if (lease.provider !== "ssh" || !lease.providerLeaseId?.startsWith("ssh://")) {
+        throw new Error("SSH lease cleanup cannot release a provider resource.");
+      }
+      if (!lease.heartbeatRunId) return;
+      const [liveRun] = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, lease.companyId),
+          eq(heartbeatRuns.id, lease.heartbeatRunId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+        ));
+      if (liveRun) throw new Error("SSH lease still belongs to a run that may execute.");
+    },
+
     async realizeWorkspace(input) {
       const device = await realizeSshDeviceWorkspace(db, input);
       const record = buildWorkspaceRealizationRecordFromDriverInput({

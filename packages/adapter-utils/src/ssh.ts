@@ -4,7 +4,7 @@ import { constants as fsConstants, createReadStream, createWriteStream, promises
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { Transform } from "node:stream";
+import { Transform, type Readable } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -665,6 +665,53 @@ function createTransferProgress(input: {
   };
 }
 
+// ServerAliveInterval only catches a dead connection. A transfer can also stop
+// moving bytes while ssh stays up (a stuck remote reader, a tunnel that still
+// answers keepalives), and nothing above the transport bounds it: the run waits
+// forever before its agent process exists. Fail a transfer once no byte has
+// moved for this long while it is streaming.
+export const SSH_TRANSFER_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+function formatStallTimeout(ms: number): string {
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000} min`;
+  if (ms >= 1000) return `${Math.round(ms / 1000)} s`;
+  return `${ms} ms`;
+}
+
+// Calls `onStall` once `stream` has emitted no data for `timeoutMs`. Attach it
+// after the stream is piped: a `data` listener on an unpiped stream starts it
+// flowing. Returns `stop`, which is idempotent.
+function watchTransferStall(input: {
+  stream: Readable | null | undefined;
+  timeoutMs: number;
+  /** Start the clock at the first byte, for a remote that prepares its data first. */
+  startOnFirstByte?: boolean;
+  onStall: (error: Error) => void;
+}): () => void {
+  const stream = input.stream;
+  if (!stream || !(input.timeoutMs > 0)) return () => undefined;
+  let timer: NodeJS.Timeout | null = null;
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    stream.off("data", arm);
+  };
+  function arm() {
+    if (stopped) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stop();
+      input.onStall(new Error(`SSH transfer stalled: no data moved for ${formatStallTimeout(input.timeoutMs)}`));
+    }, input.timeoutMs);
+    timer.unref?.();
+  }
+  stream.on("data", arm);
+  if (!input.startOnFirstByte) arm();
+  return stop;
+}
+
 async function runSshScript(
   config: SshConnectionConfig,
   script: string,
@@ -751,6 +798,7 @@ export async function streamLocalFileToSsh(input: {
   remoteScript: string;
   progress?: TransferProgress;
   registerTransferProcess?: SshTransferProcessRegistrar;
+  stallTimeoutMs?: number;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -762,6 +810,7 @@ export async function streamLocalFileToSsh(input: {
   ];
 
   let unregister: () => void = () => undefined;
+  let stopStallWatch: () => void = () => undefined;
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
@@ -800,7 +849,17 @@ export async function streamLocalFileToSsh(input: {
     } else {
       source.pipe(ssh.stdin ?? null);
     }
+    // Only the upload itself is timed. Once the file is handed over, the remote
+    // script fetches and checks out the history, which moves no bytes.
+    stopStallWatch = watchTransferStall({
+      stream: source,
+      timeoutMs: input.stallTimeoutMs ?? SSH_TRANSFER_STALL_TIMEOUT_MS,
+      onStall: fail,
+    });
+    ssh.stdin?.on("finish", stopStallWatch);
     ssh.on("close", (code, signal) => {
+      // A paused source behind a dead ssh would otherwise keep its file open.
+      source.destroy();
       if (settled) return;
       settled = true;
       if ((code ?? 0) !== 0 || signal) {
@@ -814,6 +873,7 @@ export async function streamLocalFileToSsh(input: {
       resolve();
     });
   }).finally(async () => {
+    stopStallWatch();
     unregister();
     await auth.cleanup();
   });
@@ -824,6 +884,7 @@ export async function streamSshToLocalFile(input: {
   remoteScript: string;
   localFile: string;
   progress?: TransferProgress;
+  stallTimeoutMs?: number;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -834,6 +895,7 @@ export async function streamSshToLocalFile(input: {
     `sh -c ${shellQuote(input.remoteScript)}`,
   ];
 
+  let stopStallWatch: () => void = () => undefined;
   await new Promise<void>((resolve, reject) => {
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -857,24 +919,49 @@ export async function streamSshToLocalFile(input: {
     } else {
       ssh.stdout?.pipe(sink);
     }
+    // The remote writes the whole bundle before sending its first byte, so the
+    // clock starts once the download does.
+    stopStallWatch = watchTransferStall({
+      stream: ssh.stdout,
+      timeoutMs: input.stallTimeoutMs ?? SSH_TRANSFER_STALL_TIMEOUT_MS,
+      startOnFirstByte: true,
+      onStall: fail,
+    });
+    ssh.stdout?.on("end", stopStallWatch);
     ssh.stderr?.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
     ssh.stdout?.on("error", fail);
     ssh.on("error", fail);
     sink.on("error", fail);
-    ssh.on("close", (code) => {
-      sink.end(() => {
-        if (settled) return;
-        settled = true;
-        if ((code ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
-          return;
-        }
-        resolve();
-      });
+    // Settle only when ssh has exited AND the pipe has written every byte. ssh
+    // can close while the progress counter still holds chunks; ending the sink
+    // at that point cut the file short and still reported success, so git
+    // later failed on the bundle with "early EOF". The pipe ends the sink once
+    // the stream it drains has ended.
+    let exitCode: number | null | undefined;
+    let sinkFinished = false;
+    const settleWhenWritten = () => {
+      if (settled || exitCode === undefined || !sinkFinished) return;
+      settled = true;
+      resolve();
+    };
+    sink.on("finish", () => {
+      sinkFinished = true;
+      settleWhenWritten();
     });
-  }).finally(auth.cleanup);
+    ssh.on("close", (code) => {
+      exitCode = code;
+      if ((code ?? 0) !== 0) {
+        fail(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+        return;
+      }
+      settleWhenWritten();
+    });
+  }).finally(async () => {
+    stopStallWatch();
+    await auth.cleanup();
+  });
 }
 
 async function importGitWorkspaceToSsh(input: {
@@ -1783,6 +1870,7 @@ export async function syncDirectoryToSsh(input: {
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
   registerTransferProcess?: SshTransferProcessRegistrar;
+  stallTimeoutMs?: number;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
@@ -1817,6 +1905,7 @@ export async function syncDirectoryToSsh(input: {
     : null;
 
   let unregister: () => void = () => undefined;
+  let stopStallWatch: () => void = () => undefined;
   try {
     await new Promise<void>((resolve, reject) => {
     const tarArgs = [
@@ -1896,6 +1985,14 @@ export async function syncDirectoryToSsh(input: {
     } else {
       tar.stdout?.pipe(ssh.stdin ?? null);
     }
+    // Only the upload is timed; after ssh's stdin ends the remote tar only
+    // finishes writing what it already has.
+    stopStallWatch = watchTransferStall({
+      stream: tar.stdout,
+      timeoutMs: input.stallTimeoutMs ?? SSH_TRANSFER_STALL_TIMEOUT_MS,
+      onStall: fail,
+    });
+    ssh.stdin?.on("finish", stopStallWatch);
     tar.stderr?.on("data", (chunk) => {
       tarStderr += String(chunk);
     });
@@ -1915,10 +2012,18 @@ export async function syncDirectoryToSsh(input: {
       sshExitCode = code;
       sshSignal = signal;
       // Nothing reads tar's output any more; make sure it does not linger.
-      if (!tarExited) tar.kill("SIGTERM");
+      // Killing tar is not enough: when ssh exits, Node destroys its stdin,
+      // the progress counter is unpiped, and tar's stdout stays paused behind
+      // it. tar exits, but its stdout never reads EOF, so tar never emits
+      // `close` and the transfer never settles. Destroy that stdout.
+      if (!tarExited) {
+        tar.kill("SIGTERM");
+        tar.stdout?.destroy();
+      }
       maybeFinish();
     });
     }).finally(async () => {
+      stopStallWatch();
       unregister();
       await auth.cleanup();
       await excludeFile?.cleanup();
@@ -1940,6 +2045,7 @@ export async function syncDirectoryFromSsh(input: {
   preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
+  stallTimeoutMs?: number;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
@@ -1985,6 +2091,7 @@ export async function syncDirectoryFromSsh(input: {
     })
     : null;
 
+  let stopStallWatch: () => void = () => undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
@@ -2051,6 +2158,12 @@ export async function syncDirectoryFromSsh(input: {
       } else {
         ssh.stdout?.pipe(tar.stdin ?? null);
       }
+      stopStallWatch = watchTransferStall({
+        stream: ssh.stdout,
+        timeoutMs: input.stallTimeoutMs ?? SSH_TRANSFER_STALL_TIMEOUT_MS,
+        onStall: fail,
+      });
+      ssh.stdout?.on("end", stopStallWatch);
       ssh.stderr?.on("data", (chunk) => {
         sshStderr += String(chunk);
       });
@@ -2069,7 +2182,13 @@ export async function syncDirectoryFromSsh(input: {
       tar.on("close", (code) => {
         tarExited = true;
         tarExitCode = code;
-        if (!sshExited && (code ?? 0) !== 0) ssh.kill("SIGTERM");
+        if (!sshExited && (code ?? 0) !== 0) {
+          ssh.kill("SIGTERM");
+          // The mirror of the upload case: with the consumer gone, ssh's
+          // stdout stays paused behind the progress counter and ssh never
+          // emits `close`.
+          ssh.stdout?.destroy();
+        }
         maybeFinish();
       });
     });
@@ -2081,6 +2200,7 @@ export async function syncDirectoryFromSsh(input: {
     await progress?.fail();
     throw error;
   } finally {
+    stopStallWatch();
     await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
     await auth.cleanup();
   }

@@ -43,9 +43,22 @@
 //     discards the stdin buffer, so a test proves the host releases every held
 //     transport token on the worker exit. It gives a fast exit for a worker that no
 //     longer reads its stdin and never sees the shutdown request.
-//   - `closeMode`: "ack" | "bad-ack" | "no-ack" (default "ack"). It controls the
-//     close reply, so a test proves the host retires the worker on an unconfirmed
-//     close.
+//   - `closeMode`: "ack" | "bad-ack" | "no-ack" | "route-only-ack" |
+//     "exit-then-route-only-ack" (default "ack"). It controls the close reply,
+//     so a test proves the host retires the worker on an unconfirmed close.
+//     "route-only-ack" echoes the host route id but not the worker session id,
+//     although the channel is still known. "exit-then-route-only-ack" plays a
+//     channel that ended on the worker side just as the host's close crossed
+//     it: the fixture reports the exact pair's exit, forgets the channel, then
+//     acknowledges the close with the host route id only.
+//   - `closeAckWorkerSessionId`: when the key is present, the close reply echoes
+//     the host route id and exactly this value as the worker session id (a
+//     different id, a number, an empty string), so a test proves the host
+//     treats a present but wrong session id as mismatched.
+//   - `forgetOnExit`: when true, the fixture forgets the channel as soon as it
+//     emits the scripted exit, the way a real provider drops a channel that
+//     ended on its side. Its later close reply then echoes the host route id
+//     only, as for a channel it never knew.
 //   - `batchWithOpenReply`: when true, the fixture writes the open reply and the
 //     scripted data and exit in one stdout write. The host then reads the open
 //     reply and the notifications in one batch, so a test proves the host holds
@@ -124,6 +137,22 @@ function scriptedFrameLines(directive, hostRouteId, workerSessionId) {
 // bound worker session id and the close directive.
 const routes = new Map();
 
+// Every write and stop this worker process received, so a test can prove a
+// stale session never reaches a restarted worker. The `health` method returns
+// them.
+const received = [];
+
+// Every reply the host sent to a request this worker process made to the host
+// (see `requestHost`), so a test proves a reply meant for an earlier process
+// never reaches a restarted one. The `health` method returns them.
+const hostReplies = [];
+let nextOutboundId = 0;
+
+// Whether a directive scripts an exit frame.
+function scriptsExit(directive) {
+  return typeof directive.exitCode === "number" || directive.transportClosed === true;
+}
+
 function parseDirective(raw) {
   try {
     const parsed = JSON.parse(raw);
@@ -141,7 +170,31 @@ rl.on("line", (line) => {
   const method = message && typeof message.method === "string" ? message.method : null;
   const params = message.params ?? {};
 
+  if (method === null && message.id !== undefined) {
+    // A reply to a request this worker made to the host.
+    hostReplies.push({ id: message.id, result: message.result ?? null, error: message.error ?? null });
+    return;
+  }
+
   if (method === "initialize") {
+    // `FAIL_INITIALIZE_ONCE_FILE` names a marker file. When it exists, this
+    // initialize consumes it and fails, so a test can fail exactly one later
+    // start (a crash-recovery start) of this plugin.
+    const failOnceFile = process.env.FAIL_INITIALIZE_ONCE_FILE;
+    if (failOnceFile) {
+      const fs = require("node:fs");
+      let failThisOne = false;
+      try {
+        fs.unlinkSync(failOnceFile);
+        failThisOne = true;
+      } catch {
+        // No marker: initialize normally.
+      }
+      if (failThisOne) {
+        send({ jsonrpc: "2.0", id: message.id, result: { ok: false } });
+        return;
+      }
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
@@ -178,6 +231,11 @@ rl.on("line", (line) => {
           : null,
       emitAfterCloseChunk:
         typeof directive.emitAfterCloseChunk === "string" ? directive.emitAfterCloseChunk : null,
+      hasCloseAckWorkerSessionId: Object.prototype.hasOwnProperty.call(
+        directive,
+        "closeAckWorkerSessionId",
+      ),
+      closeAckWorkerSessionId: directive.closeAckWorkerSessionId,
     });
 
     if (mode === "no-open-reply") {
@@ -202,6 +260,7 @@ rl.on("line", (line) => {
       // host reads them in one batch, so a data or exit frame arrives before the
       // route binds. The host must hold and replay the frame after the bind.
       process.stdout.write(openReplyLine + scriptedFrameLines(directive, hostRouteId, workerSessionId));
+      if (directive.forgetOnExit === true && scriptsExit(directive)) routes.delete(hostRouteId);
       return;
     }
 
@@ -232,12 +291,15 @@ rl.on("line", (line) => {
     if (directive.emitScriptedFramesAfterFirstWrite !== true) {
       setImmediate(() => {
         process.stdout.write(scriptedFrameLines(directive, hostRouteId, workerSessionId));
+        // The channel ended on the worker side; forget it, as a real provider does.
+        if (directive.forgetOnExit === true && scriptsExit(directive)) routes.delete(hostRouteId);
       });
     }
     return;
   }
 
   if (method === "duplexChannelWrite") {
+    received.push({ method, hostRouteId: params.hostRouteId, workerSessionId: params.workerSessionId });
     // Act only on the exact live pair. A write whose pair does not match a bound
     // route applies no bytes.
     const entry = routes.get(params.hostRouteId);
@@ -287,7 +349,27 @@ rl.on("line", (line) => {
   }
 
   if (method === "duplexChannelStop") {
+    received.push({ method, hostRouteId: params.hostRouteId, workerSessionId: params.workerSessionId });
     send({ jsonrpc: "2.0", id: message.id, result: null });
+    return;
+  }
+
+  if (method === "health") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: { status: "ok", details: { received, hostReplies } },
+    });
+    return;
+  }
+
+  if (method === "requestHost") {
+    // Send one request to the host (`params.method` with `params.params`), the
+    // way a real worker calls a host service, and answer this call with the
+    // request id the worker used. Outbound ids start at 1 in every process.
+    nextOutboundId += 1;
+    send({ jsonrpc: "2.0", id: nextOutboundId, method: params.method, params: params.params ?? {} });
+    send({ jsonrpc: "2.0", id: message.id, result: { sentId: nextOutboundId } });
     return;
   }
 
@@ -301,6 +383,35 @@ rl.on("line", (line) => {
     }
     if (closeMode === "bad-ack") {
       send({ jsonrpc: "2.0", id: message.id, result: { hostRouteId: "mismatched-route" } });
+      return;
+    }
+    if (closeMode === "route-only-ack") {
+      send({ jsonrpc: "2.0", id: message.id, result: { hostRouteId: params.hostRouteId } });
+      return;
+    }
+    if (closeMode === "exit-then-route-only-ack" && entry) {
+      // The channel ended here just as the host's close arrived: report the
+      // exact pair's exit, forget the channel (done above), then acknowledge
+      // with the host route id only, as for a channel this worker never knew.
+      send({
+        jsonrpc: "2.0",
+        method: "duplexChannel.exit",
+        params: {
+          hostRouteId: entry.hostRouteId,
+          workerSessionId: entry.workerSessionId,
+          exitCode: null,
+          transportClosed: true,
+        },
+      });
+      send({ jsonrpc: "2.0", id: message.id, result: { hostRouteId: params.hostRouteId } });
+      return;
+    }
+    if (entry && entry.hasCloseAckWorkerSessionId) {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { hostRouteId: params.hostRouteId, workerSessionId: entry.closeAckWorkerSessionId },
+      });
       return;
     }
     // A bound close echoes both identifiers; a pre-bind close with no entry

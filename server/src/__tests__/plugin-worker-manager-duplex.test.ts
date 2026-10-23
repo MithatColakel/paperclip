@@ -1,10 +1,33 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+
+// Mock the shared logger, so a retirement test reads the exact error the
+// manager logs. The child logger returns the same mock object.
+vi.mock("../middleware/logger.js", () => {
+  const mockLogger: Record<string, unknown> = {
+    trace: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(() => mockLogger),
+  };
+  return { logger: mockLogger, httpLogger: vi.fn() };
+});
+
+import { logger } from "../middleware/logger.js";
 import {
   createDuplexRouteSlotController,
   createPluginWorkerHandle,
+  createPluginWorkerManager,
+  type PluginWorkerHandle,
+  type WorkerHandleEvents,
+  type WorkerStatus,
 } from "../services/plugin-worker-manager.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -961,4 +984,599 @@ describe("plugin worker manager duplex channel route", () => {
       await handle.stop().catch(() => undefined);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Fail-closed retirement and crash-recovery restart.
+// ---------------------------------------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForStatus(
+  handle: PluginWorkerHandle,
+  wanted: WorkerStatus,
+  timeoutMs = 8_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (handle.status !== wanted && Date.now() < deadline) {
+    await sleep(20);
+  }
+  expect(handle.status).toBe(wanted);
+}
+
+function nextExit(handle: PluginWorkerHandle): Promise<void> {
+  return new Promise((resolve) => {
+    const listener = () => {
+      handle.off("exit", listener);
+      resolve();
+    };
+    handle.on("exit", listener);
+  });
+}
+
+// Resolve true once the worker process exits, or false after `ms`. A test that
+// expects no retirement must not hang when one does happen, and the reverse.
+function exitsWithin(handle: PluginWorkerHandle, ms: number): Promise<boolean> {
+  return Promise.race([nextExit(handle).then(() => true), sleep(ms).then(() => false)]);
+}
+
+function recordCrashes(handle: PluginWorkerHandle): WorkerHandleEvents["crash"][] {
+  const crashes: WorkerHandleEvents["crash"][] = [];
+  handle.on("crash", (payload) => crashes.push(payload));
+  return crashes;
+}
+
+// Retire the worker the way production did: a bound channel whose close the
+// worker does not acknowledge. Resolves once the retired process has exited.
+async function retireOnUnacknowledgedClose(handle: PluginWorkerHandle): Promise<void> {
+  const exited = nextExit(handle);
+  const session = await handle.openDuplexChannel(duplexOpenInput({ closeMode: "bad-ack" }));
+  await session.close();
+  await exited;
+}
+
+// The messages the mocked logger received at one level, so a test can prove a
+// log line is absent as well as present.
+function loggedMessages(level: "info" | "warn" | "error"): string[] {
+  return vi
+    .mocked(logger[level])
+    .mock.calls.map((call) => (typeof call[1] === "string" ? call[1] : String(call[0])));
+}
+
+const CLOSE_NOT_ACKNOWLEDGED = "retired: duplex channel close not acknowledged";
+
+describe("plugin worker manager fail-closed retirement", () => {
+  it("restarts a worker retired on an unacknowledged close, and ends every channel the old worker held", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    try {
+      await handle.start();
+      const oldPid = handle.diagnostics().pid;
+      // A second channel the retirement must end along with the worker.
+      const other = await handle.openDuplexChannel(duplexOpenInput({ workerSessionId: "ws-1" }));
+      const otherWait = other.wait();
+      await retireOnUnacknowledgedClose(handle);
+      await expect(otherWait).resolves.toEqual({ exitCode: null });
+      expect(crashes).toEqual([
+        expect.objectContaining({ willRestart: true, reason: CLOSE_NOT_ACKNOWLEDGED }),
+      ]);
+
+      // Crash recovery brings a fresh worker up after its backoff (about 1 s).
+      await waitForStatus(handle, "running");
+      expect(handle.diagnostics().pid).not.toBe(oldPid);
+      expect(handle.diagnostics().retiring).toBe(false);
+
+      // The fresh worker may mint the same worker session id: the old pair's
+      // tombstone went with the old worker, and the host route id is new.
+      const fresh = await handle.openDuplexChannel(duplexOpenInput({ workerSessionId: "ws-1" }));
+      await fresh.close();
+      expect(handle.status).toBe("running");
+      expect(crashes).toHaveLength(1);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 20_000);
+
+  it("never delivers a host reply meant for the retired worker to the restarted one", async () => {
+    let releaseSlowReply!: () => void;
+    const slowReplyGate = new Promise<void>((resolve) => {
+      releaseSlowReply = resolve;
+    });
+    let slowHandlerReturned!: () => void;
+    const slowHandlerDone = new Promise<void>((resolve) => {
+      slowHandlerReturned = resolve;
+    });
+    const handle = makeDuplexHandle({
+      duplexChannelLimits: { closeTimeoutMs: 200 },
+      hostHandlers: {
+        "test.slowAnswer": async (params: { tag: string }) => {
+          await slowReplyGate;
+          // Settle after the host sees the result: the reply decision runs in
+          // the microtask that follows this return.
+          setImmediate(slowHandlerReturned);
+          return { answeredFor: params.tag };
+        },
+        "test.answer": async (params: { tag: string }) => ({ answeredFor: params.tag }),
+      },
+    });
+    vi.mocked(logger.warn).mockClear();
+    try {
+      await handle.start();
+      // The old worker asks the host something slow; its request id is 1.
+      await expect(
+        handle.call("requestHost" as never, { method: "test.slowAnswer", params: { tag: "old" } } as never),
+      ).resolves.toEqual({ sentId: 1 });
+      await retireOnUnacknowledgedClose(handle);
+      await waitForStatus(handle, "running");
+
+      // The host answers the old worker's request only now, while a fresh worker
+      // runs. That fresh worker also numbers its first request 1.
+      releaseSlowReply();
+      await slowHandlerDone;
+      expect(loggedMessages("warn")).toContain(
+        "dropping a host reply: the worker process that asked is gone",
+      );
+      const before = await handle.call("health", {});
+      expect(before.details).toEqual(expect.objectContaining({ hostReplies: [] }));
+
+      // The fresh worker's own request still gets its own answer.
+      await expect(
+        handle.call("requestHost" as never, { method: "test.answer", params: { tag: "new" } } as never),
+      ).resolves.toEqual({ sentId: 1 });
+      const deadline = Date.now() + 2_000;
+      let replies: unknown = [];
+      while (Date.now() < deadline) {
+        const health = await handle.call("health", {});
+        replies = (health.details as { hostReplies: unknown[] }).hostReplies;
+        if (Array.isArray(replies) && replies.length > 0) break;
+        await sleep(20);
+      }
+      expect(replies).toEqual([{ id: 1, result: { answeredFor: "new" }, error: null }]);
+    } finally {
+      releaseSlowReply();
+      await handle.stop().catch(() => undefined);
+    }
+  }, 20_000);
+
+  it("stops restarting once the retirement budget is spent: a fourth retirement within the window leaves the worker crashed", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    vi.mocked(logger.error).mockClear();
+    try {
+      await handle.start();
+      for (let retirement = 1; retirement <= 4; retirement += 1) {
+        if (retirement > 1) await waitForStatus(handle, "running");
+        await retireOnUnacknowledgedClose(handle);
+      }
+      // Each fresh worker started cleanly, so the consecutive-crash counter was
+      // reset every time; only the retirement budget stops the loop.
+      expect(crashes.map((crash) => crash.willRestart)).toEqual([true, true, true, false]);
+      expect(crashes.every((crash) => crash.reason === CLOSE_NOT_ACKNOWLEDGED)).toBe(true);
+      expect(handle.status).toBe("crashed");
+
+      // No restart follows, even after the longest backoff a retirement gets.
+      await sleep(2_000);
+      expect(handle.status).toBe("crashed");
+      expect(handle.diagnostics()).toEqual(
+        expect.objectContaining({ pid: null, nextRestartAt: null }),
+      );
+      // One loud error names the reason and the count.
+      expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: CLOSE_NOT_ACKNOWLEDGED,
+          retirementsInWindow: 4,
+          maxRetirements: 3,
+          willRestart: false,
+        }),
+        expect.stringContaining("worker retired 4 times within 30 minutes; not restarting it"),
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 30_000);
+
+  it("counts retirements in a rolling window that a successful start does not reset", async () => {
+    // The budget runs on an injected monotonic clock, so the window edges are
+    // exact and do not depend on how long a restart takes.
+    let clock = 0;
+    const handle = makeDuplexHandle({
+      duplexChannelLimits: { closeTimeoutMs: 200 },
+      retirementBudget: { maxRestarts: 1, windowMs: 60_000, now: () => clock },
+    });
+    const crashes = recordCrashes(handle);
+    try {
+      await handle.start();
+      await retireOnUnacknowledgedClose(handle);
+      await waitForStatus(handle, "running");
+      // The first retirement has just left the window: the next one restarts.
+      clock = 60_000;
+      await retireOnUnacknowledgedClose(handle);
+      await waitForStatus(handle, "running");
+      // This one follows a successful start, but the retirement before it is
+      // still inside the window, so the budget is spent.
+      clock = 60_000 + 59_999;
+      await retireOnUnacknowledgedClose(handle);
+      expect(crashes.map((crash) => crash.willRestart)).toEqual([true, true, false]);
+      await sleep(1_500);
+      expect(handle.status).toBe("crashed");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 30_000);
+
+  it("measures the retirement window on a monotonic clock, so a wall-clock step does not refill the budget", async () => {
+    const handle = makeDuplexHandle({
+      duplexChannelLimits: { closeTimeoutMs: 200 },
+      retirementBudget: { maxRestarts: 1, windowMs: 60_000 },
+    });
+    const crashes = recordCrashes(handle);
+    const realNow = Date.now.bind(Date);
+    let wallClock: { mockRestore(): void } | null = null;
+    try {
+      await handle.start();
+      await retireOnUnacknowledgedClose(handle);
+      await waitForStatus(handle, "running");
+      // The wall clock jumps an hour ahead (an NTP step, a suspended host).
+      wallClock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 60 * 60 * 1_000);
+      await retireOnUnacknowledgedClose(handle);
+      expect(crashes.map((crash) => crash.willRestart)).toEqual([true, false]);
+    } finally {
+      wallClock?.mockRestore();
+      await handle.stop().catch(() => undefined);
+    }
+  }, 20_000);
+
+  it("retries a crash-recovery start that fails after a retirement, instead of leaving the worker down", async () => {
+    const marker = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "plugin-worker-init-")),
+      "fail-next-initialize",
+    );
+    const handle = makeDuplexHandle({
+      duplexChannelLimits: { closeTimeoutMs: 200 },
+      env: { FAIL_INITIALIZE_ONCE_FILE: marker },
+    });
+    const crashes = recordCrashes(handle);
+    vi.mocked(logger.info).mockClear();
+    vi.mocked(logger.error).mockClear();
+    try {
+      await handle.start();
+      // The next initialize, the one crash recovery runs, fails once.
+      fs.writeFileSync(marker, "fail");
+      await retireOnUnacknowledgedClose(handle);
+      expect(crashes).toEqual([
+        expect.objectContaining({ willRestart: true, reason: CLOSE_NOT_ACKNOWLEDGED }),
+      ]);
+      // The failed start is retried after a longer backoff, and the retry works.
+      await waitForStatus(handle, "running", 12_000);
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: CLOSE_NOT_ACKNOWLEDGED,
+          willRestart: true,
+          consecutiveCrashes: 2,
+        }),
+        "restart after backoff failed; retrying after backoff",
+      );
+      // A failed start is not an operator stop.
+      expect(loggedMessages("info")).not.toContain(
+        "restart after backoff cancelled by an operator stop",
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+      fs.rmSync(path.dirname(marker), { recursive: true, force: true });
+    }
+  }, 25_000);
+
+  it("does not restart a worker retired on an ownership violation", async () => {
+    const handle = makeDuplexHandle();
+    const crashes = recordCrashes(handle);
+    vi.mocked(logger.error).mockClear();
+    try {
+      await handle.start();
+      const exited = nextExit(handle);
+      const session = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-A", data: [{ chunk: "forged", sid: "ws-EVIL" }] }),
+      );
+      await expect(session.wait()).resolves.toEqual({ exitCode: null });
+      await exited;
+      expect(crashes).toEqual([
+        expect.objectContaining({
+          willRestart: false,
+          reason: "retired: duplex channel ownership violation (data frame pair)",
+        }),
+      ]);
+      expect(handle.status).toBe("crashed");
+      await sleep(2_000);
+      expect(handle.status).toBe("crashed");
+      expect(handle.diagnostics().pid).toBeNull();
+      expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: "retired: duplex channel ownership violation (data frame pair)",
+          willRestart: false,
+        }),
+        "retired worker exited; not restarting it, an operator must restart the plugin",
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("keeps the worker stopped when an operator stops it during the restart backoff", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const ready = vi.fn();
+    try {
+      await handle.start();
+      handle.on("ready", ready);
+      await retireOnUnacknowledgedClose(handle);
+      expect(handle.status).toBe("backoff");
+      await handle.stop();
+      expect(handle.status).toBe("stopped");
+      // The cancelled backoff timer never brings the worker back.
+      await sleep(2_000);
+      expect(handle.status).toBe("stopped");
+      expect(ready).not.toHaveBeenCalled();
+      expect(handle.diagnostics()).toEqual(
+        expect.objectContaining({ pid: null, nextRestartAt: null }),
+      );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("keeps every worker stopped when the manager stops all workers during the restart backoff", async () => {
+    const manager = createPluginWorkerManager();
+    try {
+      const handle = await manager.startWorker("plugin-1", {
+        entrypointPath: DUPLEX_CHANNEL_WORKER_ENTRYPOINT,
+        manifest: TEST_MANIFEST,
+        config: {},
+        instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+        apiVersion: 1,
+        hostHandlers: {},
+        duplexChannelLimits: { closeTimeoutMs: 200 },
+      });
+      const ready = vi.fn();
+      handle.on("ready", ready);
+      await retireOnUnacknowledgedClose(handle);
+      expect(handle.status).toBe("backoff");
+      await manager.stopAll();
+      expect(handle.status).toBe("stopped");
+      await sleep(2_000);
+      expect(handle.status).toBe("stopped");
+      expect(ready).not.toHaveBeenCalled();
+      expect(handle.diagnostics().pid).toBeNull();
+    } finally {
+      await manager.stopAll();
+    }
+  }, 15_000);
+
+  it("keeps the worker stopped when an operator stops it while the fresh worker is starting", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const statusesAfterStop: WorkerStatus[] = [];
+    let stopRequested = false;
+    let stopping: Promise<void> | null = null;
+    try {
+      await handle.start();
+      await retireOnUnacknowledgedClose(handle);
+      handle.on("status", ({ status }) => {
+        if (stopRequested) statusesAfterStop.push(status);
+        if (status === "starting" && !stopRequested) {
+          // Stop right after the fresh worker spawned and its initialize call
+          // went out, while the start still waits for the reply.
+          queueMicrotask(() => {
+            stopRequested = true;
+            stopping = handle.stop();
+          });
+        }
+      });
+      const deadline = Date.now() + 8_000;
+      while (stopping === null && Date.now() < deadline) await sleep(20);
+      expect(stopping).not.toBeNull();
+      await stopping;
+      expect(handle.status).toBe("stopped");
+      await sleep(1_000);
+      expect(handle.status).toBe("stopped");
+      expect(statusesAfterStop).not.toContain("running");
+      expect(handle.diagnostics().pid).toBeNull();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("keeps the worker stopped when an operator stops it between the kill and the exit", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    vi.mocked(logger.warn).mockClear();
+    try {
+      await handle.start();
+      const session = await handle.openDuplexChannel(duplexOpenInput({ closeMode: "bad-ack" }));
+      await session.close();
+      // The worker was just sent SIGKILL; its exit has not been handled yet. The
+      // handle reports the retirement, although the status still reads running.
+      expect(handle.status).toBe("running");
+      expect(handle.diagnostics().retiring).toBe(true);
+      await handle.stop();
+      expect(handle.status).toBe("stopped");
+      expect(handle.diagnostics().retiring).toBe(false);
+      // The stop won over the pending restart, and the log says so with the
+      // retirement's reason.
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: CLOSE_NOT_ACKNOWLEDGED, willRestart: false }),
+        "retired worker exited after an operator stop; not restarting",
+      );
+      await sleep(1_500);
+      expect(handle.status).toBe("stopped");
+      expect(crashes).toEqual([]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 15_000);
+
+  it("refuses new work between the kill and the exit of a retired worker", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    try {
+      await handle.start();
+      const exited = nextExit(handle);
+      const session = await handle.openDuplexChannel(duplexOpenInput({ closeMode: "bad-ack" }));
+      await session.close();
+      // Still inside the window: the status has not changed yet.
+      expect(handle.status).toBe("running");
+      await expect(handle.call("health", {})).rejects.toThrow(/is retiring/);
+      await expect(
+        handle.openDuplexChannel(duplexOpenInput({ mode: "normal" })),
+      ).rejects.toThrow(/is retiring/);
+      await expect(
+        handle.openLoginPtySession({
+          driverKey: "sandbox",
+          companyId: "company-1",
+          environmentId: "env-1",
+          providerLeaseId: JSON.stringify({ mode: "normal" }),
+          loginCommandKey: "claude",
+          sessionHome: "/tmp/session-home",
+        }),
+      ).rejects.toThrow(/is retiring/);
+      await exited;
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("accepts a route-only close acknowledgement once the worker reported the exact pair's exit", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    const exit = vi.fn();
+    try {
+      await handle.start();
+      handle.on("exit", exit);
+      const pid = handle.diagnostics().pid;
+      // The worker reports the exit for the exact pair, then forgets the
+      // channel, so its close reply echoes the host route id only.
+      const ended = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-A", exitCode: 0, forgetOnExit: true }),
+      );
+      await expect(ended.wait()).resolves.toEqual({ exitCode: 0 });
+      await ended.close();
+      // The same holds when the exit arrived before the bind and was replayed.
+      const endedEarly = await handle.openDuplexChannel(
+        duplexOpenInput({
+          workerSessionId: "ws-B",
+          transportClosed: true,
+          forgetOnExit: true,
+          batchWithOpenReply: true,
+        }),
+      );
+      await expect(endedEarly.wait()).resolves.toEqual({ exitCode: null, transportClosed: true });
+      await endedEarly.close();
+      await sleep(300);
+      expect(exit).not.toHaveBeenCalled();
+      expect(crashes).toEqual([]);
+      expect(handle.status).toBe("running");
+      expect(handle.diagnostics().pid).toBe(pid);
+      const next = await handle.openDuplexChannel(duplexOpenInput({ workerSessionId: "ws-C" }));
+      await next.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("accepts a route-only close acknowledgement when the exact pair's exit crosses the host's close", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    try {
+      await handle.start();
+      const pid = handle.diagnostics().pid;
+      // The channel is live when the host closes it. The worker reports the
+      // exact pair's exit only after the host's close went out (the pair is
+      // tombstoned by then), forgets the channel, and acknowledges with the
+      // host route id only.
+      const session = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-A", closeMode: "exit-then-route-only-ack" }),
+      );
+      await session.close();
+      expect(await exitsWithin(handle, 500)).toBe(false);
+      expect(crashes).toEqual([]);
+      expect(handle.status).toBe("running");
+      expect(handle.diagnostics().pid).toBe(pid);
+      const next = await handle.openDuplexChannel(duplexOpenInput({ workerSessionId: "ws-B" }));
+      await next.close();
+      expect(handle.status).toBe("running");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still retires on a route-only close acknowledgement when no exit was reported for the pair", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    try {
+      await handle.start();
+      const exited = nextExit(handle);
+      const session = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-A", closeMode: "route-only-ack" }),
+      );
+      await session.close();
+      await exited;
+      expect(crashes).toEqual([
+        expect.objectContaining({ willRestart: true, reason: CLOSE_NOT_ACKNOWLEDGED }),
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still retires on a route-only close acknowledgement when only another route reported an exit", async () => {
+    const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+    const crashes = recordCrashes(handle);
+    try {
+      await handle.start();
+      // Route A ends on the worker side and reports its exact pair's exit.
+      const ended = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-A", exitCode: 0, forgetOnExit: true }),
+      );
+      await expect(ended.wait()).resolves.toEqual({ exitCode: 0 });
+      // Route B reported nothing; its route-only acknowledgement proves nothing.
+      const exited = nextExit(handle);
+      const silent = await handle.openDuplexChannel(
+        duplexOpenInput({ workerSessionId: "ws-B", closeMode: "route-only-ack" }),
+      );
+      await silent.close();
+      await exited;
+      expect(crashes).toEqual([
+        expect.objectContaining({ willRestart: true, reason: CLOSE_NOT_ACKNOWLEDGED }),
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["another session id", "ws-OTHER"],
+    ["a number", 12345],
+    ["an empty string", ""],
+    ["whitespace", "   "],
+    ["null", null],
+  ])(
+    "still retires when the acknowledgement after an exact-pair exit carries %s as the session id",
+    async (_label, closeAckWorkerSessionId) => {
+      const handle = makeDuplexHandle({ duplexChannelLimits: { closeTimeoutMs: 200 } });
+      const crashes = recordCrashes(handle);
+      try {
+        await handle.start();
+        const session = await handle.openDuplexChannel(
+          duplexOpenInput({ workerSessionId: "ws-A", exitCode: 0, closeAckWorkerSessionId }),
+        );
+        await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+        const exited = exitsWithin(handle, 2_000);
+        await session.close();
+        expect(await exited).toBe(true);
+        expect(crashes).toEqual([
+          expect.objectContaining({ willRestart: true, reason: CLOSE_NOT_ACKNOWLEDGED }),
+        ]);
+      } finally {
+        await handle.stop().catch(() => undefined);
+      }
+    },
+  );
 });

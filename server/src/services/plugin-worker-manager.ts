@@ -117,6 +117,21 @@ const MAX_CONSECUTIVE_CRASHES = 10;
 /** Time window in which crashes are considered consecutive (10 minutes). */
 const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 
+/**
+ * Maximum number of fail-closed retirements (a duplex channel or a login
+ * pseudo-terminal close the worker did not acknowledge) that restart the worker
+ * within one rolling {@link RETIREMENT_WINDOW_MS}. The next retirement in the
+ * window leaves the worker `crashed` for an operator.
+ *
+ * A successful start does not reset this budget, unlike the consecutive-crash
+ * counter: a retired worker starts cleanly every time, so that counter alone
+ * would let a repeating retirement loop restart the worker forever.
+ */
+const MAX_RESTARTED_RETIREMENTS = 3;
+
+/** Rolling window for the retirement budget (30 minutes). */
+const RETIREMENT_WINDOW_MS = 30 * 60 * 1_000;
+
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
@@ -341,8 +356,18 @@ export interface WorkerHandleEvents {
   "ready": { pluginId: string };
   /** Worker process exited. */
   "exit": { pluginId: string; code: number | null; signal: NodeJS.Signals | null };
-  /** Worker process crashed unexpectedly. */
-  "crash": { pluginId: string; code: number | null; signal: NodeJS.Signals | null; willRestart: boolean };
+  /**
+   * Worker process crashed unexpectedly. `reason` is set when the host retired
+   * the worker fail-closed (`"retired: <why>"`), not when the process died on
+   * its own.
+   */
+  "crash": {
+    pluginId: string;
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    willRestart: boolean;
+    reason?: string;
+  };
   /** Worker process errored (e.g. spawn failure). */
   "error": { pluginId: string; error: Error };
   /** Worker status changed. */
@@ -519,6 +544,37 @@ export interface WorkerStartOptions {
     /** The close timeout for one duplex channel route, in milliseconds. */
     closeTimeoutMs?: number;
   };
+
+  /**
+   * The budget for fail-closed retirements that restart the worker. The
+   * defaults allow {@link MAX_RESTARTED_RETIREMENTS} in a rolling
+   * {@link RETIREMENT_WINDOW_MS}. A test overrides them to exercise the window
+   * without long waits.
+   */
+  retirementBudget?: {
+    /** Max retirements that restart the worker within one rolling window. */
+    maxRestarts?: number;
+    /** The rolling window, in milliseconds. */
+    windowMs?: number;
+    /**
+     * The monotonic clock the window is measured on, in milliseconds. Defaults
+     * to `performance.now()`, so a wall-clock step neither empties nor extends
+     * the window. A test injects its own clock.
+     */
+    now?: () => number;
+  };
+}
+
+/**
+ * A start that an operator stop overtook. The start spawned nothing, or ended
+ * the process it spawned, and the stop owns the status. Crash recovery treats
+ * it as the intended outcome, not as a failed start.
+ */
+class WorkerStoppedWhileStartingError extends Error {
+  constructor(pluginId: string) {
+    super(`Worker for "${pluginId}" was stopped while starting`);
+    this.name = "WorkerStoppedWhileStartingError";
+  }
 }
 
 /**
@@ -785,6 +841,14 @@ export interface WorkerDiagnostics {
   pendingRequests: number;
   lastCrashAt: number | null;
   nextRestartAt: number | null;
+  /**
+   * True between a fail-closed retirement's SIGKILL and the process exit. The
+   * status still reads `running` in that window, but the handle refuses new
+   * work. A retirement that is not restarted then leaves the status `crashed`;
+   * an operator restarts the plugin (restart, or disable and enable), which
+   * unloads the old handle first.
+   */
+  retiring: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,7 +973,9 @@ export function createPluginWorkerHandle(
   function releaseIdleSleep(): void {
     const prior = idleHold;
     idleHold = null;
-    if (prior && childProcess?.stdin?.writable) {
+    // A worker being retired fail-closed gets nothing more; its hold ends with
+    // the process the host already killed.
+    if (prior && retiringChild === null && childProcess?.stdin?.writable) {
       try {
         sendMessage({ jsonrpc: JSONRPC_VERSION, method: "releaseIdleSleep", params: { ownerId: prior.ownerId } });
       } catch { /* Worker-side expiry still bounds a lost release. */ }
@@ -1045,6 +1111,33 @@ export function createPluginWorkerHandle(
 
   // Shutdown coordination
   let intentionalStop = false;
+  // Bumped by every operator stop. A start that a stop overtook (for example
+  // the crash-recovery start after a retirement) sees the change and never
+  // reports the worker as running, so the stop wins.
+  let stopGeneration = 0;
+
+  // Fail-closed retirement. The host SIGKILLs the worker process and, until
+  // that process exits, refuses new work and ignores everything the process
+  // still writes, so nothing the retired worker held is ever reused. The exit
+  // handler then decides whether a fresh worker starts: `restart` goes through
+  // crash recovery within the retirement budget, `hold` leaves the worker down
+  // for an operator. An operator stop always wins over both.
+  type RetirementMode = "restart" | "hold";
+  let retiringChild: ChildProcess | null = null;
+  let retirement: { reason: string; mode: RetirementMode } | null = null;
+  // When each retirement that restarted (or tried to restart) the worker
+  // happened, on the monotonic budget clock, for the rolling budget. Only an
+  // operator start clears it.
+  const restartedRetirementTimes: number[] = [];
+  const maxRestartedRetirements =
+    options.retirementBudget?.maxRestarts ?? MAX_RESTARTED_RETIREMENTS;
+  const retirementWindowMs =
+    options.retirementBudget?.windowMs ?? RETIREMENT_WINDOW_MS;
+  const retirementClock = options.retirementBudget?.now ?? (() => performance.now());
+  // Why the pending crash-recovery restart happens (`"retired: <why>"`), or
+  // undefined after a plain crash. A failed recovery start logs it, so the
+  // reason survives a start that fails. A successful start clears it.
+  let recoveryReason: string | undefined;
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
@@ -1089,6 +1182,10 @@ export function createPluginWorkerHandle(
 
   function handleLine(line: string): void {
     if (!line.trim()) return;
+    // A retired worker is no longer trusted. Lines it wrote before the SIGKILL
+    // can still sit in the pipe; drop them unread, so no late reply,
+    // acknowledgement, frame, or host request from it is acted on.
+    if (retiringChild !== null) return;
 
     // Enforce the framing bound BEFORE the JSON parse. A line longer than the
     // limit is dropped without a parse, so a faulty or hostile worker cannot
@@ -1543,12 +1640,9 @@ export function createPluginWorkerHandle(
     if (!confirmed) {
       // The worker did not acknowledge the close, so the host cannot prove the
       // terminal is gone. Fail closed: retire the worker before any reuse. This
-      // also settles and clears every other route the worker still holds.
-      log.error(
-        { pluginId },
-        "login pseudo-terminal close not acknowledged; retiring worker",
-      );
-      void killProcess();
+      // also settles and clears every other route the worker still holds. A
+      // fresh worker holds no terminal, so crash recovery may start one.
+      retireWorker("login pseudo-terminal close not acknowledged", "restart");
     }
   }
 
@@ -1886,7 +1980,11 @@ export function createPluginWorkerHandle(
       },
       kill(): void {
         const sid = route.workerSessionId;
-        if (!sid) return;
+        // The stop is keyed on the worker session id alone. Once the route
+        // ended (its terminal exited, it was closed, or its worker exited), that
+        // id may name another terminal, on this worker or on a restarted one,
+        // so a stale stop must never be sent.
+        if (!sid || route.state !== "open" || route.terminalized) return;
         void callInternal(
           "loginPtyStop",
           { workerSessionId: sid },
@@ -1986,6 +2084,11 @@ export function createPluginWorkerHandle(
     // before the send and decrements it once the request settles, on every
     // path: a reply, a rejection, a timeout, a worker exit, or a shutdown.
     pendingWriteBytes: number;
+    // True once the worker reported the exit of this route's exact bound pair
+    // (`hostRouteId` + `workerSessionId`). A worker may forget a channel once it
+    // ended, so its later close acknowledgement can echo the host route id
+    // only; the earlier exact-pair exit is the proof the channel is gone.
+    exitReported: boolean;
   }
   // The live duplex routes on this worker, keyed by the exact
   // `{ hostRouteId, workerSessionId }` pair. The host binds one pair once, at
@@ -2001,6 +2104,13 @@ export function createPluginWorkerHandle(
   // until the worker retires. A late frame for a tombstoned pair reaches no
   // listener. A closed pair never returns.
   const duplexPairTombstones = new Set<string>();
+  // The tombstoned routes whose close the host sent but the worker has not
+  // acknowledged yet, keyed by the exact pair key. A worker can report the
+  // exact pair's exit just as the host's close crosses it on the wire; the
+  // pair is tombstoned by then, so the exit reaches no wait, but it still
+  // marks the closing route, and its close acknowledgement is then judged
+  // with that exit in mind. An entry leaves once its acknowledgement settles.
+  const closingDuplexRoutes = new Map<string, DuplexChannelRoute>();
 
   // The process-scoped aggregate route-slot controller. The manager injects it, so
   // the ceiling counts every duplex route across every worker in the process, not
@@ -2033,13 +2143,13 @@ export function createPluginWorkerHandle(
     duplexRouteSlots?.release();
   }
 
-  // Retire the worker at once. The host kills the process, so every live route,
-  // every reserved route, and every tombstone drops together. The host uses this
-  // as the fail-closed response to an ownership violation and to a tombstone-set
-  // overflow. The host never logs the raw frame content on a violation.
+  // Retire the worker at once on an ownership violation. The host kills the
+  // process, so every live route, every reserved route, and every tombstone
+  // drops together. A worker that sent a frame or a reply for a pair it does not
+  // own is not trusted again without an operator, so it is not restarted. The
+  // host never logs the raw frame content on a violation.
   function retireDuplexWorkerOnViolation(reason: string): void {
-    log.error({ pluginId }, `duplex channel ownership violation (${reason}); retiring worker`);
-    void killProcess();
+    retireWorker(`duplex channel ownership violation (${reason})`, "hold");
   }
 
   // Install a tombstone for a bound pair atomically with the removal of its live
@@ -2056,8 +2166,10 @@ export function createPluginWorkerHandle(
       if (duplexPairTombstones.size >= MAX_DUPLEX_ROUTE_TOMBSTONES) {
         // The set is full. Do not evict a tombstone. Retire the worker, which
         // drops every route and every tombstone together, so no closed pair ever
-        // returns.
-        retireDuplexWorkerOnViolation("tombstone set overflow");
+        // returns. The host fills this set itself, one pair per closed route, so
+        // a full set is a capacity limit, not worker misbehavior: a fresh worker
+        // starts with an empty set, and host route ids never repeat.
+        retireWorker("duplex channel tombstone set full", "restart");
         return;
       }
       duplexPairTombstones.add(pairKey);
@@ -2069,13 +2181,19 @@ export function createPluginWorkerHandle(
   // for the exact pair. Before a session binds, the acknowledgement carries the
   // host route identifier only, so a lost open reply still permits a route-only
   // close. After a session binds, the acknowledgement must echo both the host
-  // route identifier and the bound worker session identifier. An absent,
-  // malformed, mismatched, or timed-out acknowledgement returns false, so the
-  // caller fails closed.
-  async function closeDuplexChannelTerminal(
-    hostRouteId: string,
-    boundWorkerSessionId: string | null,
-  ): Promise<boolean> {
+  // route identifier and the bound worker session identifier. One exception:
+  // when the worker already reported the exit of the exact bound pair, an
+  // acknowledgement with no worker session identifier at all is enough, because
+  // the worker already proved that exact channel gone and may have forgotten it
+  // since. The exit may arrive before the close or cross it on the wire, as long
+  // as it arrives before the acknowledgement, so the check reads the route's
+  // flag only once the acknowledgement is in. An absent, malformed, mismatched,
+  // or timed-out acknowledgement returns false, so the caller fails closed; a
+  // worker session identifier that is present but not the bound one (a number,
+  // an empty string, another session) is mismatched, never "route-only".
+  async function closeDuplexChannelTerminal(route: DuplexChannelRoute): Promise<boolean> {
+    const hostRouteId = route.hostRouteId;
+    const boundWorkerSessionId = route.workerSessionId;
     try {
       const ack = await callInternal(
         "duplexChannelClose",
@@ -2087,8 +2205,9 @@ export function createPluginWorkerHandle(
       }
       if (boundWorkerSessionId !== null) {
         // A bound close: the acknowledgement must echo the exact worker session
-        // identifier. A missing or a mismatched identifier is invalid.
-        return readNonEmptyString(ack.workerSessionId) === boundWorkerSessionId;
+        // identifier, or carry none after an exact-pair exit.
+        if (readNonEmptyString(ack.workerSessionId) === boundWorkerSessionId) return true;
+        return ack.workerSessionId === undefined && route.exitReported;
       }
       return true;
     } catch {
@@ -2138,15 +2257,26 @@ export function createPluginWorkerHandle(
     // A terminalized route reports a null exit code, which the caller treats as a
     // failure.
     settleRouteWait(route, { exitCode: null });
-    const confirmed = await closeDuplexChannelTerminal(route.hostRouteId, route.workerSessionId);
+    // Keep the route reachable by its exact pair until the acknowledgement
+    // settles, so an exit that crosses the close still counts for it.
+    const closingPairKey =
+      route.workerSessionId !== null
+        ? duplexPairKey(route.hostRouteId, route.workerSessionId)
+        : null;
+    if (closingPairKey !== null) closingDuplexRoutes.set(closingPairKey, route);
+    let confirmed: boolean;
+    try {
+      confirmed = await closeDuplexChannelTerminal(route);
+    } finally {
+      if (closingPairKey !== null && closingDuplexRoutes.get(closingPairKey) === route) {
+        closingDuplexRoutes.delete(closingPairKey);
+      }
+    }
     if (!confirmed) {
       // The worker did not acknowledge the close, so the host cannot prove the
-      // channel is gone. Fail closed: retire the worker before any reuse.
-      log.error(
-        { pluginId },
-        "duplex channel close not acknowledged; retiring worker",
-      );
-      void killProcess();
+      // channel is gone. Fail closed: retire the worker before any reuse. A
+      // fresh worker holds no channel, so crash recovery may start one.
+      retireWorker("duplex channel close not acknowledged", "restart");
     }
   }
 
@@ -2291,7 +2421,16 @@ export function createPluginWorkerHandle(
     const workerSessionId = readNonEmptyString(params.workerSessionId);
     const resolved = resolveDuplexRouteByPair(hostRouteId, workerSessionId);
     if (resolved === "tombstoned") {
-      // A late exit for a closed pair. It reaches no wait and changes no state.
+      // A late exit for a closed pair. It reaches no wait. When the host's close
+      // for that exact pair still waits for its acknowledgement, the exit crossed
+      // the close on the wire: record it on the closing route, so a later
+      // acknowledgement that echoes the host route id only is judged as one
+      // that follows an exact-pair exit.
+      const closing =
+        hostRouteId && workerSessionId
+          ? closingDuplexRoutes.get(duplexPairKey(hostRouteId, workerSessionId))
+          : undefined;
+      if (closing) closing.exitReported = true;
       return;
     }
     if (resolved === "violation") {
@@ -2307,6 +2446,9 @@ export function createPluginWorkerHandle(
       return;
     }
     const exitCode = typeof params.exitCode === "number" ? params.exitCode : null;
+    // The exit resolved to this live route by its exact bound pair, so the
+    // worker reported this exact channel gone.
+    resolved.exitReported = true;
     // A reason-less transport close carries `transportClosed`; a real process exit
     // does not. Carry the discriminator to the wait only when it is a transport
     // close, so a real exit keeps the plain `{ exitCode }` result and the broker
@@ -2441,6 +2583,7 @@ export function createPluginWorkerHandle(
     openingDuplexRoutes.clear();
     liveDuplexRoutes.clear();
     duplexPairTombstones.clear();
+    closingDuplexRoutes.clear();
     for (const route of routes) {
       if (!route.terminalized) {
         route.terminalized = true;
@@ -2496,6 +2639,7 @@ export function createPluginWorkerHandle(
       preBindBytes: 0,
       preBindExit: null,
       pendingWriteBytes: 0,
+      exitReported: false,
     };
     // Reserve one aggregate route slot before any work. When the process-scoped
     // ceiling is full, reject with the fixed route-busy error and open nothing, so
@@ -2773,8 +2917,22 @@ export function createPluginWorkerHandle(
       return;
     }
 
+    // The process that sent this request. The handler may outlive it: the
+    // worker can exit or be retired while the handler runs, and crash recovery
+    // can start a fresh process before the handler returns. Worker request ids
+    // restart at 1 in every process, so a reply sent to the fresh process could
+    // settle one of its own requests with another process's answer. Reply only
+    // to the process that asked, and only while it is still trusted.
+    const origin = childProcess;
+    const originStillAsks = () =>
+      origin !== null && childProcess === origin && retiringChild !== origin;
+
     try {
       const result = await handler(request.params, contextForWorkerMessage(request));
+      if (!originStillAsks()) {
+        log.warn({ method }, "dropping a host reply: the worker process that asked is gone");
+        return;
+      }
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,
@@ -2783,6 +2941,10 @@ export function createPluginWorkerHandle(
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log.error({ method, err: errorMessage }, "host handler error");
+      if (!originStillAsks()) {
+        log.warn({ method }, "dropping a host error reply: the worker process that asked is gone");
+        return;
+      }
       try {
         sendMessage(
           createErrorResponse(
@@ -3000,6 +3162,11 @@ export function createPluginWorkerHandle(
     signal: NodeJS.Signals | null,
   ): void {
     const wasIntentional = intentionalStop;
+    // The retired process is gone, so the handle accepts work again once a
+    // fresh worker runs. The retirement itself is decided below.
+    const retired = retirement;
+    retirement = null;
+    retiringChild = null;
 
     // Clean up readline interfaces
     if (readline) {
@@ -3050,13 +3217,22 @@ export function createPluginWorkerHandle(
     emitter.emit("exit", { pluginId, code, signal });
 
     if (wasIntentional) {
-      // Graceful stop — status is already "stopping" or will be set to "stopped"
+      // Graceful stop — status is already "stopping" or will be set to "stopped".
+      // An operator stop that arrived during a retirement wins: no restart.
       setStatus("stopped");
-      log.info({ code, signal }, "worker process stopped");
+      if (retired) {
+        log.warn(
+          { code, signal, reason: `retired: ${retired.reason}`, willRestart: false },
+          "retired worker exited after an operator stop; not restarting",
+        );
+      } else {
+        log.info({ code, signal }, "worker process stopped");
+      }
       return;
     }
 
-    // Unexpected exit — crash recovery
+    // Unexpected exit — crash recovery. A fail-closed retirement lands here too:
+    // the old worker is never reused, but the plugin may come back.
     totalCrashes++;
     const now = Date.now();
 
@@ -3067,24 +3243,87 @@ export function createPluginWorkerHandle(
     consecutiveCrashes++;
     lastCrashAt = now;
 
-    log.error(
-      { code, signal, consecutiveCrashes, totalCrashes },
-      "worker process crashed",
-    );
+    const withinCrashLimit = autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES;
+    let willRestart = withinCrashLimit;
+    const reason = retired ? `retired: ${retired.reason}` : undefined;
 
-    const willRestart =
-      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES;
+    if (!retired) {
+      log.error(
+        { code, signal, consecutiveCrashes, totalCrashes, willRestart },
+        "worker process crashed",
+      );
+      if (!willRestart) {
+        log.error(
+          { consecutiveCrashes, maxCrashes: MAX_CONSECUTIVE_CRASHES },
+          "max consecutive crashes reached, not restarting",
+        );
+      }
+    } else if (retired.mode === "hold") {
+      willRestart = false;
+      log.error(
+        { code, signal, reason, willRestart, totalCrashes },
+        "retired worker exited; not restarting it, an operator must restart the plugin",
+      );
+    } else {
+      // Count this retirement in the rolling budget. A successful start does not
+      // reset it, so a retirement that repeats on every fresh worker stops here.
+      // The window runs on the monotonic clock, not the wall clock.
+      const retiredAt = retirementClock();
+      while (
+        restartedRetirementTimes.length > 0 &&
+        retiredAt - restartedRetirementTimes[0]! >= retirementWindowMs
+      ) {
+        restartedRetirementTimes.shift();
+      }
+      restartedRetirementTimes.push(retiredAt);
+      const retirementsInWindow = restartedRetirementTimes.length;
+      if (retirementsInWindow > maxRestartedRetirements) {
+        willRestart = false;
+        log.error(
+          {
+            code,
+            signal,
+            reason,
+            willRestart,
+            retirementsInWindow,
+            maxRetirements: maxRestartedRetirements,
+            windowMs: retirementWindowMs,
+          },
+          `worker retired ${retirementsInWindow} times within ${Math.round(retirementWindowMs / 60_000)} minutes; not restarting it, an operator must restart the plugin`,
+        );
+      } else {
+        log.error(
+          {
+            code,
+            signal,
+            reason,
+            willRestart,
+            retirementsInWindow,
+            maxRetirements: maxRestartedRetirements,
+            consecutiveCrashes,
+            maxCrashes: MAX_CONSECUTIVE_CRASHES,
+          },
+          willRestart
+            ? "retired worker exited; starting a fresh worker after backoff"
+            : !autoRestart
+              ? "retired worker exited; not restarting it, auto-restart is off"
+              : `retired worker exited; not restarting it, ${consecutiveCrashes} consecutive crashes passed the limit of ${MAX_CONSECUTIVE_CRASHES}`,
+        );
+      }
+    }
 
+    recoveryReason = willRestart ? reason : undefined;
     setStatus("crashed");
-    emitter.emit("crash", { pluginId, code, signal, willRestart });
+    emitter.emit("crash", {
+      pluginId,
+      code,
+      signal,
+      willRestart,
+      ...(reason ? { reason } : {}),
+    });
 
     if (willRestart) {
       scheduleRestart();
-    } else {
-      log.error(
-        { consecutiveCrashes, maxCrashes: MAX_CONSECUTIVE_CRASHES },
-        "max consecutive crashes reached, not restarting",
-      );
     }
   }
 
@@ -3133,6 +3372,13 @@ export function createPluginWorkerHandle(
     backoffTimer = setTimeout(async () => {
       backoffTimer = null;
       nextRestartAt = null;
+      // A stop bumps the generation. Decide on it, not on `intentionalStop`:
+      // a failed initialize also ends its process through killProcess, which
+      // sets that flag, and must not read as an operator stop.
+      const generation = stopGeneration;
+      // Checked before the idle hold below, so a worker that already runs is
+      // never put back into backoff by a reschedule.
+      if (status === "running" || status === "starting") return;
       // A temporary idle hold must not consume the crash-recovery attempt.
       // Keep the bounded backoff until admission reopens.
       if (readTaskDrain(new Date())?.ownerId) {
@@ -3142,12 +3388,59 @@ export function createPluginWorkerHandle(
       try {
         await startInternal();
       } catch (err) {
-        log.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          "restart after backoff failed",
-        );
+        const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof WorkerStoppedWhileStartingError || generation !== stopGeneration) {
+          // An operator stop overtook the restart; that is the intended outcome.
+          log.info({ err: message }, "restart after backoff cancelled by an operator stop");
+          return;
+        }
+        handleFailedRecoveryStart(message);
       }
     }, delay);
+  }
+
+  // A crash-recovery start failed (spawn error, initialize timeout, `ok:false`,
+  // or an error reply). The start never reached "running", so it counts as one
+  // more consecutive crash. Retry through the same backoff while the
+  // consecutive-crash limit allows it; otherwise leave the worker `crashed`
+  // with one loud error naming the reason and the count. A worker that was
+  // retired is therefore never left down silently by a start that failed once.
+  function handleFailedRecoveryStart(message: string): void {
+    totalCrashes++;
+    const now = Date.now();
+    if (lastCrashAt !== null && now - lastCrashAt > CRASH_WINDOW_MS) {
+      consecutiveCrashes = 0;
+    }
+    consecutiveCrashes++;
+    lastCrashAt = now;
+    const willRestart = autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES;
+    const reason = recoveryReason;
+    if (status !== "crashed") setStatus("crashed");
+    if (willRestart) {
+      log.error(
+        {
+          err: message,
+          reason,
+          willRestart,
+          consecutiveCrashes,
+          maxCrashes: MAX_CONSECUTIVE_CRASHES,
+        },
+        "restart after backoff failed; retrying after backoff",
+      );
+      scheduleRestart();
+      return;
+    }
+    recoveryReason = undefined;
+    log.error(
+      {
+        err: message,
+        reason,
+        willRestart,
+        consecutiveCrashes,
+        maxCrashes: MAX_CONSECUTIVE_CRASHES,
+      },
+      `restart after backoff failed; ${consecutiveCrashes} consecutive crashes passed the limit of ${MAX_CONSECUTIVE_CRASHES}, not restarting it, an operator must restart the plugin`,
+    );
   }
 
   function cancelPendingRestart(): void {
@@ -3168,7 +3461,14 @@ export function createPluginWorkerHandle(
     }
 
     intentionalStop = false;
+    // An operator stop that lands while this start is in flight bumps the
+    // generation; the start then never reports the worker as running.
+    const generation = stopGeneration;
     setStatus("starting");
+    if (generation !== stopGeneration) {
+      // A status listener stopped the worker before it spawned. Spawn nothing.
+      throw new WorkerStoppedWhileStartingError(pluginId);
+    }
     stderrExcerpt = "";
 
     const child = spawnProcess();
@@ -3198,21 +3498,45 @@ export function createPluginWorkerHandle(
     } catch (err) {
       // Initialize failed — kill the process and propagate
       const msg = err instanceof Error ? err.message : String(err);
+      if (generation !== stopGeneration) {
+        // An operator stop overtook this start and owns the process and the
+        // status now; it ends in "stopped", not "crashed".
+        log.info({ err: msg }, "worker start ended by an operator stop");
+        await killProcess();
+        throw new WorkerStoppedWhileStartingError(pluginId);
+      }
       log.error({ err: msg }, "worker initialize failed");
       await killProcess();
+      if (generation !== stopGeneration) {
+        // A stop arrived while the failed process was being ended; it owns the
+        // status now, so do not overwrite it with "crashed".
+        throw new WorkerStoppedWhileStartingError(pluginId);
+      }
       setStatus("crashed");
       throw new Error(`Worker initialize failed for "${pluginId}": ${msg}`);
     }
 
+    if (generation !== stopGeneration) {
+      // An operator stop arrived while the worker initialized. Never report it
+      // as running; end the process, whether or not the stop still waits for it.
+      log.info({ pid: child.pid }, "worker initialized after an operator stop; not marking it running");
+      await killProcess();
+      throw new WorkerStoppedWhileStartingError(pluginId);
+    }
+
     // Reset crash counter on successful start
     consecutiveCrashes = 0;
+    recoveryReason = undefined;
     setStatus("running");
     emitter.emit("ready", { pluginId });
     log.info({ pid: child.pid }, "worker process started and initialized");
   }
 
   async function stopInternal(): Promise<void> {
+    // An operator stop always wins: no pending crash-recovery restart fires,
+    // and a start already in flight never reports the worker as running.
     cancelPendingRestart();
+    stopGeneration += 1;
 
     if (status === "stopped" || status === "stopping") {
       return;
@@ -3226,17 +3550,23 @@ export function createPluginWorkerHandle(
       return;
     }
 
-    // Step 1: Send shutdown RPC and wait for the worker to exit gracefully.
-    // We race the shutdown call against a timeout. The worker should process
-    // the shutdown and exit on its own within the drain period.
-    try {
-      await Promise.race([
-        callInternal("shutdown", {} as Record<string, never>, SHUTDOWN_DRAIN_MS),
-        waitForExit(SHUTDOWN_DRAIN_MS),
-      ]);
-    } catch {
-      // Shutdown call failed or timed out — proceed to kill
-      log.warn("shutdown RPC failed or timed out, escalating to SIGTERM");
+    if (retiringChild !== null) {
+      // A fail-closed retirement already sent SIGKILL. The retired worker gets
+      // no shutdown request; wait for its exit, which now counts as a stop.
+      await waitForExit(SIGTERM_GRACE_MS);
+    } else {
+      // Step 1: Send shutdown RPC and wait for the worker to exit gracefully.
+      // We race the shutdown call against a timeout. The worker should process
+      // the shutdown and exit on its own within the drain period.
+      try {
+        await Promise.race([
+          callInternal("shutdown", {} as Record<string, never>, SHUTDOWN_DRAIN_MS),
+          waitForExit(SHUTDOWN_DRAIN_MS),
+        ]);
+      } catch {
+        // Shutdown call failed or timed out — proceed to kill
+        log.warn("shutdown RPC failed or timed out, escalating to SIGTERM");
+      }
     }
 
     // Give the process a brief moment to exit after the shutdown response
@@ -3325,6 +3655,40 @@ export function createPluginWorkerHandle(
     });
   }
 
+  // Fail-closed retirement. Kill the worker at once, so nothing it still holds
+  // (a channel or a terminal the host cannot prove closed, or state after an
+  // ownership violation) is ever reused. Unlike killProcess this is not an
+  // operator stop: the exit handler restarts a `restart` retirement through
+  // crash recovery, within the retirement budget, and leaves a `hold`
+  // retirement down for an operator. Until the process exits the handle
+  // refuses new work and drops the process's output.
+  function retireWorker(reason: string, mode: RetirementMode): void {
+    const child = childProcess;
+    if (!child) return;
+    if (retiringChild === child && retirement) {
+      // Already retiring this process. Keep the first reason, but a `hold`
+      // never downgrades to a `restart`.
+      if (mode === "hold" && retirement.mode !== "hold") {
+        retirement = { reason, mode };
+        log.error({ reason }, `worker already retiring; now not restarting it: ${reason}`);
+      }
+      return;
+    }
+    retiringChild = child;
+    retirement = { reason, mode };
+    log.error(
+      { reason, restartPolicy: mode },
+      mode === "restart"
+        ? `retiring worker: ${reason}; a fresh worker starts after backoff if the retirement budget allows`
+        : `retiring worker: ${reason}; it will not be restarted`,
+    );
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Process may already be dead; its exit event still follows.
+    }
+  }
+
   async function killProcess(): Promise<void> {
     if (!childProcess) return;
     intentionalStop = true;
@@ -3361,6 +3725,18 @@ export function createPluginWorkerHandle(
     onWorkerSettled?: () => void,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
+      if (retiringChild !== null) {
+        // The worker is being retired fail-closed; nothing more reaches it.
+        // The call never reached the worker, so it settles now: a caller's
+        // inspection slot must not wait for a reply that cannot come.
+        onWorkerSettled?.();
+        reject(
+          new Error(
+            `Cannot call "${method}" — worker for "${pluginId}" is retiring`,
+          ),
+        );
+        return;
+      }
       const idleControl = method === "prepareIdleSleep" || method === "releaseIdleSleep";
       if (!idleControl && method !== "shutdown" && idleSleepHeld()) {
         onWorkerSettled?.();
@@ -3485,6 +3861,15 @@ export function createPluginWorkerHandle(
   // Public API
   // -----------------------------------------------------------------------
 
+  // Why the handle refuses new work right now, or null when it accepts it. A
+  // worker being retired still shows its last status until its process exits,
+  // but it takes no new call, channel, or terminal.
+  function workUnavailableState(): string | null {
+    if (status !== "running" && status !== "starting") return status;
+    if (retiringChild !== null) return "retiring";
+    return null;
+  }
+
   const handle: PluginWorkerHandle = {
     releaseIdleSleep,
     async prepareIdleSleep(hold) {
@@ -3494,7 +3879,9 @@ export function createPluginWorkerHandle(
       // Clear a previous hold even when this idle worker received no ordinary
       // call between two controller attempts.
       idleSleepHeld();
-      if (status !== "running" || totalCrashes > 0) return "unknown";
+      // A worker being retired still reads "running" until its process exits,
+      // but it is no longer trusted, so it is never sealed for idle sleep.
+      if (status !== "running" || retiringChild !== null || totalCrashes > 0) return "unknown";
       if (!supportedMethods.includes("prepareIdleSleep")) return "present";
       if (unsettledCalls.size || activeHostHandlers || loginPtyRoutesByHostRouteId.size ||
           liveDuplexRoutes.size || openingDuplexRoutes.size || terminalDuplexRoutes.size) return "present";
@@ -3531,6 +3918,13 @@ export function createPluginWorkerHandle(
     },
 
     async start() {
+      if (status !== "running" && status !== "starting") {
+        // An explicit start is an operator action: it replaces any pending
+        // crash-recovery restart and gives the worker a fresh retirement
+        // budget. A start refused as "already running" changes neither.
+        cancelPendingRestart();
+        restartedRetirementTimes.length = 0;
+      }
       await startInternal();
     },
 
@@ -3540,6 +3934,7 @@ export function createPluginWorkerHandle(
 
     async restart() {
       await stopInternal();
+      restartedRetirementTimes.length = 0;
       await startInternal();
     },
 
@@ -3550,11 +3945,12 @@ export function createPluginWorkerHandle(
       executeLogSink?: ExecuteLogSink,
       onWorkerSettled?: () => void,
     ): Promise<HostToWorkerMethods[M][1]> {
-      if (status !== "running" && status !== "starting") {
+      const unavailable = workUnavailableState();
+      if (unavailable) {
         onWorkerSettled?.();
         return Promise.reject(
           new Error(
-            `Cannot call "${method}" — worker for "${pluginId}" is ${status}`,
+            `Cannot call "${method}" — worker for "${pluginId}" is ${unavailable}`,
           ),
         );
       }
@@ -3562,10 +3958,11 @@ export function createPluginWorkerHandle(
     },
 
     openLoginPtySession(input: LoginPtyOpenInput) {
-      if (status !== "running" && status !== "starting") {
+      const unavailable = workUnavailableState();
+      if (unavailable) {
         return Promise.reject(
           new Error(
-            `Cannot open a login pseudo-terminal — worker for "${pluginId}" is ${status}`,
+            `Cannot open a login pseudo-terminal — worker for "${pluginId}" is ${unavailable}`,
           ),
         );
       }
@@ -3573,10 +3970,11 @@ export function createPluginWorkerHandle(
     },
 
     openDuplexChannel(input: DuplexChannelOpenInput) {
-      if (status !== "running" && status !== "starting") {
+      const unavailable = workUnavailableState();
+      if (unavailable) {
         return Promise.reject(
           new Error(
-            `Cannot open a duplex channel — worker for "${pluginId}" is ${status}`,
+            `Cannot open a duplex channel — worker for "${pluginId}" is ${unavailable}`,
           ),
         );
       }
@@ -3584,7 +3982,7 @@ export function createPluginWorkerHandle(
     },
 
     notify(method: string, params: unknown) {
-      if (status !== "running") return;
+      if (status !== "running" || retiringChild !== null) return;
       if (idleSleepHeld()) throw new Error("Plugin is held for idle sleep");
       // Fork: plus the host-derived method (spec 9.6).
       const invocationScope = withHostInvocationFacts(deriveInvocationScope(method, params), method, params);
@@ -3641,6 +4039,7 @@ export function createPluginWorkerHandle(
         pendingRequests: pendingRequests.size,
         lastCrashAt,
         nextRestartAt,
+        retiring: retiringChild !== null,
       };
     },
   };
@@ -3666,6 +4065,8 @@ export interface PluginWorkerManagerOptions {
     code?: number | null;
     signal?: string | null;
     willRestart?: boolean;
+    /** Set on a crash the host caused by retiring the worker: `"retired: <why>"`. */
+    reason?: string;
   }) => void;
   /**
    * The process-scoped aggregate ceiling for concurrent duplex channel routes,
@@ -3821,6 +4222,7 @@ export function createPluginWorkerManager(
             code: payload.code,
             signal: payload.signal,
             willRestart: payload.willRestart,
+            ...(payload.reason ? { reason: payload.reason } : {}),
           });
         });
         handle.on("ready", (payload) => {
