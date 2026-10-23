@@ -676,6 +676,18 @@ function hasOwn(record: Record<string, unknown>, key: string) {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
 
+/** Whether two records hold the same keys with the same values. */
+function sameShallowFields(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+) {
+  const keys = Object.keys(left);
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => hasOwn(right, key) && Object.is(left[key], right[key]))
+  );
+}
+
 async function auditAgentIssueCreateAttributionSpoof(input: {
   db: Db;
   req: Request;
@@ -3464,6 +3476,8 @@ export function issueRoutes(
     companyId: string;
     issueId: string;
     agentId: string;
+    /** Runs only when there is a goal to stop, right before it is stopped. */
+    beforeStop?: () => Promise<void>;
   }) => {
     const current = await runnerGoals.projection(
       input.companyId,
@@ -3488,6 +3502,7 @@ export function issueRoutes(
         { code: "runner_goal_stop_unsupported", projection: current },
       );
     }
+    await input.beforeStop?.();
     await runnerGoals.act(input.companyId, input.issueId, {
       requestId: `ownership_${randomUUID()}`,
       agentId: input.agentId,
@@ -4120,9 +4135,12 @@ export function issueRoutes(
     scheduledRetryRunId: string | null | undefined;
     issue: { id: string; companyId: string };
     actor: ReturnType<typeof getActorInfo>;
+    /** Runs only when there is a retry to cancel, right before it is cancelled. */
+    beforeCancel?: () => Promise<void>;
   }) {
     const scheduledRetryRunId = readNonEmptyString(input.scheduledRetryRunId);
     if (!scheduledRetryRunId) return null;
+    await input.beforeCancel?.();
 
     try {
       const cancelled = await heartbeat.cancelRun(scheduledRetryRunId, undefined, {
@@ -13999,43 +14017,8 @@ export function issueRoutes(
           });
           return;
         }
-
-        const runToInterrupt = await resolveActiveIssueRun(existing);
-        if (runToInterrupt) {
-          const cancelled = await heartbeat.cancelRun(
-            runToInterrupt.id,
-            "Interrupted by board comment",
-            operatorInterruptCancelOptions({ issueId: existing.id, actor }),
-          );
-          if (cancelled) {
-            interruptedRunId = cancelled.id;
-            await logActivity(db, {
-              companyId: cancelled.companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              action: "heartbeat.cancelled",
-              entityType: "heartbeat_run",
-              entityId: cancelled.id,
-              issueId: existing.id,
-              details: {
-                agentId: cancelled.agentId,
-                source: "issue_comment_interrupt",
-                issueId: existing.id,
-                cancellationKind: "operator_interrupted",
-                operatorInterrupted: true,
-              },
-            });
-          }
-        }
+        // The interrupt itself runs after the update precheck below.
       }
-
-      const runToCancelForCancelledStatus =
-        shouldCancelActiveRunForCancelledStatus
-          ? await resolveActiveIssueRun(existing)
-          : null;
 
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
@@ -14049,25 +14032,6 @@ export function issueRoutes(
         updateFields.status === undefined
       ) {
         updateFields.status = "todo";
-      }
-      let cancelledScheduledRetryRunId: string | null = null;
-      if (
-        commentBody &&
-        shouldResumeInProgressScheduledRetry &&
-        updateFields.status === "todo"
-      ) {
-        cancelledScheduledRetryRunId =
-          await cancelScheduledRetrySupersededByComment({
-            scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
-            issue: existing,
-            actor,
-          });
-        if (!cancelledScheduledRetryRunId) {
-          shouldResumeInProgressScheduledRetry = false;
-          if (!explicitMoveToTodoRequested && req.body.status === undefined) {
-            delete updateFields.status;
-          }
-        }
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
@@ -14095,6 +14059,147 @@ export function issueRoutes(
         existing.assigneeAgentId,
         req.body.executionPolicy !== undefined && monitorChanged,
       );
+
+      // Below, before the update is written, the request may cancel a
+      // scheduled retry, interrupt the active run, stop the assignee's runner
+      // goal, cancel its run or reopen its closed workspace. None of that can
+      // be undone, so right before each of those steps actually happens,
+      // reject a patch that the update will refuse anyway (for example
+      // reassigning or completing a conversation, or handing a task to a user
+      // who is no longer a member). A request that takes none of those steps
+      // leaves the rules to the update alone.
+      const logRejectedIssueUpdate = (err: unknown) => {
+        if (!(err instanceof HttpError) || err.status !== 422) return;
+        logger.warn(
+          {
+            issueId: id,
+            companyId: existing.companyId,
+            assigneePatch: {
+              assigneeAgentId:
+                normalizedAssigneeAgentId === undefined
+                  ? "__omitted__"
+                  : normalizedAssigneeAgentId,
+              assigneeUserId:
+                req.body.assigneeUserId === undefined
+                  ? "__omitted__"
+                  : req.body.assigneeUserId,
+            },
+            currentAssignee: {
+              assigneeAgentId: existing.assigneeAgentId,
+              assigneeUserId: existing.assigneeUserId,
+            },
+            error: err.message,
+            details: err.details,
+          },
+          "issue update rejected with 422",
+        );
+      };
+      // The data the update gets, apart from the stop id that only a stop
+      // below can set. The precheck checks exactly this.
+      const issueUpdateDataBeforeStop = () => ({
+        ...updateFields,
+        workspaceSelectionActor: req.actor,
+        expectedExecutionPolicy,
+        expectedStatusVersion,
+        actorAgentId: actor.agentId ?? null,
+        actorRunId: actor.agentId ? actor.runId : null,
+        actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+      const precheckIssueUpdate = async (
+        current: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+      ) => {
+        try {
+          await svc.precheckUpdate(current, issueUpdateDataBeforeStop());
+        } catch (err) {
+          logRejectedIssueUpdate(err);
+          throw err;
+        }
+      };
+      // Every step below that cannot be undone awaits this first. It checks
+      // the row read above once for each version of the patch: the
+      // scheduled-retry cancel runs before the policy transition adds its
+      // fields, so a step after the transition checks the final patch again.
+      let issueUpdatePrecheck: {
+        fields: Record<string, unknown>;
+        result: Promise<void>;
+      } | null = null;
+      const precheckIssueUpdateOnce = () => {
+        if (
+          !issueUpdatePrecheck ||
+          !sameShallowFields(issueUpdatePrecheck.fields, updateFields)
+        ) {
+          issueUpdatePrecheck = {
+            fields: { ...updateFields },
+            result: precheckIssueUpdate(existing),
+          };
+        }
+        return issueUpdatePrecheck.result;
+      };
+      // Stopping a runner goal can wait for the runner, so the row read above
+      // can be stale by the time the run is cancelled. Check again on a fresh
+      // read; a row that is gone is left to the update. If the check now
+      // refuses, the run keeps running and the goal stays stopped: resuming it
+      // could restart a goal that a concurrent change took from this agent.
+      // The error then says which stop was made.
+      const precheckIssueUpdateAfterGoalStop = async (
+        goalStopAction: "pause" | "clear",
+      ) => {
+        const current = await svc.getById(id);
+        if (!current) return;
+        try {
+          await precheckIssueUpdate(current);
+        } catch (err) {
+          if (err instanceof HttpError) {
+            logger.warn(
+              {
+                issueId: id,
+                companyId: existing.companyId,
+                runnerGoalStopped: goalStopAction,
+                status: err.status,
+                error: err.message,
+              },
+              "issue update refused after its runner goal was stopped",
+            );
+            if (
+              err.details === undefined ||
+              (err.details !== null &&
+                typeof err.details === "object" &&
+                !Array.isArray(err.details))
+            ) {
+              err.details = {
+                ...(err.details as Record<string, unknown> | undefined),
+                runnerGoalStopped: goalStopAction,
+              };
+            }
+          }
+          throw err;
+        }
+      };
+
+      // Whether this cancel succeeds decides whether the comment moves the
+      // task to todo, which the policy transition below reads. So the cancel
+      // runs here, as late as its result allows, and the precheck sees the
+      // patch without the transition's fields.
+      let cancelledScheduledRetryRunId: string | null = null;
+      if (
+        commentBody &&
+        shouldResumeInProgressScheduledRetry &&
+        updateFields.status === "todo"
+      ) {
+        cancelledScheduledRetryRunId =
+          await cancelScheduledRetrySupersededByComment({
+            scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
+            issue: existing,
+            actor,
+            beforeCancel: precheckIssueUpdateOnce,
+          });
+        if (!cancelledScheduledRetryRunId) {
+          shouldResumeInProgressScheduledRetry = false;
+          if (!explicitMoveToTodoRequested && req.body.status === undefined) {
+            delete updateFields.status;
+          }
+        }
+      }
 
       const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
         ? { patch: {} }
@@ -14357,15 +14462,58 @@ export function issueRoutes(
         }
       }
 
+      if (interruptRequested) {
+        const runToInterrupt = await resolveActiveIssueRun(existing);
+        if (runToInterrupt) {
+          await precheckIssueUpdateOnce();
+          const cancelled = await heartbeat.cancelRun(
+            runToInterrupt.id,
+            "Interrupted by board comment",
+            operatorInterruptCancelOptions({ issueId: existing.id, actor }),
+          );
+          if (cancelled) {
+            interruptedRunId = cancelled.id;
+            await logActivity(db, {
+              companyId: cancelled.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              action: "heartbeat.cancelled",
+              entityType: "heartbeat_run",
+              entityId: cancelled.id,
+              issueId: existing.id,
+              details: {
+                agentId: cancelled.agentId,
+                source: "issue_comment_interrupt",
+                issueId: existing.id,
+                cancellationKind: "operator_interrupted",
+                operatorInterrupted: true,
+              },
+            });
+          }
+        }
+      }
+
+      const runToCancelForCancelledStatus =
+        shouldCancelActiveRunForCancelledStatus
+          ? await resolveActiveIssueRun(existing)
+          : null;
+
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      // An MCP client never stops the run here. A legacy run that hands its
+      // own task to a human keeps running, but its goal still stops first.
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
-        await stopRunnerGoalForOwnershipChange({
+        const goalStopAction = await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          beforeStop: precheckIssueUpdateOnce,
         });
+        if (goalStopAction) await precheckIssueUpdateAfterGoalStop(goalStopAction);
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         const isHumanSelfHandoff =
           req.actor.type === "agent" &&
@@ -14379,6 +14527,7 @@ export function issueRoutes(
           runToStopForReassignment.companyId === existing.companyId &&
           runToStopForReassignment.contextSnapshot?.issueId === existing.id;
         if (runToStopForReassignment && !isHumanSelfHandoff) {
+          await precheckIssueUpdateOnce();
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14415,11 +14564,14 @@ export function issueRoutes(
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          beforeStop: precheckIssueUpdateOnce,
         });
+        if (goalStopAction) await precheckIssueUpdateAfterGoalStop(goalStopAction);
         const runToStopForTerminalization = goalStopAction
           ? await resolveActiveIssueRun(existing)
           : null;
         if (goalStopAction && runToStopForTerminalization) {
+          await precheckIssueUpdateOnce();
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
@@ -14475,14 +14627,8 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const issueUpdateData = {
-        ...updateFields,
-        workspaceSelectionActor: req.actor,
-        expectedExecutionPolicy,
-        expectedStatusVersion,
-        actorAgentId: actor.agentId ?? null,
-        actorRunId: actor.agentId ? actor.runId : null,
+        ...issueUpdateDataBeforeStop(),
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
-        actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
@@ -14581,12 +14727,14 @@ export function issueRoutes(
         );
       };
       // Reopen the closed isolated workspace only after every access, validation,
-      // and policy gate passes, and just before the update persists. A rejected
-      // update must not rebuild and republish the workspace as active, because the
-      // issue stays terminal and the reaper then skips the leaked workspace.
+      // and policy gate and the update precheck pass, and just before the update
+      // persists. A rejected update must not rebuild and republish the workspace
+      // as active, because the issue stays terminal and the reaper then skips the
+      // leaked workspace.
       let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
       let reopenedGeneration: number | null = null;
       if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
+        await precheckIssueUpdateOnce();
         const reopenOutcome =
           await reopenClosedIssueExecutionWorkspaceOrRespond(
             req,
@@ -14703,31 +14851,7 @@ export function issueRoutes(
           issue = await updateIssue();
         }
       } catch (err) {
-        if (err instanceof HttpError && err.status === 422) {
-          logger.warn(
-            {
-              issueId: id,
-              companyId: existing.companyId,
-              assigneePatch: {
-                assigneeAgentId:
-                  normalizedAssigneeAgentId === undefined
-                    ? "__omitted__"
-                    : normalizedAssigneeAgentId,
-                assigneeUserId:
-                  req.body.assigneeUserId === undefined
-                    ? "__omitted__"
-                    : req.body.assigneeUserId,
-              },
-              currentAssignee: {
-                assigneeAgentId: existing.assigneeAgentId,
-                assigneeUserId: existing.assigneeUserId,
-              },
-              error: err.message,
-              details: err.details,
-            },
-            "issue update rejected with 422",
-          );
-        }
+        logRejectedIssueUpdate(err);
         throw err;
       }
       if (!issue) {

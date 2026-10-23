@@ -16,6 +16,7 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
   getByIdForUpdate: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
@@ -222,7 +223,7 @@ async function loadAppModules() {
 }
 
 async function createApp(transaction: (callback: (tx: Record<string, never>) => Promise<unknown>) => Promise<unknown> =
-  async (callback) => callback({})) {
+  async (callback) => callback({}), actorOverrides: Record<string, unknown> = {}) {
   const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
@@ -234,6 +235,7 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
       source: "local_implicit",
       runId: req.header("x-paperclip-run-id") ?? null,
       isInstanceAdmin: false,
+      ...actorOverrides,
     };
     next();
   });
@@ -520,6 +522,187 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("checks the final patch before the interrupt cancels the run, and skips the check for plain edits", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-3",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(
+      makeIssue({ ...existing, assigneeAgentId: ASSIGNEE_AGENT_ID }),
+    );
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-precheck",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "hand this over",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-3",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-3",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        comment: "hand this over",
+        interrupt: true,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // One check, on the stored row and the patch the update writes, by the
+    // acting board user (no agent run), before the interrupt cancels the run.
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    const [checkedIssue, checkedPatch] = mockIssueService.precheckUpdate.mock
+      .calls[0] as unknown as [Record<string, unknown>, Record<string, unknown>];
+    expect(checkedIssue).toMatchObject({ id: existing.id, status: "in_progress" });
+    expect(checkedPatch).toMatchObject({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      actorAgentId: null,
+      actorRunId: null,
+    });
+    expect(checkedPatch).not.toHaveProperty("comment");
+    expect(checkedPatch).not.toHaveProperty("interrupt");
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject(checkedPatch);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "run-3",
+      "Interrupted by board comment",
+      expect.anything(),
+    );
+    expect(mockIssueService.precheckUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]!,
+    );
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+
+    // A plain field edit stops nothing, so it leaves the rules to the update.
+    vi.clearAllMocks();
+    mockIssueService.update.mockResolvedValue({ ...existing, title: "Renamed" });
+    const titleRes = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ title: "Renamed" });
+    expect(titleRes.status, JSON.stringify(titleRes.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.precheckUpdate).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("checks an MCP client's comment update before its interrupt cancels the run", async () => {
+    // An MCP client never stops a run for a reassignment or completion, but
+    // its comment can still interrupt the active run, so the precheck runs first.
+    const { unprocessable } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-4",
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.precheckUpdate.mockRejectedValue(
+      unprocessable("Issue can only have one assignee"),
+    );
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-4",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+
+    const res = await request(await createApp(undefined, { source: "mcp_oauth" }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "stop and look at this", interrupt: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("checks the patch before a comment cancels its scheduled retry, and the final patch again before the interrupt", async () => {
+    // The retry cancel decides whether the comment moves the task to todo, so it
+    // runs before the policy transition. Here the transition then clears a
+    // stale execution state, so the interrupt checks the final patch again.
+    const existing = makeIssue({
+      assigneeAgentId: PREVIOUS_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId: "run-5",
+      status: "in_progress",
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-5",
+      agentId: PREVIOUS_AGENT_ID,
+      status: "scheduled_retry",
+      scheduledRetryReason: "transient_failure",
+    });
+    mockIssueService.update.mockResolvedValue({ ...existing, status: "todo", executionState: null });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-retry",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "try again with the new settings",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-5",
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "running",
+      contextSnapshot: { issueId: existing.id },
+    });
+    mockHeartbeatService.cancelRun.mockImplementation(async (runId: string) => ({
+      id: runId,
+      companyId: existing.companyId,
+      agentId: PREVIOUS_AGENT_ID,
+      status: "cancelled",
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ comment: "try again with the new settings", interrupt: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const cancelledRunIds = mockHeartbeatService.cancelRun.mock.calls.map((call) => call[0]);
+    expect(cancelledRunIds).toEqual(["retry-5", "run-5"]);
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(2);
+    const [[, retryPatch], [, interruptPatch]] = mockIssueService.precheckUpdate.mock
+      .calls as unknown as Array<[Record<string, unknown>, Record<string, unknown>]>;
+    expect(retryPatch).toMatchObject({ status: "todo" });
+    expect(retryPatch).not.toHaveProperty("executionState");
+    expect(interruptPatch).toMatchObject({ status: "todo", executionState: null });
+    const precheckOrder = mockIssueService.precheckUpdate.mock.invocationCallOrder;
+    const cancelOrder = mockHeartbeatService.cancelRun.mock.invocationCallOrder;
+    expect(precheckOrder[0]).toBeLessThan(cancelOrder[0]!);
+    expect(cancelOrder[0]).toBeLessThan(precheckOrder[1]!);
+    expect(precheckOrder[1]).toBeLessThan(cancelOrder[1]!);
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject(interruptPatch);
   });
 
   it("interrupts the active run without waking an agent when the handoff assigns a user", async () => {

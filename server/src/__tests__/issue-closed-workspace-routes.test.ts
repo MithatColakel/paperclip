@@ -16,6 +16,7 @@ const REOPEN_PENDING_WAIT_TIMEOUT_MS = 5_000;
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   checkout: vi.fn(),
   addComment: vi.fn(),
 }));
@@ -77,6 +78,21 @@ function registerServiceMocks() {
 
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
+  }));
+
+  // An agent update reads its run's watchdog scope and counts its cross-issue
+  // influence; neither applies to the fixture agent's own task.
+  vi.doMock("../services/task-watchdog-scope.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/task-watchdog-scope.js")>(
+      "../services/task-watchdog-scope.js",
+    )),
+    resolveTaskWatchdogMutationScope: vi.fn(async () => ({ kind: "none" })),
+  }));
+  vi.doMock("../services/cross-issue-influence-limit.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/cross-issue-influence-limit.js")>(
+      "../services/cross-issue-influence-limit.js",
+    )),
+    observeCrossIssueInfluence: vi.fn(async () => ({ allowed: true })),
   }));
 
   vi.doMock("../services/execution-workspaces.js", () => ({
@@ -215,11 +231,12 @@ async function assertNoBackgroundClearWithinRetryWindow() {
 
 describe("closed isolated workspace issue routes", () => {
   const routeModules = hoistModuleGraph(registerServiceMocks, async () => {
-    const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+    const [{ issueRoutes }, { errorHandler }, { forbidden, unprocessable }] = await Promise.all([
       vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
       vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../errors.js")>("../errors.js"),
     ]);
-    return { issueRoutes, errorHandler };
+    return { issueRoutes, errorHandler, forbidden, unprocessable };
   });
 
   function createApp(actor?: Record<string, unknown>) {
@@ -244,6 +261,9 @@ describe("closed isolated workspace issue routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
+    // Tests that reach the update set its result; the precheck allows by default.
+    mockIssueService.update.mockReset();
+    mockIssueService.precheckUpdate.mockReset().mockResolvedValue(undefined);
     mockExecutionWorkspaceService.getById.mockResolvedValue(makeClosedWorkspace());
     mockExecutionWorkspaceService.refreshReopenPendingConsumption.mockResolvedValue({ refreshed: true });
     // The guard reopens a closed isolated workspace and lets the request
@@ -379,6 +399,108 @@ describe("closed isolated workspace issue routes", () => {
       mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
     ).not.toHaveBeenCalled();
     expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen the workspace when the update precheck refuses the comment update", async () => {
+    // A done task with no assignee cannot move to in_progress. The update would
+    // refuse it after the reopen, so the route must check the update first and
+    // leave the closed workspace alone.
+    const { unprocessable } = routeModules.value;
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue(),
+      status: "done",
+      assigneeAgentId: null,
+    });
+    mockIssueService.precheckUpdate.mockRejectedValue(
+      unprocessable("in_progress issues require an assignee"),
+    );
+    mockIssueService.update.mockRejectedValue(
+      unprocessable("in_progress issues require an assignee"),
+    );
+
+    const res = await request(createApp())
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "hello", status: "in_progress" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("in_progress issues require an assignee");
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("checks an MCP client's comment update before it reopens the workspace", async () => {
+    // An MCP client never stops a run through this route, but its comment still
+    // reopens a closed workspace, so the update precheck runs first.
+    const { unprocessable } = routeModules.value;
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "done" });
+    mockIssueService.precheckUpdate.mockRejectedValue(
+      unprocessable("Issue can only have one assignee"),
+    );
+
+    const res = await request(createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "mcp_oauth",
+      isInstanceAdmin: false,
+    }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "hello" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.precheckUpdate.mock.calls[0]?.[1]).toMatchObject({ status: "todo" });
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("checks an agent's expectedStatusVersion promotion before it reopens the workspace", async () => {
+    // The promotion is status-only, so the reopen is its only step that cannot
+    // be undone. An agent whose run was stopped meanwhile is refused first.
+    const { forbidden } = routeModules.value;
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_test_mutation",
+      explanation: "The fixture agent may change the task.",
+    }));
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue(),
+      status: "backlog",
+      statusVersion: 7,
+    });
+    mockIssueService.precheckUpdate.mockRejectedValue(
+      forbidden("This run was cancelled", { code: "agent_run_cancelled" }),
+    );
+
+    const res = await request(createApp({
+      type: "agent",
+      agentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+      source: "agent_jwt",
+    }))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", expectedStatusVersion: 7 });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details).toMatchObject({ code: "agent_run_cancelled" });
+    expect(mockIssueService.precheckUpdate.mock.calls[0]?.[1]).toMatchObject({
+      status: "todo",
+      expectedStatusVersion: 7,
+      actorAgentId: agentId,
+      actorRunId: "55555555-5555-4555-8555-555555555555",
+    });
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("clears the reopen-pending flag when the comment update returns null after a reopen", async () => {

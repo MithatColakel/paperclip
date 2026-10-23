@@ -13,6 +13,7 @@ const mockIssueService = vi.hoisted(() => ({
   getWakeableParentAfterChildCompletion: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
