@@ -439,6 +439,9 @@ describe("closed isolated workspace issue routes", () => {
     mockIssueService.precheckUpdate.mockRejectedValue(
       unprocessable("Issue can only have one assignee"),
     );
+    mockIssueService.update.mockRejectedValue(
+      unprocessable("Issue can only have one assignee"),
+    );
 
     const res = await request(createApp({
       type: "board",
@@ -451,13 +454,13 @@ describe("closed isolated workspace issue routes", () => {
       .send({ comment: "hello" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
-    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.precheckUpdate.mock.calls[0]?.[1]).toMatchObject({ status: "todo" });
     expect(
       mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
     ).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.precheckUpdate).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.precheckUpdate.mock.calls[0]?.[1]).toMatchObject({ status: "todo" });
   });
 
   it("checks an agent's expectedStatusVersion promotion before it reopens the workspace", async () => {
@@ -478,6 +481,9 @@ describe("closed isolated workspace issue routes", () => {
     mockIssueService.precheckUpdate.mockRejectedValue(
       forbidden("This run was cancelled", { code: "agent_run_cancelled" }),
     );
+    mockIssueService.update.mockRejectedValue(
+      forbidden("This run was cancelled", { code: "agent_run_cancelled" }),
+    );
 
     const res = await request(createApp({
       type: "agent",
@@ -491,16 +497,16 @@ describe("closed isolated workspace issue routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details).toMatchObject({ code: "agent_run_cancelled" });
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.precheckUpdate.mock.calls[0]?.[1]).toMatchObject({
       status: "todo",
       expectedStatusVersion: 7,
       actorAgentId: agentId,
       actorRunId: "55555555-5555-4555-8555-555555555555",
     });
-    expect(
-      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
-    ).not.toHaveBeenCalled();
-    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("clears the reopen-pending flag when the comment update returns null after a reopen", async () => {

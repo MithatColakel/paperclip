@@ -16,9 +16,13 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  executionWorkspaces,
   issueComments,
   issueRelations,
   issues,
+  labels,
+  projectWorkspaces,
+  projects,
   toolActionRequests,
   toolApplications,
   toolConnections,
@@ -93,7 +97,8 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.insert(companies).values({
         id: companyId,
         name: "Precheck",
-        issuePrefix: `P${companyId.slice(0, 4).toUpperCase()}`,
+        // Long enough that the many companies seeded here never share a prefix.
+        issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 10).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
       });
       await db.insert(agents).values([
@@ -303,6 +308,31 @@ const support = await getEmbeddedPostgresTestSupport();
     function expectRunStillRunning(run: typeof heartbeatRuns.$inferSelect) {
       expect({ status: run.status, errorCode: run.errorCode, finishedAt: run.finishedAt })
         .toEqual({ status: "running", errorCode: null, finishedAt: null });
+    }
+
+    /** A parked retry of the issue's run, which a human comment supersedes. */
+    async function scheduleRetry(companyId: string, agentId: string, issueId: string) {
+      const [retry] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId,
+          agentId,
+          status: "scheduled_retry",
+          scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+          scheduledRetryAttempt: 1,
+          scheduledRetryReason: "transient_failure",
+          contextSnapshot: { issueId, taskKey: issueId },
+        })
+        .returning();
+      return retry!;
+    }
+
+    async function expectRetryStillScheduled(retryId: string) {
+      const retry = await readRun(retryId);
+      expect({ status: retry.status, finishedAt: retry.finishedAt }).toEqual({
+        status: "scheduled_retry",
+        finishedAt: null,
+      });
     }
 
     it("rejects reassigning a conversation before cancelling its run", async () => {
@@ -804,18 +834,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const { companyId, agentId } = await seedCompany();
       const conversation = await createConversation(companyId, agentId);
       const issue = await createTask(companyId, agentId);
-      const [retry] = await db
-        .insert(heartbeatRuns)
-        .values({
-          companyId,
-          agentId,
-          status: "scheduled_retry",
-          scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
-          scheduledRetryAttempt: 1,
-          scheduledRetryReason: "transient_failure",
-          contextSnapshot: { issueId: issue.id, taskKey: issue.id },
-        })
-        .returning();
+      const retry = await scheduleRetry(companyId, agentId, issue.id);
 
       // The comment would move the task back to todo and cancel the retry;
       // only that cancel stops work here.
@@ -824,11 +843,7 @@ const support = await getEmbeddedPostgresTestSupport();
         .send({ comment: "Try it again with the new settings", parentId: conversation.id });
       expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.error).toBe(CONVERSATION_PARENT_ERROR);
-      const retryAfter = await readRun(retry!.id);
-      expect({ status: retryAfter.status, finishedAt: retryAfter.finishedAt }).toEqual({
-        status: "scheduled_retry",
-        finishedAt: null,
-      });
+      await expectRetryStillScheduled(retry.id);
       const after = await readIssue(issue.id);
       expect(after.status).toBe("in_progress");
       expect(after.parentId).toBeNull();
@@ -922,6 +937,288 @@ const support = await getEmbeddedPostgresTestSupport();
         .from(agentTaskSessions)
         .where(eq(agentTaskSessions.id, session.id));
       expect((sessionAfter!.goalJson as Record<string, unknown>).status).toBe("paused");
+    });
+
+    it("rejects a human comment's review request before it cancels the scheduled retry it supersedes", async () => {
+      // The route refuses the review request after the policy transition. The
+      // retry cancel waits for that check, so the task keeps its retry.
+      const { companyId, agentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const retry = await scheduleRetry(companyId, agentId, issue.id);
+
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({
+          comment: "Please look at the new settings",
+          reviewRequest: { instructions: "Check the settings" },
+        });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe("reviewRequest requires an active review or approval stage");
+      await expectRetryStillScheduled(retry.id);
+      expect((await readIssue(issue.id)).status).toBe("in_progress");
+      expect(
+        await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)),
+      ).toEqual([]);
+    });
+
+    it("still cancels the scheduled retry an allowed human comment supersedes", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const retry = await scheduleRetry(companyId, agentId, issue.id);
+
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Try it again with the new settings" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe("todo");
+      expect((await readRun(retry.id)).status).toBe("cancelled");
+    });
+
+    it("keeps the goal stopped and the run running when the check after the goal stop refuses a run's handoff to a human", async () => {
+      const { companyId, agentId } = await seedCompany(RUNNER_AGENT);
+      const issue = await createTask(companyId, agentId, {
+        createdByUserId: BOARD_USER_ID,
+      });
+      const run = await startRun(companyId, agentId, issue.id);
+      // The creator leaves the company while the route waits for the runner
+      // to pause the goal, so the handoff is refused on the fresh read.
+      const session = await startRunnerGoal(
+        { companyId, agentId, issueId: issue.id, runId: run.id },
+        async () => {
+          await db
+            .update(companyMemberships)
+            .set({ status: "suspended" })
+            .where(
+              and(
+                eq(companyMemberships.companyId, companyId),
+                eq(companyMemberships.principalId, BOARD_USER_ID),
+              ),
+            );
+        },
+      );
+
+      const res = await request(agentApp(companyId, agentId, run.id))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ assigneeAgentId: null, assigneeUserId: BOARD_USER_ID });
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(res.body.error).toBe("Assignee user not found");
+      expect(res.body.details).toMatchObject({ runnerGoalStopped: "pause" });
+      expectRunStillRunning(await readRun(run.id));
+      const [sessionAfter] = await db
+        .select()
+        .from(agentTaskSessions)
+        .where(eq(agentTaskSessions.id, session.id));
+      expect((sessionAfter!.goalJson as Record<string, unknown>).status).toBe("paused");
+      const after = await readIssue(issue.id);
+      expect({ assigneeAgentId: after.assigneeAgentId, assigneeUserId: after.assigneeUserId })
+        .toEqual({ assigneeAgentId: agentId, assigneeUserId: null });
+    });
+
+    it("rejects a reassignment that blocks the task on itself before cancelling its run", async () => {
+      const { companyId, agentId, otherAgentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const run = await startRun(companyId, agentId, issue.id);
+
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ assigneeAgentId: otherAgentId, blockedByIssueIds: [issue.id] });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe("Issue cannot be blocked by itself");
+      expectRunStillRunning(await readRun(run.id));
+      expect((await readIssue(issue.id)).assigneeAgentId).toBe(agentId);
+    });
+
+    it("rejects completing a task with another company's label before stopping its goal or run", async () => {
+      const { companyId, agentId } = await seedCompany(RUNNER_AGENT);
+      const other = await seedCompany();
+      const [foreignLabel] = await db
+        .insert(labels)
+        .values({ companyId: other.companyId, name: "Foreign", color: "#000000" })
+        .returning();
+      const issue = await createTask(companyId, agentId);
+      const run = await startRun(companyId, agentId, issue.id);
+      const session = await startRunnerGoal({
+        companyId,
+        agentId,
+        issueId: issue.id,
+        runId: run.id,
+      });
+
+      const res = await request(boardApp(companyId))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "done", labelIds: [foreignLabel!.id] });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe("One or more labels are invalid for this company");
+      expectRunStillRunning(await readRun(run.id));
+      await expectGoalUntouched(session.id);
+      expect((await readIssue(issue.id)).status).toBe("in_progress");
+    });
+
+    it("refuses invalid blockers and labels, as the update does", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const other = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const blocked = await createTask(companyId, agentId, { title: "Blocked by the task" });
+      // The task already blocks the other one; the reverse closes a cycle.
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: issue.id,
+        relatedIssueId: blocked.id,
+        type: "blocks",
+      });
+      const foreignIssue = await createTask(other.companyId, other.agentId);
+      const svc = issueService(db);
+      const stored = await svc.getById(issue.id);
+
+      for (const [patch, message] of [
+        [{ blockedByIssueIds: [issue.id] }, "Issue cannot be blocked by itself"],
+        [{ blockedByIssueIds: [foreignIssue.id] }, "Blocked-by issues must belong to the same company"],
+        [{ blockedByIssueIds: [blocked.id] }, "Blocking relations cannot contain cycles"],
+        [{ labelIds: [randomUUID()] }, "One or more labels are invalid for this company"],
+      ] as const) {
+        const refusal = { status: 422, message };
+        await expect(svc.precheckUpdate(stored!, { ...patch })).rejects.toMatchObject(refusal);
+        await expect(svc.update(issue.id, { ...patch })).rejects.toMatchObject(refusal);
+      }
+      await expect(svc.precheckUpdate(stored!, { blockedByIssueIds: [], labelIds: [] }))
+        .resolves.toBeUndefined();
+    });
+
+    it("refuses unknown workspaces and a source change that leaves bound files behind, as the update does", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const [project] = await db
+        .insert(projects)
+        .values({ companyId, name: "Workspace project" })
+        .returning();
+      const [source, otherSource] = await db
+        .insert(projectWorkspaces)
+        .values([
+          { companyId, projectId: project!.id, name: "Source" },
+          { companyId, projectId: project!.id, name: "Other source" },
+        ])
+        .returning();
+      const [bound] = await db
+        .insert(executionWorkspaces)
+        .values({
+          companyId,
+          projectId: project!.id,
+          projectWorkspaceId: source!.id,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "Bound files",
+        })
+        .returning();
+      const issue = await createTask(companyId, agentId, { projectId: project!.id });
+      const svc = issueService(db);
+
+      const unknownWorkspace = { projectWorkspaceId: randomUUID() };
+      const unknownRefusal = { status: 404, message: "Project workspace not found" };
+      const stored = await svc.getById(issue.id);
+      await expect(svc.precheckUpdate(stored!, unknownWorkspace)).rejects.toMatchObject(unknownRefusal);
+      await expect(svc.update(issue.id, unknownWorkspace)).rejects.toMatchObject(unknownRefusal);
+
+      await db
+        .update(issues)
+        .set({ projectWorkspaceId: source!.id, executionWorkspaceId: bound!.id })
+        .where(eq(issues.id, issue.id));
+      const boundStored = await svc.getById(issue.id);
+      const sourceChange = { projectWorkspaceId: otherSource!.id };
+      const boundRefusal = {
+        status: 409,
+        message: "Task already has bound files; schedule a workspace selection or explicitly clear its binding when changing the source",
+      };
+      await expect(svc.precheckUpdate(boundStored!, sourceChange)).rejects.toMatchObject(boundRefusal);
+      await expect(svc.update(issue.id, sourceChange)).rejects.toMatchObject(boundRefusal);
+      expect((await readIssue(issue.id)).projectWorkspaceId).toBe(source!.id);
+    });
+
+    it("refuses making a task public under private access, as the update does", async () => {
+      const { companyId, agentId } = await seedCompany();
+      const svc = issueService(db);
+      const [privateProject] = await db
+        .insert(projects)
+        .values({ companyId, name: "Private project", visibility: "private" })
+        .returning();
+      const privateParent = await createTask(companyId, agentId, { title: "Private parent" });
+      await db
+        .update(issues)
+        .set({ visibility: "private", privacyRootIssueId: privateParent.id })
+        .where(eq(issues.id, privateParent.id));
+      const issue = await createTask(companyId, agentId);
+      const stored = await svc.getById(issue.id);
+
+      for (const [patch, message] of [
+        [
+          { visibility: "open", projectId: privateProject!.id },
+          "Move this task out of its private project before making it public",
+        ],
+        [
+          { visibility: "open", parentId: privateParent.id },
+          "A task cannot be made public while it inherits private access",
+        ],
+      ] as const) {
+        const refusal = { status: 422, message };
+        await expect(svc.precheckUpdate(stored!, { ...patch })).rejects.toMatchObject(refusal);
+        await expect(svc.update(issue.id, { ...patch })).rejects.toMatchObject(refusal);
+      }
+      const after = await readIssue(issue.id);
+      expect({ projectId: after.projectId, parentId: after.parentId }).toEqual({
+        projectId: null,
+        parentId: null,
+      });
+    });
+
+    it("refuses a guarded promotion that the policy transition would not keep status-only, as the update does", async () => {
+      const { companyId, agentId, otherAgentId } = await seedCompany();
+      const stageId = randomUUID();
+      const issue = await createTask(companyId, agentId, { status: "backlog" });
+      // A pending review whose recorded participant is not in the stage: the
+      // transition hands the task to the stage's reviewer and moves it to
+      // in_review, which a guarded promotion may not do.
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: false,
+            stages: [
+              {
+                id: stageId,
+                type: "review",
+                approvalsNeeded: 1,
+                participants: [{ type: "agent", agentId: otherAgentId }],
+              },
+            ],
+          },
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId },
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        })
+        .where(eq(issues.id, issue.id));
+      const svc = issueService(db);
+      const stored = await svc.getById(issue.id);
+      const promotion = {
+        status: "todo",
+        expectedStatusVersion: stored!.statusVersion,
+        actorAgentId: null,
+        actorRunId: null,
+        actorUserId: BOARD_USER_ID,
+      };
+      const refusal = {
+        status: 422,
+        message: "expectedStatusVersion requires a status-only backlog-to-todo promotion",
+      };
+      await expect(svc.precheckUpdate(stored!, promotion)).rejects.toMatchObject(refusal);
+      await expect(svc.update(issue.id, promotion)).rejects.toMatchObject(refusal);
+      expect((await readIssue(issue.id)).status).toBe("backlog");
     });
 
     it("still cancels the current run before an allowed reassignment", async () => {
