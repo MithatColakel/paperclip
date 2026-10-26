@@ -14562,12 +14562,22 @@ export function issueRoutes(
           runToStopForReassignment.contextSnapshot?.issueId === existing.id;
         if (runToStopForReassignment && !isHumanSelfHandoff) {
           await precheckIssueUpdateOnce();
+          // The run's own agent handing the task on ends its turn by choice;
+          // that stop is not an interruption of work with unknown outcomes.
+          const handoffByStoppedRun =
+            actor.actorType === "agent" &&
+            actor.agentId === runToStopForReassignment.agentId &&
+            actor.runId === runToStopForReassignment.id;
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
             {
               errorCode: "issue_reassigned",
-              resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
+              resultJson: {
+                reassignmentStopConfirmed: true,
+                issueMutationStopId,
+                ...(handoffByStoppedRun ? { handoffByStoppedRun: true } : {}),
+              },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
             },
