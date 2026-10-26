@@ -15,6 +15,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueRelations,
   issues,
   toolActionRequests,
@@ -30,6 +31,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueService } from "../services/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { legacyExecutionNeedsReconciliation } from "../services/legacy-execution-recovery.js";
 import {
   registerLiveRunnerGoalController,
   runnerGoalControlBrokerInternals,
@@ -738,9 +741,40 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(stopped.status).toBe("cancelled");
       expect(stopped.errorCode).toBe("issue_reassigned");
       expect(stopped.resultJson).toMatchObject({ reassignmentStopConfirmed: true });
+      // The board interrupted work of unknown outcome, so the hold stays.
+      expect(stopped.resultJson).not.toHaveProperty("handoffByStoppedRun");
+      expect(legacyExecutionNeedsReconciliation(stopped)).toBe(true);
       const after = await readIssue(issue.id);
       expect(after.assigneeUserId).toBe(BOARD_USER_ID);
       expect(after.executionRunId).toBeNull();
+    });
+
+    it("leaves no execution hold when an agent hands its task on from its own run", async () => {
+      const { companyId, agentId, otherAgentId } = await seedCompany();
+      const issue = await createTask(companyId, agentId);
+      const run = await startRun(companyId, agentId, issue.id);
+
+      const res = await request(agentApp(companyId, agentId, run.id))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ assigneeAgentId: otherAgentId, status: "todo" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.assigneeAgentId).toBe(otherAgentId);
+
+      const stopped = await readRun(run.id);
+      expect(stopped.status).toBe("cancelled");
+      expect(stopped.errorCode).toBe("issue_reassigned");
+      expect(stopped.resultJson).toMatchObject({
+        reassignmentStopConfirmed: true,
+        handoffByStoppedRun: true,
+      });
+      expect(legacyExecutionNeedsReconciliation(stopped)).toBe(false);
+      expect(
+        await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, issue.id)),
+      ).toEqual([]);
+      expect(await getExecutionBlocker(db, companyId, issue.id)).toBeNull();
     });
 
     it("still stops the runner goal and cancels the run before an allowed completion", async () => {

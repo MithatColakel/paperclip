@@ -33,6 +33,11 @@ export function legacyExecutionNeedsReconciliation(
   if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
   const evidence = run.resultJson?.executionRecovery as
     Record<string, unknown> | undefined;
+  // The agent handed its task on from inside this run, so its turn ended by its
+  // own choice. Holding it would only stop the next owner from starting.
+  if (run.status === "cancelled" && run.errorCode === "issue_reassigned"
+      && run.resultJson?.reassignmentStopConfirmed === true
+      && run.resultJson?.handoffByStoppedRun === true) return false;
   if (run.status === "cancelled" && evidence?.kind === "interrupted"
       && evidence.providerStopped === true && evidence.sessionPreserved === true
       && evidence.actionOutcomes === "settled"

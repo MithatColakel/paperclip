@@ -50,6 +50,19 @@ it.each([
   } })).toBe(true);
 });
 
+it("does not hold a run whose own agent stopped it by handing the task on", () => {
+  const handedOn = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned",
+    resultJson: { reassignmentStopConfirmed: true, handoffByStoppedRun: true },
+  };
+  expect(legacyExecutionNeedsReconciliation(handedOn)).toBe(false);
+  // A reassignment by anyone else still interrupts work of unknown outcome.
+  expect(legacyExecutionNeedsReconciliation({ ...handedOn, resultJson: { reassignmentStopConfirmed: true } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOn, resultJson: { handoffByStoppedRun: true } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOn, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOn, status: "failed" })).toBe(true);
+});
+
 it("retains the hold until the provider actually acknowledges cancellation", () => {
   expect(legacyExecutionNeedsReconciliation({ ...stopped, resultJson: {
     ...stopped.resultJson, executionCancellation: { state: "requested" },
