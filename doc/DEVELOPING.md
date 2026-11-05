@@ -2126,6 +2126,44 @@ closed. Keep transport files outside the pack so they cannot include themselves.
 Matching staged/preinstalled packs remain preferred and never transfer archives.
 Daytona detects gzip/zstd headers and skips redundant transport compression.
 
+### SSH run guard
+
+An agent command over SSH has no PTY, so sshd does not stop it when the
+connection drops. Without a guard the agent keeps running with no owner: it holds
+memory, and it can keep changing things while its run is already failed and a
+retry is starting. `SSH_RUN_GUARD_STEP` in `packages/adapter-utils/src/ssh.ts`
+starts a small watcher beside each command from `buildSshSpawnTarget`.
+
+- **When it acts:** the sshd session behind the command is gone on three checks in
+  a row, 5 s apart, and the command is still running. It sends `SIGTERM`, waits up
+  to 10 s, then sends `SIGKILL`, and logs one line to the `paperclip-run-guard`
+  syslog tag. So a dropped connection, a Stop and a server restart all end the
+  remote process.
+- **When it does not:** after a normal exit it ends without stopping anything, so
+  what a finished run left behind stays as before. It also never starts without
+  sshd in the command's ancestry or without a usable `ps`.
+- **What it matches:** the descendants of the command's root process and its own
+  process group, which sshd creates per command. Another run under the same user
+  has another group.
+- **Limit:** it relies on sshd noticing the loss. With `ClientAliveInterval` unset
+  and a network that drops packets silently, sshd can wait for TCP to time out.
+
+The callback bridge server (`paperclip-bridge-server.mjs`) is started with `nohup`
+in its own SSH command, so the guard does not cover it. The host relay loop
+refreshes `host-heartbeat` in the queue directory every minute, and the file
+gateway exits when that file is 30 minutes old. That covers a stop that timed out
+and a host that went away.
+
+To test against a real sshd (the fixture is off by default on macOS):
+
+```sh
+cd packages/adapter-utils
+PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB=1 npx vitest run src/ssh-run-guard.test.ts
+```
+
+On a real host, kill the local `ssh` of a test run. The remote process stops within
+about 30 s, and `journalctl -t paperclip-run-guard` shows the line.
+
 ### Remote GitHub launcher staging
 
 Managed GitHub launchers stage their nine text files in one bounded control
