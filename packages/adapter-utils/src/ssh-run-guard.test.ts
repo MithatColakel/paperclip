@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -77,6 +77,18 @@ describe("SSH run guard", () => {
     pids.clear();
   });
 
+  async function pidIn(dir: string, name: string) {
+    const file = path.join(dir, name);
+    await waitFor(
+      async () => (await readFile(file, "utf8").catch(() => "")).endsWith("\n"),
+      10_000,
+      `${name} to be written`,
+    );
+    const pid = Number((await readFile(file, "utf8")).trim());
+    pids.add(pid);
+    return pid;
+  }
+
   // Runs `script` the way an agent command runs over SSH, in a fresh directory.
   async function startRun(script: string) {
     const dir = await mkdtemp(path.join(rootDir, "run-"));
@@ -94,17 +106,7 @@ describe("SSH run guard", () => {
     });
     const closed = new Promise<number | null>((resolve) => child.on("close", (code) => resolve(code)));
     void closed.then(() => target.cleanup());
-    const pidFrom = async (name: string) => {
-      const file = path.join(dir, name);
-      await waitFor(
-        async () => (await readFile(file, "utf8").catch(() => "")).endsWith("\n"),
-        10_000,
-        `${name} to be written`,
-      );
-      const pid = Number((await readFile(file, "utf8")).trim());
-      pids.add(pid);
-      return pid;
-    };
+    const pidFrom = (name: string) => pidIn(dir, name);
     const drop = () => {
       child.kill("SIGKILL");
     };
@@ -170,6 +172,39 @@ describe("SSH run guard", () => {
 
     await waitFor(() => !droppedPids.some(isAlive), STOP_DEADLINE_MS, "the dropped run to stop");
     expect(otherPids.every(isAlive)).toBe(true);
+  }, TEST_TIMEOUT_MS);
+
+  it("works when the host hides the sshd session from the user it runs as", async (ctx) => {
+    if (!config) return ctx.skip();
+    // A /proc mounted with hidepid hides sshd's session process, which is not dumpable,
+    // from its own user. A `ps` shim gives the same view here: the outer shell plays the
+    // session, and killing it plays the drop.
+    const dir = await mkdtemp(path.join(rootDir, "hidden-"));
+    const { stdout: realPs } = await execFileAsync("sh", ["-c", "command -v ps"]);
+    await writeFile(
+      path.join(dir, "ps"),
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = "$HIDDEN_PID" ] && exit 1; done\nexec ${realPs.trim()} "$@"\n`,
+      { mode: 0o755 },
+    );
+    const session = spawn("/bin/sh", ["-c", 'export HIDDEN_PID=$$ PATH="$PWD:$PATH"; /bin/sh -c "$PC_RUN"; :'], {
+      cwd: dir,
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        PC_RUN: [SSH_RUN_GUARD_STEP, "echo $$ > root.pid", "sleep 300 &", "echo $! > child.pid", "wait"].join("\n"),
+      },
+    });
+    children.add(session);
+    const running = await Promise.all(["root.pid", "child.pid"].map((name) => pidIn(dir, name)));
+
+    // Three checks 5 s apart: by now a hidden session counted as gone would have stopped it.
+    await new Promise((resolve) => setTimeout(resolve, 17_000));
+    expect(running.every(isAlive)).toBe(true);
+
+    session.kill("SIGKILL");
+
+    await waitFor(() => !running.some(isAlive), STOP_DEADLINE_MS, "the run's processes to stop");
   }, TEST_TIMEOUT_MS);
 
   it("keeps a normal run's input, output and exit code, and does not hold the channel", async (ctx) => {
