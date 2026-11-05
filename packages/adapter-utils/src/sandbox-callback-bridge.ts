@@ -84,6 +84,14 @@ const BACKSTOP_WRITE_RETRY_MS = 50;
 // exponential ramp below it keeps a hard-down channel from burning an exec
 // call every poll interval.
 const MAX_TRANSIENT_ITERATION_BACKOFF_MS = 5_000;
+// The relay loop refreshes a heartbeat file on this interval. The gateway is
+// started with `nohup` and otherwise lives until the host stops it, so a host that
+// cannot (a dropped connection, a stop that timed out, a server restart) would
+// leave it running for good. It stops itself once the file is this old. Long
+// enough that only a host that is really gone trips it: a live run's connection
+// fails well before this.
+const BRIDGE_HOST_HEARTBEAT_INTERVAL_MS = 60_000;
+const DEFAULT_BRIDGE_HOST_STALE_MS = 30 * 60_000;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 export const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
@@ -272,6 +280,7 @@ export interface SandboxCallbackBridgeDirectories {
   readyFile: string;
   pidFile: string;
   logFile: string;
+  hostHeartbeatFile: string;
 }
 
 export interface SandboxCallbackBridgeQueueClient {
@@ -484,6 +493,7 @@ export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallba
     readyFile: path.posix.join(rootDir, "ready.json"),
     pidFile: path.posix.join(rootDir, "server.pid"),
     logFile: path.posix.join(rootDir, "logs", "bridge.log"),
+    hostHeartbeatFile: path.posix.join(rootDir, "host-heartbeat"),
   };
 }
 
@@ -496,6 +506,7 @@ export function buildSandboxCallbackBridgeEnv(input: {
   responseTimeoutMs?: number | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  hostStaleMs?: number | null;
 }): Record<string, string> {
   return {
     PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_FILE_MODE,
@@ -514,6 +525,9 @@ export function buildSandboxCallbackBridgeEnv(input: {
     ),
     PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(
       normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES),
+    ),
+    PAPERCLIP_BRIDGE_HOST_STALE_MS: String(
+      normalizeTimeoutMs(input.hostStaleMs, DEFAULT_BRIDGE_HOST_STALE_MS),
     ),
   };
 }
@@ -875,6 +889,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // otherwise). When it is absent, the request work runs with an empty store,
   // exactly like the earlier `runWithoutActiveStep` behavior.
   getRuntimeParentContext?: () => StartupSpanContext | undefined;
+  // How often the relay loop refreshes the host heartbeat file. Defaults to
+  // BRIDGE_HOST_HEARTBEAT_INTERVAL_MS.
+  hostHeartbeatIntervalMs?: number | null;
   // Wrap each Paperclip-API callback request in a
   // `sandbox.callbackBridge.relayRequest` span, so the request's read, write, and
   // remove execs group under one named span. When it is absent, the request work
@@ -885,6 +902,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
+  const hostHeartbeatIntervalMs = normalizeTimeoutMs(
+    input.hostHeartbeatIntervalMs,
+    BRIDGE_HOST_HEARTBEAT_INTERVAL_MS,
+  );
   const abortedHandlerGraceMs = normalizeTimeoutMs(
     input.abortedHandlerGraceMs,
     DEFAULT_BRIDGE_ABORTED_HANDLER_GRACE_MS,
@@ -1484,6 +1505,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // it to the current time. The idle branch and every processed request update
   // it, so steady progress keeps the watchdog re-armed.
   let lastSuccessfulIterationAt = Date.now();
+  let lastHostHeartbeatAt = Date.now();
   let watchdogTrippedAt: number | null = null;
   let watchdogTripInFlight = false;
   // Check often enough to fire soon after the threshold, but not so often that
@@ -1551,6 +1573,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
             "Sandbox callback bridge list requests",
           );
           consecutivePollFailures = 0;
+          // Awaited, so a late write cannot land after stop and recreate the queue
+          // directory. A failed write is only a missed beat.
+          if (!stopping && Date.now() - lastHostHeartbeatAt >= hostHeartbeatIntervalMs) {
+            lastHostHeartbeatAt = Date.now();
+            await withTimeout(
+              input.client.writeTextFile(directories.hostHeartbeatFile, new Date().toISOString()),
+              iterationTimeoutMs,
+              "Sandbox callback bridge host heartbeat",
+            ).catch(() => undefined);
+          }
         } catch (error) {
           if (stopping) {
             break;
@@ -1830,6 +1862,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   shellCommand?: "bash" | "sh" | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  hostStaleMs?: number | null;
 }): Promise<StartedSandboxCallbackBridgeServer> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -1855,6 +1888,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     responseTimeoutMs: input.responseTimeoutMs,
     maxQueueDepth: input.maxQueueDepth,
     maxBodyBytes: input.maxBodyBytes,
+    hostStaleMs: input.hostStaleMs,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
   const startResult = await runSandboxBridgeControlCommand(input.runner, {
@@ -2596,6 +2630,21 @@ async function runFileGateway() {
 
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+
+  // Nobody is left to stop this process or answer its queue once the host's
+  // heartbeat goes stale, so exit without waiting for open client connections.
+  const hostStaleMs = Number(process.env.PAPERCLIP_BRIDGE_HOST_STALE_MS || "0");
+  if (hostStaleMs > 0) {
+    const hostHeartbeatFile = path.posix.join(queueDir, "host-heartbeat");
+    const startedAtMs = Date.now();
+    setInterval(async () => {
+      const stat = await fs.stat(hostHeartbeatFile).catch(() => null);
+      const lastSeenMs = Math.max(startedAtMs, stat ? stat.mtimeMs : 0);
+      if (Date.now() - lastSeenMs < hostStaleMs) return;
+      process.stderr.write("[paperclip-bridge] host heartbeat went stale; stopping.\\n");
+      process.exit(0);
+    }, Math.min(hostStaleMs, 30000)).unref();
+  }
 
   await fs.mkdir(requestsDir, { recursive: true });
   await fs.mkdir(responsesDir, { recursive: true });
