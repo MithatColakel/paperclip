@@ -1503,16 +1503,23 @@ const SSH_LOGIN_PROFILE_STEPS = [
 // A run ends with its connection, so this takes nothing a reconnect could use, and
 // a normal exit stops the guard without touching anything the run left behind.
 // Three misses in a row keep one failed `ps` under load from stopping a healthy
-// run. The guard fails open: with no sshd in its ancestry (or no usable `ps`) it
-// never starts, and a failed check ends it without stopping anything.
+// run. The guard fails open: with neither sshd nor a hidden process in its ancestry
+// (or no usable `ps`) it never starts, and a failed check ends it without stopping
+// anything.
+//
+// It watches the parent of the topmost process it can see, not the session itself.
+// A host that mounts /proc with hidepid hides sshd's session process from the user
+// it runs as, because that process is not dumpable. So the first ancestor `ps`
+// cannot see counts as the session, and the session is gone once that topmost
+// process has another parent.
 //
 // It only matches this command: the descendants of its root process plus its own
 // process group, which sshd creates per command. Another run under the same user
-// has another group. The group is left out if it is also sshd's own group. It uses
-// `grep` rather than `case` because bash 3.2, which is /bin/sh on macOS, misparses
-// a `case` pattern inside `$(...)`.
+// has another group. The group is left out unless the topmost process leads it, so
+// it can never be sshd's own group. It uses `grep` rather than `case` because bash
+// 3.2, which is /bin/sh on macOS, misparses a `case` pattern inside `$(...)`.
 const SSH_RUN_GUARD_SCRIPT = [
-  "root=$1; session=$2; group=$3; self=$$",
+  "root=$1; session=$2; top=$3; group=$4; self=$$",
   "run_pids() { ps -A -o pid=,ppid=,pgid= 2>/dev/null | awk -v root=\"$root\" -v group=\"$group\" -v self=\"$self\" '"
     + "{ pid[NR] = $1; parent[NR] = $2; if (group > 1 && $3 == group) mark[$1] = 1 } "
     + "END { mark[root] = 1; "
@@ -1522,7 +1529,7 @@ const SSH_RUN_GUARD_SCRIPT = [
   "while [ \"$misses\" -lt 3 ]; do",
   "  sleep 5",
   "  ps -o pid= -p \"$root\" >/dev/null 2>&1 || exit 0",
-  "  if ps -o comm= -p \"$session\" 2>/dev/null | grep -q sshd; then misses=0; else misses=$((misses + 1)); fi",
+  "  if [ \"$(ps -o ppid= -p \"$top\" 2>/dev/null | tr -d \" \")\" = \"$session\" ]; then misses=0; else misses=$((misses + 1)); fi",
   "done",
   "if command -v logger >/dev/null 2>&1; then logger -t paperclip-run-guard \"SSH connection lost; stopping process tree of $root\"; fi",
   "pids=$(run_pids)",
@@ -1544,13 +1551,15 @@ const SSH_RUN_GUARD_SCRIPT = [
 // ends in `exec`. The watcher's stdio is /dev/null, so it never holds the ssh channel
 // open, and the extra fork takes it out of the agent's process tree.
 export const SSH_RUN_GUARD_STEP = [
-  "pc_session=$(p=$PPID; i=0; while [ \"$i\" -lt 8 ] && [ \"${p:-0}\" -gt 1 ]; do"
-    + " if ps -o comm= -p \"$p\" 2>/dev/null | grep -q sshd; then echo \"$p\"; break; fi;"
-    + " p=$(ps -o ppid= -p \"$p\" 2>/dev/null | tr -d \" \"); i=$((i + 1)); done)",
-  "if [ -n \"$pc_session\" ]; then"
+  "pc_top=$$; pc_session=$PPID; pc_i=0",
+  "while [ \"$pc_i\" -lt 8 ] && [ \"${pc_session:-0}\" -gt 1 ]; do"
+    + " pc_comm=$(ps -o comm= -p \"$pc_session\" 2>/dev/null);"
+    + " if [ -z \"$pc_comm\" ] || echo \"$pc_comm\" | grep -q sshd; then break; fi;"
+    + " pc_top=$pc_session; pc_session=$(ps -o ppid= -p \"$pc_session\" 2>/dev/null | tr -d \" \"); pc_i=$((pc_i + 1)); done",
+  "if [ \"$pc_i\" -lt 8 ] && [ \"${pc_session:-0}\" -gt 1 ]; then"
     + " pc_group=$(ps -o pgid= -p \"$$\" 2>/dev/null | tr -d \" \");"
-    + " if [ \"$pc_group\" = \"$(ps -o pgid= -p \"$pc_session\" 2>/dev/null | tr -d \" \")\" ]; then pc_group=0; fi;"
-    + ` ( sh -c ${shellQuote(SSH_RUN_GUARD_SCRIPT)} paperclip-run-guard "$$" "$pc_session" "\${pc_group:-0}" </dev/null >/dev/null 2>&1 & );`
+    + " if [ \"$pc_group\" != \"$pc_top\" ]; then pc_group=0; fi;"
+    + ` ( sh -c ${shellQuote(SSH_RUN_GUARD_SCRIPT)} paperclip-run-guard "$$" "$pc_session" "$pc_top" "\${pc_group:-0}" </dev/null >/dev/null 2>&1 & );`
     + " fi",
   "true",
 ].join("; ");

@@ -2141,7 +2141,12 @@ starts a small watcher beside each command from `buildSshSpawnTarget`.
   remote process.
 - **When it does not:** after a normal exit it ends without stopping anything, so
   what a finished run left behind stays as before. It also never starts without
-  sshd in the command's ancestry or without a usable `ps`.
+  sshd or a hidden process in the command's ancestry, or without a usable `ps`.
+- **Hosts with `hidepid`:** a `/proc` mounted with `hidepid` hides sshd's session
+  process from the user it runs as. So the guard does not look at sshd itself. It
+  watches the parent of the topmost process it can see, and the session is gone
+  once that parent changes. To see a guard on a live run, look from root:
+  `ps -eo user,etime,args | awk '$1!="root" && /paperclip-run-guard [0-9 ]+$/'`.
 - **What it matches:** the descendants of the command's root process and its own
   process group, which sshd creates per command. Another run under the same user
   has another group.
