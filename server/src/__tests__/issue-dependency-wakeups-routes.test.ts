@@ -754,4 +754,32 @@ describe("issue dependency wakeups in issue routes", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
   });
+
+  it("logs a failed wake block instead of leaving an unhandled rejection", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const failure = new Error("database unavailable");
+      mockIssueService.getById.mockResolvedValue(issueRecord({ status: "in_progress" }));
+      mockIssueService.update.mockResolvedValue(issueRecord({ status: "done" }));
+      mockIssueService.listWakeableBlockedDependents.mockRejectedValue(failure);
+
+      const app = await createApp();
+      const { logger } = await import("../middleware/logger.js");
+      const logged = vi.spyOn(logger, "error");
+      const res = await request(app).patch("/api/issues/issue-1").send({ status: "done" });
+
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => {
+        expect(logged).toHaveBeenCalledWith(
+          { err: failure, issueId: "issue-1" },
+          "failed to process wakeups after issue update",
+        );
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
 });
