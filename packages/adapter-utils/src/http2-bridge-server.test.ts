@@ -2271,4 +2271,95 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(duplex.destroyed).toBe(false);
   });
+
+  it("keeps the process up when a response lands while an exited channel is closing", async () => {
+    // Node's JSStreamSocket fails an internal assertion, which exits the
+    // process, if HTTP/2 writes while a shutdown request is pending.
+    const uncaught = vi.fn();
+    process.on("uncaughtException", uncaught);
+    const [serverSide, clientSide] = duplexPair();
+    const client = connectRawClient(clientSide);
+    client.on("error", () => undefined);
+    try {
+      let releaseForward = (): void => undefined;
+      const forwardReleased = new Promise<void>((resolve) => {
+        releaseForward = resolve;
+      });
+      let markForwardStarted = (): void => undefined;
+      const forwardStarted = new Promise<void>((resolve) => {
+        markForwardStarted = resolve;
+      });
+      let markCloseStarted = (): void => undefined;
+      const closeStarted = new Promise<void>((resolve) => {
+        markCloseStarted = resolve;
+      });
+      let exitChannel = (): void => undefined;
+      const handle = createHttp2BridgeServer({
+        bridgeToken: BRIDGE_TOKEN,
+        routes: [{ method: "POST", path: /^\/api\/x$/ }],
+        forwardRequest: async () => {
+          markForwardStarted();
+          await forwardReleased;
+          return { status: 200, body: Buffer.from("{}") };
+        },
+      });
+      handle.bindChannel({
+        ...fakeChannelFromDuplex(serverSide),
+        onExit: (listener) => {
+          exitChannel = () => listener({ exitCode: null, transportClosed: true });
+        },
+        close: () => {
+          markCloseStarted();
+          return new Promise<void>(() => undefined);
+        },
+      });
+
+      const request = client.request({
+        ":method": "POST",
+        ":path": "/api/x",
+        authorization: `Bearer ${BRIDGE_TOKEN}`,
+      });
+      request.on("error", () => undefined);
+      request.end("{}");
+      await forwardStarted;
+
+      exitChannel();
+      await closeStarted;
+      releaseForward();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(uncaught).not.toHaveBeenCalled();
+    } finally {
+      process.off("uncaughtException", uncaught);
+      client.destroy();
+      serverSide.destroy();
+      clientSide.destroy();
+    }
+  });
+
+  it("wrapDuplexChannelAsNodeDuplex ends without waiting for the channel close and reports its failure", async () => {
+    let rejectClose = (_error: Error): void => undefined;
+    const channel: CommandManagedDuplexChannel = {
+      write: () => undefined,
+      onData: () => undefined,
+      onExit: () => undefined,
+      stop: () => undefined,
+      close: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectClose = reject;
+        }),
+    };
+    const duplex = wrapDuplexChannelAsNodeDuplex(channel);
+
+    await new Promise<void>((resolve) => {
+      duplex.end(resolve);
+    });
+
+    const failure = new Error("close refused");
+    const reported = new Promise((resolve) => {
+      duplex.once("error", resolve);
+    });
+    rejectClose(failure);
+    expect(await reported).toBe(failure);
+  });
 });

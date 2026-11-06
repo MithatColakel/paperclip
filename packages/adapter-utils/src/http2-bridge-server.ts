@@ -451,9 +451,14 @@ export function wrapDuplexChannelAsNodeDuplex(
       }
     },
     final(callback) {
-      channel
-        .close()
-        .then(() => callback(), (error) => callback(error instanceof Error ? error : new Error(String(error))));
+      // Finish now and let the close run on its own. Until this callback runs,
+      // Node's JSStreamSocket holds a shutdown request, and an HTTP/2 write in
+      // that window (a late response, a watchdog ping) fails an internal
+      // assertion that exits the process. A close can take seconds.
+      channel.close().catch((error) => {
+        duplex.destroy(error instanceof Error ? error : new Error(String(error)));
+      });
+      callback();
     },
   });
   channel.onData((chunk) => {
