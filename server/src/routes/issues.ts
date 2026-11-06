@@ -15090,7 +15090,12 @@ export function issueRoutes(
               ),
             );
         }
-      })();
+      })().catch((err) =>
+        logger.error(
+          { err, issueId: issue.id },
+          "failed to process wakeups after issue update",
+        ),
+      );
 
       if (comment) checkResourceWaitAfterComment(issue, scheduledRetryForHumanComment);
       await queueTaskWatchdogEvaluation(issue, actor.runId);
@@ -18459,7 +18464,12 @@ export function issueRoutes(
               ),
             );
         }
-      })();
+      })().catch((err) =>
+        logger.error(
+          { err, issueId: currentIssue.id },
+          "failed to process wakeups after issue comment",
+        ),
+      );
 
       checkResourceWaitAfterComment(currentIssue, scheduledRetryForHumanComment);
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
