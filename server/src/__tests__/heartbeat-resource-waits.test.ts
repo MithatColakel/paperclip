@@ -484,6 +484,9 @@ describeEmbeddedPostgres("heartbeat resource waits (integration)", () => {
       await expect.poll(async () => (await db.select({ status: agents.status }).from(agents).where(eq(agents.id, builder.id)))[0]?.status,
         { timeout: 5_000, interval: 50 }).toBe("idle");
 
+      // The deferral points the episode at its successor just after inserting it.
+      await expect.poll(async () => (await episodesOf(companyId))[0]?.currentRunId,
+        { timeout: 5_000, interval: 50 }).toBe(successor.id);
       const [episode] = await episodesOf(companyId);
       expect(episode).toMatchObject({ kind: "environment", reason: "offline", scope: "target", currentRunId: successor.id, resolvedAt: null });
       const [registry] = await db.select().from(environmentAvailability).where(eq(environmentAvailability.environmentId, environment.id));
