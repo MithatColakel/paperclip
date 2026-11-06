@@ -1,8 +1,9 @@
+import { releaseProviderRecoveryTransfers, stageProviderFreshWorkspace } from "./provider-fresh-workspace.js";
 import { readWorkspaceProviderBinding } from "@paperclipai/shared";
 import { settlePluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { environmentLeases, executionWorkspaces, environments, heartbeatRuns, issues, projects, type Db } from "@paperclipai/db";
-import { environmentTaskOperationSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskOperation } from "@paperclipai/plugin-sdk";
+import { freshWorkspaceSchema, environmentTaskOperationSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskOperation } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -105,6 +106,14 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
       throw new Error("Managed workspace execution binding changed");
     }
   }
+  let freshWorkspace = metadata.freshWorkspace === undefined ? undefined : freshWorkspaceSchema.parse(metadata.freshWorkspace);
+  if (freshWorkspace && driver.freshWorkspaceVersion !== 1 && (launches || operation.kind === "describe" || operation.kind === "check_project_auth"))
+    throw new Error("Plugin-provided fresh workspace preparation unavailable");
+  if (freshWorkspace && operation.kind === "prepare") {
+    if (!lease.issueId) throw new Error("Fresh workspace task ownership is missing");
+    freshWorkspace = await stageProviderFreshWorkspace({ db, companyId: input.companyId,
+      issueId: lease.issueId, ...freshWorkspace, existing: freshWorkspace });
+  }
   const projectIds = scopesProjects ? operation.projectIds : [];
   if (activeProbe && projectIds.length > 0) throw new Error("Plugin Runner probe cannot use project mounts");
   if (projectIds.length > 0) {
@@ -164,9 +173,12 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
       issueId: lease.issueId, config: driverConfig,
       taskId, runId: run?.id ?? (activeProbe ? String(probe.runId) : null), agentId: run?.agentId ?? null, projectIds,
       lease: { providerLeaseId: lease.providerLeaseId, metadata: lease.metadata ?? undefined },
-      ...(workspaceBinding ? { workspace: workspaceBinding } : {}), operation,
+      ...(workspaceBinding ? { workspace: workspaceBinding } : {}),
+      ...(freshWorkspace && (launches || operation.kind === "check_project_auth") ? { fresh: freshWorkspace } : {}), operation,
     }, operation.kind === "copilot_metadata" ? Math.max(1, Math.min(40_000, Number(probe?.expiresAtMs) - Date.now())) : 15_000);
     const parsed = parseEnvironmentTaskResult(operation, taskId, result);
+    if (freshWorkspace && parsed.kind === "description" && parsed.freshWorkspaceVersion !== 1)
+      throw new Error("Plugin-provided fresh workspace preparation unavailable");
     if (operation.kind === "check_project_auth" && parsed.kind === "project_auth") {
       if (parsed.configurationId !== operation.configurationId || parsed.provider !== operation.provider) throw new Error("Plugin Runner project validation identity mismatch");
       if (parsed.allowed) {
@@ -183,6 +195,8 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
       }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId)));
     }
     if (operation.kind === "complete") {
+      if (freshWorkspace && metadata.runnerTaskExecutionStopped === true)
+        await releaseProviderRecoveryTransfers(input.companyId, freshWorkspace);
       await db.update(environmentLeases).set({
         metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"runnerTaskDispatched":false}'::jsonb`,
       }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId),

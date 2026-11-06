@@ -108,6 +108,7 @@ export const environmentTaskResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("description"), taskId: providerId,
     runner: z.object({ version: z.string().min(1), digest: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict(),
     launchPreparationVersion: z.literal(1).optional(),
+    freshWorkspaceVersion: z.literal(1).optional(),
     projectAuthCheckVersion: z.literal(1).optional(),
   }).strict(),
   z.object({
@@ -150,6 +151,7 @@ export interface PluginEnvironmentTaskParams extends Omit<PluginEnvironmentDrive
   /** Company-validated projects to prepare on submit; empty during cleanup. */
   projectIds: string[];
   workspace?: import("@paperclipai/shared").WorkspaceProviderBinding;
+  fresh?: import("./workspace-provider.js").PluginFreshWorkspace;
   operation: PluginEnvironmentTaskOperation;
 }
 

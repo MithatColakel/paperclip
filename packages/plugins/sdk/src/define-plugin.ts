@@ -186,6 +186,8 @@ export interface PluginApiRequestInput {
 }
 
 export interface PluginApiResponse {
+  /** Server-only upstream for a declared WebSocket route. Never returned as JSON. */
+  websocket?: { url: string; headers?: Record<string, string> };
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;

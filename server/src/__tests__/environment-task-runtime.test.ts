@@ -4,7 +4,11 @@ import { executionWorkspaces, type Db } from "@paperclipai/db";
 import { environmentTaskOperationSchema, parseEnvironmentTaskResult } from "@paperclipai/plugin-sdk";
 import { executeEnvironmentTask } from "../services/environment-task-runtime.js";
 
-const state = vi.hoisted(() => ({ plugin: {} as any }));
+const state = vi.hoisted(() => ({ plugin: {} as any, release: vi.fn() }));
+vi.mock("../services/provider-fresh-workspace.js", () => ({
+  stageProviderFreshWorkspace: async (input: { existing: unknown }) => input.existing,
+  releaseProviderRecoveryTransfers: state.release,
+}));
 vi.mock("../services/plugin-registry.js", () => ({ pluginRegistryService: () => ({ getById: vi.fn(async () => state.plugin) }) }));
 const leaseId = "10000000-0000-4000-8000-000000000001";
 const projectId = "10000000-0000-4000-8000-000000000002";
@@ -30,9 +34,36 @@ function worker(result: unknown = { kind: "accepted", taskId: "attempt-1" }) {
 const submit = { kind: "submit" as const, preparedLaunchId: "configuration", projectIds: [projectId], runner: { protocolMin: 1, protocolMax: 2, harness: "codex", runnerId: "runner", leaseId, runId: "run", sessionId: "session", turnId: "turn", itemId: "item" }, bootstrapTicket: "transient-test-ticket" };
 
 beforeEach(() => {
+  state.release.mockReset();
   state.plugin = { id: "original", pluginKey: "test.provider", status: "ready", manifestJson: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "tasks", supportsTasks: true }] } };
 });
 describe("plugin-provided Runner execution", () => {
+  it("forwards a retained fresh directory intent on later launch calls and checks provider support", async () => {
+    const value = row();
+    value.lease.metadata.runnerTaskProjectAuthValidation.projectIds = [];
+    const fresh = { attemptId: leaseId, sourceRunId: secondProjectId, previousWorkspaceId: null, recoverySnapshots: [] };
+    Object.assign(value.lease.metadata, { freshWorkspace: fresh });
+    Object.assign(state.plugin.manifestJson.environmentDrivers[0], { freshWorkspaceVersion: 1 });
+    const workers = worker();
+    await executeEnvironmentTask(database(value, []).db, workers as never, { companyId: "company", leaseId, operation: { ...submit, projectIds: [] } });
+    expect(workers.call).toHaveBeenCalledWith("original", "environmentTask", expect.objectContaining({ fresh }), 15_000);
+    delete state.plugin.manifestJson.environmentDrivers[0].freshWorkspaceVersion;
+    const denied = worker();
+    await expect(executeEnvironmentTask(database(value, []).db, denied as never, { companyId: "company", leaseId,
+      operation: { ...submit, projectIds: [] } })).rejects.toThrow("fresh workspace preparation unavailable");
+    expect(denied.call).not.toHaveBeenCalled();
+  });
+  it("releases fresh transfer copies only after confirmed task completion", async () => {
+    const value = row();
+    const fresh = { attemptId: leaseId, sourceRunId: secondProjectId, previousWorkspaceId: null, recoverySnapshots: [] };
+    Object.assign(value.lease.metadata, { freshWorkspace: fresh });
+    const workers = worker();
+    await executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: { kind: "complete" } });
+    expect(state.release).not.toHaveBeenCalled();
+    Object.assign(value.lease.metadata, { runnerTaskExecutionStopped: true });
+    await executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: { kind: "complete" } });
+    expect(state.release).toHaveBeenCalledWith("company", fresh);
+  });
   it("passes only the workspace binding pinned to this lease and provider", async () => {
     const value = row(); value.lease.metadata.runnerTaskProjectAuthValidation.projectIds = [];
     const binding = { pluginId: leaseId, projectId, executionWorkspaceId: secondProjectId, projectWorkspaceId: projectId,

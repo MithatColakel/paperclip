@@ -3,11 +3,11 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 // Fork: production applied the Claude account pool migrations as 0306–0310.
-// The 2026-10 upstream sync renumbered them behind upstream's files (now
-// 0371–0375). The ledger (drizzle.__drizzle_migrations) keeps only each file's
+// Upstream syncs renumber them behind upstream's files (now
+// 0375–0379). The ledger (drizzle.__drizzle_migrations) keeps only each file's
 // SHA-256, so moving a file is safe and changing one byte is not: the runner
 // would take the file as new and run it again. None of them is idempotent.
-// 0372–0374 would stop the boot (42701/42P07), and 0375 would re-run its
+// 0376–0378 would stop the boot (42701/42P07), and 0379 would re-run its
 // backfills: every account's origin becomes legacy_host_pool, and accounts an
 // admin disabled become owner-disabled. Never edit these files. If one must
 // change, map its deployed hash to it in mapHashesToMigrationFiles (client.ts),

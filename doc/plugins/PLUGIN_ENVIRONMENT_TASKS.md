@@ -3,8 +3,8 @@
 An environment driver can provide a Runner task through a worker hook.
 The task API has no shell command or file transfer operation.
 
-This API is a server and worker contract. The agent environment test can verify
-a task-capable provider. Native heartbeat dispatch is a separate integration.
+This API is a server and worker contract. The [native execution integration](PLUGIN_RUNNER_EXECUTION.md)
+connects a task-capable environment to a Runner run.
 
 ## Declare the hook
 
@@ -186,3 +186,34 @@ For a native hello probe, select a saved AI account or use the installed account
 Core rejects local environment overrides when no saved account is selected.
 This includes draft credentials. The probe uses the installed VM environment. Core does not test a different installed account in their place.
 Only Core can supply the selected account identity and local credential home.
+
+## Fresh attempts
+
+A workspace provider opts in with `workspaceProvider.freshWorkspaceVersion: 1`.
+A task environment also declares `environmentDrivers[].freshWorkspaceVersion: 1`
+and returns `freshWorkspaceVersion: 1` from `describe`.
+
+Core supplies a server-authorized `fresh` intent on workspace preparation and on
+launch-related task calls. `attemptId` is stable across interrupted preparation.
+`previousWorkspaceId` identifies retained storage; it is not permission to change
+or remove it. The provider prepares a new working directory from the authorized
+source and base. It may share repository objects or other immutable storage.
+Core does not require a particular Git or filesystem layout.
+
+`recoverySnapshots` contains verified, Core-staged archive and manifest files.
+Each file descriptor contains a trusted host path, SHA-256, and byte size. These
+paths are host-authored transfer sources, never user-supplied paths or URLs.
+Providers verify the bytes and safely materialize each snapshot separately at
+`.paperclip-recovered/<operationId>` beneath the new working directory. Preserve
+file links safely and include provenance. Never overlay recovered files onto the
+clean working tree or overwrite an earlier attachment. Core includes those
+relative attachment paths in the new attempt's continuation context.
+
+A provider reconciles the same attempt and workspace identity after an ambiguous
+reply. It must not replace the failed workspace or allocate another workspace
+when preparation is repeated. Providers without this version remain unavailable
+for fresh attempts; ordinary preparation and reuse retain their existing contract.
+
+Core keeps transfer files while preparation is uncertain. Confirmed task completion
+and provider workspace removal release these disposable copies. The descriptors
+remain stable: a later preparation downloads the same verified files again.

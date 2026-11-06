@@ -25,7 +25,7 @@ The shared `AI_CONNECTION_CAPABILITIES` contract defines these combinations:
 | --- | --- | --- |
 | Claude / Anthropic | Claude subscription token or Anthropic API key | Claude |
 | OpenAI | ChatGPT/Codex subscription or OpenAI API key | Codex |
-| OpenRouter (legacy, no routing metadata) | API key | OpenCode, with an `openrouter/` model |
+| OpenRouter (legacy, no routing metadata) | API key | OpenCode or Pi, with an `openrouter/` model |
 | Google | API key | Gemini CLI |
 | Grok / xAI | Grok subscription or xAI API key | Grok |
 
@@ -575,13 +575,13 @@ database whose name contains `rehearsal` or `snapshot`; on a cluster forked from
 a backup, copy the database under such a name first (`CREATE DATABASE
 paperclip_snapshot TEMPLATE <database>`). Do not use one of Paperclip's built-in
 backups: their format keeps no CHECK constraints, and
-`0374_smooth_killmonger` (applied in production as `0309`) drops the check on
+`0378_smooth_killmonger` (applied in production as `0309`) drops the check on
 `ai_account_hosts.kind`, so the rehearsal of a database without the pool would
 stop there although production has the constraint. Fork: production applied the
-five pool migrations as `0306`–`0310`; the upstream sync renumbered them,
-byte-identical, to `0371`–`0375`, and the runner matches applied migrations by
+five pool migrations as `0306`–`0310`; upstream syncs renumbered them,
+byte-identical, to `0375`–`0379`, and the runner matches applied migrations by
 hash, so a copy of that production database does not run them again. Its
-pending set is upstream's `0306`–`0370` and the later fork migrations (`0376`).
+pending set is upstream's `0306`–`0374` and the later fork migrations (`0380`).
 Then run, from `/app` in the new image:
 
 ```sh
@@ -724,7 +724,7 @@ device" (a target an environment driver plugin reported).
    runs on it wait as `device_unknown`.
 
 Device names stay unique with a ` (n)` suffix. Migration
-`0375_productive_veda` (applied in production as `0310`) set the keys of
+`0379_productive_veda` (applied in production as `0310`) set the keys of
 existing hosts whose mapped environments agree on one host and port (and `local`
 for the server host), so a new SSH environment on a known machine joins its
 device. Hosts it could not key are listed by the pre-deploy report.
@@ -1834,6 +1834,7 @@ credentials belong to the connection; the model belongs to the agent.
 | Codex legacy and Codex New Runner (app-server) | OpenRouter; custom/local OpenAI Responses endpoints |
 | Claude legacy and Claude New Runner (ACPX) | OpenRouter; custom/local Anthropic Messages; Bedrock API key |
 | OpenCode legacy and New Runner | OpenRouter; custom/local Chat Completions |
+| Pi legacy and New Runner | OpenRouter; native OpenAI, Anthropic, and Google API keys with a matching `provider/model` |
 | Hermes local | OpenRouter; custom/local Chat Completions |
 | Gemini CLI, Grok | Their native API connections; custom routes are not advertised |
 
@@ -1843,7 +1844,7 @@ environment probes and task execution. The settings file contains no credential.
 
 OpenClaw Gateway, Hermes Gateway, Claude Managed, AWS AgentCore, Process, HTTP,
 and legacy `acpx_local` are excluded: external agents retain their own model
-configuration, and `acpx_local` is retired. Cursor/Pi/Copilot custom routing,
+configuration, and `acpx_local` is retired. Cursor/Copilot custom routing, Pi custom gateways and Bedrock,
 Vertex, ambient AWS identity, arbitrary authentication headers, and automatic
 catalog discovery for custom gateways are not part of this implementation.
 
@@ -2072,3 +2073,17 @@ updates, account changes, duplicate identity resolution, ownership, monetary
 receipt replay, unknown prices, and failed provider observations. Provider payloads
 are fixtures; live provider access still depends on the deployment's credentials
 and scopes.
+
+### Login completion ownership
+
+The internal connection save service takes an internal auth-session row ID for
+every login flow. The setup-token owner resolves its public session ID within
+the company, user, and adapter scope before calling save. Local and device
+logins already use internal IDs. Provider names do not select the ID column.
+
+A login flow can supply a completion callback that runs inside the connection
+save transaction, after the session binding is written. Setup-token completion
+uses its existing conditional transition to `stored`; a rejected transition
+rolls back the credentials and connection binding. Already-bound sessions return
+the existing connection without repeating the callback. Local and device login
+services continue to own their final states.

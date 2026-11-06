@@ -1726,6 +1726,8 @@ export interface PluginAgentRuntimeState {
   agent: Agent;
   instructionsRootPath: string | null;
   instructionsEntryFile: string;
+  /** Default entry content when the agent has no instruction directory. */
+  instructionsEntryContent?: string;
   instanceSecrets: Record<string, string>;
 }
 

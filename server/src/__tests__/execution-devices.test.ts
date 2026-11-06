@@ -253,7 +253,7 @@ describeEmbeddedPostgres("execution devices (database)", () => {
       expect(candidates.map((candidate) => [candidate.environmentId, candidate.device?.id])).toEqual([[localEnvironment.id, server!.id]]);
     });
 
-    it("keys SSH devices as the account pool data migration (0375_productive_veda, applied in production as 0310) does and names new ones after the environment", async () => {
+    it("keys SSH devices as the account pool data migration (0379_productive_veda, applied in production as 0310) does and names new ones after the environment", async () => {
       // A device whose key the data migration's backfill (0375, applied as 0310) set.
       const [tower] = await db.insert(aiAccountHosts).values({ name: "Tower", kind: "mac", externalKey: "ssh:tower.example.com:2222" }).returning();
       const tunnel = await environment("ssh", { host: " TOWER.example.com ", port: "2222", username: "runner" });

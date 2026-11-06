@@ -427,7 +427,7 @@ connection, before enabling the new server and UI.
 
 - Create every migration with `pnpm --filter @paperclipai/db generate`. Do not hand-write a snapshot.
 - Do not hand-edit a snapshot to resolve a merge conflict. Renumber your migration and run `generate` again, as `packages/db/.gitattributes` describes.
-- Fork: a migration production has already applied (now `0371`–`0375`) is renumbered by renaming its file and updating its journal tag only, never by regenerating or editing it, because the runner recognises applied files only by the SHA-256 of their content. `packages/db/src/fork-migration-receipts.test.ts` pins those hashes.
+- Fork: a migration production has already applied (now `0375`–`0379`) is renumbered by renaming its file and updating its journal tag only, never by regenerating or editing it, because the runner recognises applied files only by the SHA-256 of their content. `packages/db/src/fork-migration-receipts.test.ts` pins those hashes.
 - The repo keeps only the newest 5 snapshots. `generate` runs `prune:snapshots` afterwards to delete older ones. Drizzle only reads the newest snapshot, and each snapshot is a full copy of the schema (over 1 MB each). Older snapshots are still in git history.
 - `packages/db/src/migration-snapshot-drift.test.ts` is the enforcement backstop. It repeats the diff that `generate` performs and fails when the newest snapshot no longer matches `packages/db/src/schema/`.
 
@@ -1126,3 +1126,12 @@ identity references. Budget reservations have a distinct classifier invocation
 source, and cost events accept `prompt_injection`. Unknown charges retain their
 holds through agent deletion attempts and settle through billing correction.
 See [service behavior](prompt-injection-prevention.md).
+
+### Deferred conversation requests
+
+`issue_thread_interactions.dismissed_at` and `dismissed_by_user_id` record a
+human's decision to leave a pending request in history. They are independent of
+`status`, `result`, and `resolved_at`: dismissal is neither an answer nor approval.
+The board-only dismissal path locks the task then interaction, checks audience,
+and never enqueues a continuation. Ordinary deferred requests are excluded from
+completion arbitration; protected authorization gates remain active.

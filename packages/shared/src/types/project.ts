@@ -101,6 +101,15 @@ export interface ProjectDiscoveryPage {
   nextCursor: string | null;
 }
 
+export interface ProjectWorkspaceProviderConfiguration {
+  source: "project" | "default" | "core";
+  pluginId: string | null;
+  displayName: string;
+  providers: Array<{ id: string; displayName: string; isDefault: boolean }>;
+  effectivePolicy: ProjectExecutionWorkspacePolicy | null;
+  error: string | null;
+}
+
 export interface Project {
   id: string;
   companyId: string;
@@ -128,6 +137,7 @@ export interface Project {
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
   /** Where the project's work runs for agents that are not pinned to an environment. */
   defaultEnvironmentId: string | null;
+  workspaceProvider?: ProjectWorkspaceProviderConfiguration;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
