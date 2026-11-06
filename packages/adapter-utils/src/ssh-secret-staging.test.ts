@@ -7,6 +7,7 @@ import { runChildProcess } from "./server-utils.js";
 import {
   buildSshEnvLoadSteps,
   buildSshSpawnTarget,
+  SSH_RUN_GUARD_STEP,
   buildSshStagedEnvFile,
   createSshCommandManagedRuntimeRunner,
   getSshEnvLabSupport,
@@ -426,6 +427,7 @@ describe("ssh secret staging", () => {
     await target.cleanup();
     expect(target.discardStagedEnv).toBeUndefined();
     const legacySpawnScript = [
+      SSH_RUN_GUARD_STEP,
       ...LEGACY_PROFILE_STEPS,
       `cd ${shellQuote(host.spec.remoteCwd)}`,
       `exec env ${envArgs} 'node' '--version'`,
