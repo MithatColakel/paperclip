@@ -105,6 +105,21 @@ export type TaskWorkspaceBindingPatch = Partial<Pick<typeof issues.$inferInsert,
   "executionWorkspaceId" | "projectWorkspaceId" | "executionWorkspacePreference" | "executionWorkspaceSettings"
 >>;
 
+/**
+ * A task with bound files keeps them when its source changes, unless the
+ * patch clears the binding too. Reads only its arguments; the issue update
+ * precheck runs it on the stored row as well.
+ */
+export function assertTaskWorkspaceSourceChangeKeepsBinding(
+  task: Pick<typeof issues.$inferSelect, "projectWorkspaceId" | "executionWorkspaceId">,
+  patch: Pick<TaskWorkspaceBindingPatch, "projectWorkspaceId" | "executionWorkspaceId">,
+) {
+  if (patch.projectWorkspaceId !== undefined && patch.projectWorkspaceId !== task.projectWorkspaceId &&
+      task.executionWorkspaceId && patch.executionWorkspaceId !== null) {
+    throw conflict("Task already has bound files; schedule a workspace selection or explicitly clear its binding when changing the source");
+  }
+}
+
 type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
@@ -1651,10 +1666,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (!task) throw notFound("Task not found");
     const fields = ["executionWorkspaceId", "projectWorkspaceId", "executionWorkspacePreference", "executionWorkspaceSettings"] as const;
     if (!fields.some(field => input.patch[field] !== undefined && !isDeepStrictEqual(input.patch[field], task[field]))) return {};
-    if (input.patch.projectWorkspaceId !== undefined && input.patch.projectWorkspaceId !== task.projectWorkspaceId &&
-        task.executionWorkspaceId && input.patch.executionWorkspaceId !== null) {
-      throw conflict("Task already has bound files; schedule a workspace selection or explicitly clear its binding when changing the source");
-    }
+    assertTaskWorkspaceSourceChangeKeepsBinding(task, input.patch);
     const [holder] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "running"),
       or(eq(heartbeatRuns.nativeIssueId, input.issueId),

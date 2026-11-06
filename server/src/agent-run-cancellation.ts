@@ -12,28 +12,49 @@ export function agentRunWritesRevoked(run: {
     && "state" in cancellation && cancellation.state === "requested");
 }
 
+async function assertAgentRunMayWrite(db: Db, companyId: string, actor: {
+  agentId?: string | null;
+  runId?: string | null;
+  stopId?: string | null;
+}, lock: boolean) {
+  if (!actor.agentId || !actor.runId) return;
+  const runQuery = db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
+    runtimeMode: heartbeatRuns.runtimeMode, companyId: heartbeatRuns.companyId,
+    contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)));
+  const [run] = lock ? await runQuery.for("share") : await runQuery;
+  const stoppedForThisMutation = run?.status === "cancelled" && actor.stopId &&
+    run.resultJson?.issueMutationStopId === actor.stopId;
+  if (agentRunWritesRevoked(run) && !stoppedForThisMutation) {
+    throw forbidden("This run was cancelled", { code: "agent_run_cancelled" });
+  }
+  const [handoff] = await db.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
+    eq(caseHandoffs.companyId, companyId), eq(caseHandoffs.sourceRunId, actor.runId),
+    inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "delivered"]),
+  )).limit(1);
+  if (handoff) throw forbidden("This run handed off its task. End the turn.", { code: "case_handoff_run_yielded", handoffId: handoff.id });
+  return run;
+}
+
 /** The caller must supply its write transaction, so Stop and commit serialize. */
 export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, actor: {
   agentId?: string | null;
   runId?: string | null;
   stopId?: string | null;
 }) {
-  if (!actor.agentId || !actor.runId) return;
-  const [run] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
-    runtimeMode: heartbeatRuns.runtimeMode, companyId: heartbeatRuns.companyId,
-    contextSnapshot: heartbeatRuns.contextSnapshot })
-    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
-      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)))
-    .for("share");
-  const stoppedForThisMutation = run?.status === "cancelled" && actor.stopId &&
-    run.resultJson?.issueMutationStopId === actor.stopId;
-  if (agentRunWritesRevoked(run) && !stoppedForThisMutation) {
-    throw forbidden("This run was cancelled", { code: "agent_run_cancelled" });
-  }
-  const [handoff] = await tx.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
-    eq(caseHandoffs.companyId, companyId), eq(caseHandoffs.sourceRunId, actor.runId),
-    inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch", "delivered"]),
-  )).limit(1);
-  if (handoff) throw forbidden("This run handed off its task. End the turn.", { code: "case_handoff_run_yielded", handoffId: handoff.id });
-  return run;
+  return assertAgentRunMayWrite(tx, companyId, actor, true);
+}
+
+/**
+ * The check above, read-only and without its lock, for a precheck that runs
+ * before the caller stops any run. No run has been stopped for this mutation
+ * yet, so the stop-id exemption does not apply. The write must still call
+ * `assertAgentRunWriteAllowed` in its transaction.
+ */
+export async function assertAgentRunWriteNotRevoked(db: Db, companyId: string, actor: {
+  agentId?: string | null;
+  runId?: string | null;
+}) {
+  return assertAgentRunMayWrite(db, companyId, { agentId: actor.agentId, runId: actor.runId }, false);
 }

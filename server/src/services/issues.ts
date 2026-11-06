@@ -7,13 +7,16 @@ import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js
 import { type AuthorizationActor, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
 import { assertExecutionWorkspaceRecordAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-access.js";
 import { type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
-import { executionWorkspaceService } from "./execution-workspaces.js";
+import {
+  assertTaskWorkspaceSourceChangeKeepsBinding,
+  executionWorkspaceService,
+} from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
-import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { assertAgentRunWriteAllowed, assertAgentRunWriteNotRevoked } from "../agent-run-cancellation.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
@@ -224,16 +227,58 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  ALL_ISSUE_STATUSES,
+  ISSUE_UPDATE_CONTROL_KEYS,
+  assertIssueUpdatePrecheck,
+  issueUpdateChangesAssigneeAgent,
+} from "./issue-update-precheck.js";
 
-const ALL_ISSUE_STATUSES = [
-  "backlog",
-  "todo",
-  "in_progress",
-  "in_review",
-  "blocked",
-  "done",
-  "cancelled",
-];
+export {
+  assertIssueUpdatePrecheck,
+  type IssueUpdatePrecheckFacts,
+  type IssueUpdatePrecheckIssue,
+  type IssueUpdatePrecheckPatch,
+} from "./issue-update-precheck.js";
+
+/** The patch `issueService.update` and `issueService.precheckUpdate` take. */
+export type IssueUpdateData = Partial<typeof issues.$inferInsert> & {
+  labelIds?: string[];
+  blockedByIssueIds?: string[];
+  actorAgentId?: string | null;
+  actorRunId?: string | null;
+  /** Server-owned transfer being applied; never accepted from HTTP input. */
+  caseHandoffId?: string;
+  actorRunStopId?: string | null;
+  actorUserId?: string | null;
+  companyGuard?: string;
+  workspaceSelectionActor?: AuthorizationActor;
+  expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
+  expectedStatusVersion?: number;
+};
+
+type IssueUpdateControlKey = Exclude<
+  keyof IssueUpdateData,
+  keyof typeof issues.$inferInsert
+>;
+type ListedIssueUpdateControlKey = (typeof ISSUE_UPDATE_CONTROL_KEYS)[number];
+// The precheck tells control keys from issue columns by its list. Fail the
+// build when the list and `IssueUpdateData` disagree.
+const issueUpdateControlKeysListed: [IssueUpdateControlKey] extends [
+  ListedIssueUpdateControlKey,
+]
+  ? [ListedIssueUpdateControlKey] extends [IssueUpdateControlKey]
+    ? true
+    : never
+  : never = true;
+void issueUpdateControlKeysListed;
+
+/**
+ * The stored issue row the update rules read. The whole row, because the
+ * policy transition of a guarded promotion reads most of it.
+ */
+export type IssueUpdatePrecheckRow = typeof issues.$inferSelect;
+
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
@@ -329,10 +374,99 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
   )`;
 }
 
-function assertTransition(from: string, to: string) {
-  if (from === to) return;
-  if (!ALL_ISSUE_STATUSES.includes(to)) {
-    throw conflict(`Unknown issue status: ${to}`);
+/**
+ * A snapshot-guarded policy update must find the policy it was read against.
+ * `update` checks this under the issue row lock; `precheckUpdate` without it.
+ */
+function assertExpectedExecutionPolicy(
+  existing: Pick<typeof issues.$inferSelect, "executionPolicy">,
+  expectedExecutionPolicy: IssueUpdateData["expectedExecutionPolicy"],
+) {
+  if (expectedExecutionPolicy !== undefined && !isDeepStrictEqual(
+    existing.executionPolicy ?? null,
+    expectedExecutionPolicy,
+  )) {
+    throw conflict("The task execution settings changed. Try cancelling the monitor again.", {
+      code: "execution_policy_changed",
+    });
+  }
+}
+
+/**
+ * A guarded backlog-to-todo promotion must find the status version it was
+ * read at, and the policy transition must keep it a status-only promotion.
+ * Returns the transition's patch, or nothing without a version guard.
+ * `update` checks this under the issue row lock; `precheckUpdate` without it.
+ */
+function expectedStatusVersionPromotionPatch(
+  row: typeof issues.$inferSelect,
+  data: Pick<
+    IssueUpdateData,
+    "expectedStatusVersion" | "actorAgentId" | "actorUserId" | "workspaceSelectionActor"
+  >,
+): Record<string, unknown> {
+  if (data.expectedStatusVersion === undefined) return {};
+  if (row.statusVersion !== data.expectedStatusVersion || row.status !== "backlog") {
+    throw conflict("The task status or assignment changed. Read the task again before starting work.", {
+      code: "issue_status_version_changed",
+    });
+  }
+  const policy = normalizeIssueExecutionPolicy(row.executionPolicy ?? null);
+  const actor = data.workspaceSelectionActor;
+  const transition = applyIssueExecutionPolicyTransition({
+    issue: row,
+    policy,
+    previousPolicy: policy,
+    requestedStatus: "todo",
+    requestedAssigneePatch: {},
+    actor: { agentId: data.actorAgentId ?? null, userId: data.actorUserId ?? null },
+    allowBoardOverride: actor?.type === "board" && actor.source !== "mcp_oauth",
+  });
+  if (transition.decision ||
+    (transition.patch.status !== undefined && transition.patch.status !== "todo") ||
+    (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== row.assigneeAgentId) ||
+    (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== row.assigneeUserId)) {
+    throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
+  }
+  return transition.patch;
+}
+
+/**
+ * Where an issue's private access comes from after an update: the project
+ * it will be in, and the parent it inherits access from, with whether that
+ * parent or the parent's project is private. `update` reads this under the
+ * company's privacy-tree lock; `precheckUpdate` without it.
+ */
+async function readIssuePrivacyTree(
+  dbOrTx: any,
+  companyId: string,
+  row: Pick<typeof issues.$inferSelect, "projectId" | "privacyParentIssueId">,
+  issueData: Pick<IssueUpdateData, "projectId" | "parentId">,
+) {
+  const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : row.projectId;
+  const [project] = nextProjectId ? await dbOrTx.select().from(projects)
+    .where(and(eq(projects.id, nextProjectId), eq(projects.companyId, companyId))) : [];
+  const parentId = issueData.parentId !== undefined ? issueData.parentId : row.privacyParentIssueId;
+  const [parent] = parentId ? await dbOrTx.select().from(issues)
+    .where(and(eq(issues.id, parentId), eq(issues.companyId, companyId))) : [];
+  const parentPrivate = Boolean(parent && (parent.visibility === "private" || (parent.projectId && await dbOrTx.select({ id: projects.id }).from(projects)
+    .where(and(eq(projects.id, parent.projectId), eq(projects.visibility, "private"))).limit(1).then((rows: Array<{ id: string }>) => rows.length > 0))));
+  return {
+    project: (project ?? null) as typeof projects.$inferSelect | null,
+    parent: (parent ?? null) as typeof issues.$inferSelect | null,
+    parentPrivate,
+  };
+}
+
+/** The refusals for making a task public. Reads only its argument. */
+function assertIssuePrivacyTreeAllowsOpen(
+  tree: Awaited<ReturnType<typeof readIssuePrivacyTree>>,
+) {
+  if (tree.project?.visibility === "private" && !tree.project.personalOwnerUserId) {
+    throw unprocessable("Move this task out of its private project before making it public");
+  }
+  if (tree.parentPrivate) {
+    throw unprocessable("A task cannot be made public while it inherits private access");
   }
 }
 
@@ -7278,6 +7412,130 @@ export function issueService(db: Db) {
     }
   }
 
+  /**
+   * The rules of `update` that refuse a patch before anything is written, in
+   * the order `update` applies them: the stored row, the patch and other rows
+   * (the new parent, an external-channel binding, the new project, blockers
+   * and the next assignees). `update` runs them as the authority;
+   * `precheckUpdate` runs the same function read-only, so the two cannot
+   * drift. Returns the new project that `update` reads its visibility from.
+   */
+  async function assertIssueUpdateRules(
+    dbOrTx: any,
+    existing: IssueUpdatePrecheckRow,
+    data: IssueUpdateData,
+  ): Promise<{ selectedProject: { visibility: string } | null }> {
+    if (data.parentId !== undefined && data.parentId !== existing.parentId) {
+      await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
+    }
+    const externalBinding = issueUpdateChangesAssigneeAgent(existing, data)
+      ? await dbOrTx
+          .select({ id: chatConversations.id })
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.companyId, existing.companyId),
+              eq(chatConversations.issueId, existing.id),
+            ),
+          )
+          .limit(1)
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null)
+      : null;
+    const selectedProject: { visibility: string } | null = data.projectId
+      ? await dbOrTx
+          .select({ visibility: projects.visibility })
+          .from(projects)
+          .where(and(eq(projects.id, data.projectId), eq(projects.companyId, existing.companyId)))
+          .then((rows: Array<{ visibility: string }>) => rows[0] ?? null)
+      : null;
+    assertIssueUpdatePrecheck(existing, data, {
+      externalChannelConversationId: externalBinding?.id ?? null,
+      ...(data.projectId ? { projectFound: selectedProject !== null } : {}),
+    });
+
+    if (data.status === "in_progress") {
+      const dependencyReadiness =
+        data.blockedByIssueIds === undefined
+          ? (
+              await listIssueDependencyReadinessMap(
+                dbOrTx,
+                existing.companyId,
+                [existing.id],
+              )
+            ).get(existing.id)
+          : null;
+      const unresolvedBlockerIssueIds =
+        data.blockedByIssueIds !== undefined
+          ? await listUnresolvedBlockerIssueIds(
+              dbOrTx,
+              existing.companyId,
+              data.blockedByIssueIds,
+            )
+          : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
+      if (unresolvedBlockerIssueIds.length > 0) {
+        const unresolvedBlockers = await listUnresolvedBlockerDetails(
+          dbOrTx,
+          existing.companyId,
+          unresolvedBlockerIssueIds,
+          dependencyReadiness?.pendingFinalizeBlockerIssueIds,
+        );
+        throw unprocessable("Issue is blocked by unresolved blockers", {
+          unresolvedBlockerIssueIds,
+          unresolvedBlockers,
+        });
+      }
+    }
+    const nextAssigneeAgentId =
+      data.assigneeAgentId !== undefined
+        ? data.assigneeAgentId
+        : existing.assigneeAgentId;
+    if (
+      nextAssigneeAgentId &&
+      (data.assigneeAgentId !== undefined || data.status === "in_progress")
+    ) {
+      await assertAssignableAgent(
+        dbOrTx as Db,
+        existing.companyId,
+        nextAssigneeAgentId,
+        { kind: "work" },
+      );
+    }
+    if (data.assigneeUserId) {
+      await assertAssignableUser(existing.companyId, data.assigneeUserId);
+    }
+    return { selectedProject };
+  }
+
+  /**
+   * An agent may not complete a task while a connection review is open.
+   * `update` runs this under the issue row lock; `precheckUpdate` runs it
+   * without the lock.
+   */
+  async function assertNoPendingToolReviewForAgentCompletion(
+    dbOrTx: any,
+    existing: Pick<IssueUpdatePrecheckRow, "id" | "companyId">,
+    data: Pick<IssueUpdateData, "actorAgentId" | "status">,
+  ) {
+    if (!data.actorAgentId || data.status !== "done") return;
+    const [review] = await dbOrTx
+      .select({ id: toolActionRequests.id })
+      .from(toolActionRequests)
+      .where(
+        and(
+          eq(toolActionRequests.companyId, existing.companyId),
+          eq(toolActionRequests.issueId, existing.id),
+          inArray(toolActionRequests.status, ["pending", "approved", "executing"]),
+        ),
+      )
+      .limit(1);
+    if (review) {
+      throw conflict(
+        "This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.",
+        { code: "tool_review_pending", actionRequestId: review.id },
+      );
+    }
+  }
+
   async function assertValidProjectWorkspace(
     companyId: string,
     projectId: string | null | undefined,
@@ -7324,6 +7582,42 @@ export function issueService(db: Db) {
     if (workspace.companyId !== companyId)
       throw unprocessable("Execution workspace must belong to same company");
     return workspace;
+  }
+
+  /**
+   * The workspace rules `update` applies before its transaction, to the
+   * workspaces the issue will have: they exist in the issue's company, and an
+   * explicitly pinned worktree can run. `precheckUpdate` runs the same
+   * function. Pass the data after `update` drops the execution workspace
+   * fields, which it does while isolated workspaces are off.
+   */
+  async function assertIssueUpdateWorkspaces(
+    existing: Pick<
+      IssueUpdatePrecheckRow,
+      "companyId" | "projectId" | "projectWorkspaceId" | "executionWorkspaceId" | "executionWorkspacePreference"
+    >,
+    issueData: Pick<
+      IssueUpdateData,
+      "projectId" | "projectWorkspaceId" | "executionWorkspaceId" | "executionWorkspacePreference" | "executionWorkspaceSettings"
+    >,
+    isolatedWorkspacesEnabled: boolean,
+  ) {
+    const next = <K extends "projectId" | "projectWorkspaceId" | "executionWorkspaceId" | "executionWorkspacePreference">(
+      key: K,
+    ) => (issueData[key] !== undefined ? issueData[key] : existing[key]);
+    const projectWorkspaceId = next("projectWorkspaceId");
+    const executionWorkspaceId = next("executionWorkspaceId");
+    if (projectWorkspaceId) await assertValidProjectWorkspace(existing.companyId, null, projectWorkspaceId);
+    if (executionWorkspaceId) await assertValidExecutionWorkspace(existing.companyId, null, executionWorkspaceId);
+    if (isolatedWorkspacesEnabled && issueData.executionWorkspaceSettings !== undefined) {
+      assertExplicitPinnedWorktreeIssueRunnable({
+        projectId: next("projectId") ?? null,
+        projectWorkspaceId: projectWorkspaceId ?? null,
+        executionWorkspaceId: executionWorkspaceId ?? null,
+        executionWorkspacePreference: next("executionWorkspacePreference") ?? null,
+        executionWorkspaceSettings: issueData.executionWorkspaceSettings,
+      });
+    }
   }
 
   async function assertValidLabelIds(
@@ -7528,6 +7822,37 @@ export function issueService(db: Db) {
     }
   }
 
+  function assertNotBlockedBySelf(issueId: string, blockerIssueIds: string[]) {
+    if (blockerIssueIds.some((candidate) => candidate === issueId)) {
+      throw unprocessable("Issue cannot be blocked by itself");
+    }
+  }
+
+  /**
+   * Blockers must be issues of the same company and must not close a cycle.
+   * `syncBlockedByIssueIds` checks this while it holds the issues' row locks;
+   * `precheckUpdate` without them.
+   */
+  async function assertBlockersInCompanyWithoutCycles(
+    issueId: string,
+    companyId: string,
+    blockerIssueIds: string[],
+    dbOrTx: any = db,
+  ) {
+    const relatedIssues = await dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds)),
+      );
+    if (relatedIssues.length !== blockerIssueIds.length) {
+      throw unprocessable(
+        "Blocked-by issues must belong to the same company",
+      );
+    }
+    await assertNoBlockingCycles(companyId, issueId, blockerIssueIds, dbOrTx);
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
@@ -7536,9 +7861,7 @@ export function issueService(db: Db) {
     dbOrTx: any = db,
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
-    if (deduped.some((candidate) => candidate === issueId)) {
-      throw unprocessable("Issue cannot be blocked by itself");
-    }
+    assertNotBlockedBySelf(issueId, deduped);
 
     if (deduped.length > 0) {
       const lockedIssueIds = [issueId, ...deduped].sort();
@@ -7548,18 +7871,7 @@ export function issueService(db: Db) {
             ORDER BY ${issues.id}
             FOR UPDATE`,
       );
-      const relatedIssues = await dbOrTx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(
-          and(eq(issues.companyId, companyId), inArray(issues.id, deduped)),
-        );
-      if (relatedIssues.length !== deduped.length) {
-        throw unprocessable(
-          "Blocked-by issues must belong to the same company",
-        );
-      }
-      await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
+      await assertBlockersInCompanyWithoutCycles(issueId, companyId, deduped, dbOrTx);
     }
 
     await dbOrTx
@@ -10869,22 +11181,76 @@ export function issueService(db: Db) {
       });
     },
 
+    /**
+     * Read-only. Throws the error `update` would return for `data` from the
+     * rules it applies, in the same order, without its locks. The PATCH route
+     * calls it before it stops the assignee's runner goal, cancels a run or
+     * reopens a workspace, so a refused request leaves that work alone.
+     * `update` stays the authority and runs the same rules again. What
+     * `update` checks under a lock is best effort here, because each fact can
+     * change before `update` takes the lock: the acting run did not hand the
+     * task off, a guarded promotion still finds its version and stays
+     * status-only, a guarded policy still matches, the task may be made
+     * public, the acting run may still write and owns the task, no connection
+     * review is open, and the labels and blockers are valid. Not repeated
+     * here: the refusal while a run still holds the task's workspace (that
+     * can be the run the route is about to stop) and the workspace access
+     * check `update` makes after it writes.
+     */
+    precheckUpdate: async (
+      existing: IssueUpdatePrecheckRow,
+      data: IssueUpdateData,
+    ) => {
+      await assertIssueUpdateRules(db, existing, data);
+      const changesExecutionWorkspace =
+        data.executionWorkspaceId !== undefined ||
+        data.executionWorkspacePreference !== undefined ||
+        data.executionWorkspaceSettings !== undefined;
+      const isolatedWorkspacesEnabled =
+        changesExecutionWorkspace &&
+        (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+      // `update` drops these fields while isolated workspaces are off.
+      const workspaceData = isolatedWorkspacesEnabled
+        ? data
+        : {
+            ...data,
+            executionWorkspaceId: undefined,
+            executionWorkspacePreference: undefined,
+            executionWorkspaceSettings: undefined,
+          };
+      await assertIssueUpdateWorkspaces(existing, workspaceData, isolatedWorkspacesEnabled);
+      if (data.actorRunId) await assertNoCaseHandoffMutation(db, data.actorRunId, existing.id);
+      expectedStatusVersionPromotionPatch(existing, data);
+      assertTaskWorkspaceSourceChangeKeepsBinding(existing, workspaceData);
+      assertExpectedExecutionPolicy(existing, data.expectedExecutionPolicy);
+      if (data.visibility === "open") {
+        assertIssuePrivacyTreeAllowsOpen(
+          await readIssuePrivacyTree(db, existing.companyId, existing, data),
+        );
+      }
+      if (data.actorAgentId && data.actorRunId) {
+        const actorRun = await assertAgentRunWriteNotRevoked(db, existing.companyId, {
+          agentId: data.actorAgentId,
+          runId: data.actorRunId,
+        });
+        assertLegacyRunTaskOwnership(actorRun, existing);
+      }
+      await assertNoPendingToolReviewForAgentCompletion(db, existing, data);
+      if (data.labelIds !== undefined) {
+        await assertValidLabelIds(existing.companyId, [...new Set(data.labelIds)]);
+      }
+      if (data.blockedByIssueIds !== undefined) {
+        const blockerIssueIds = [...new Set(data.blockedByIssueIds)];
+        assertNotBlockedBySelf(existing.id, blockerIssueIds);
+        if (blockerIssueIds.length > 0) {
+          await assertBlockersInCompanyWithoutCycles(existing.id, existing.companyId, blockerIssueIds);
+        }
+      }
+    },
+
     update: async (
       id: string,
-      data: Partial<typeof issues.$inferInsert> & {
-        labelIds?: string[];
-        blockedByIssueIds?: string[];
-        actorAgentId?: string | null;
-        actorRunId?: string | null;
-        /** Server-owned transfer being applied; never accepted from HTTP input. */
-        caseHandoffId?: string;
-        actorRunStopId?: string | null;
-        actorUserId?: string | null;
-        companyGuard?: string;
-        workspaceSelectionActor?: AuthorizationActor;
-        expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
-        expectedStatusVersion?: number;
-      },
+      data: IssueUpdateData,
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
@@ -10911,17 +11277,9 @@ export function issueService(db: Db) {
         .where(idPredicate)
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
-      if (data.parentId !== undefined && data.parentId !== existing.parentId) {
-        await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
-      }
-      if (existing.conversationAgentId) {
-        if ((data.assigneeAgentId !== undefined && data.assigneeAgentId !== existing.conversationAgentId)
-          || data.assigneeUserId || data.conversationAgentId !== undefined || data.conversationUserId !== undefined
-          || data.conversationState !== undefined || data.conversationSessionGeneration !== undefined
-          || data.conversationBoundaryCommentId !== undefined || data.status === "done" || data.status === "cancelled") {
-          throw unprocessable("Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation");
-        }
-      }
+      // `precheckUpdate` runs the same rules before the PATCH route stops the
+      // assignee's work.
+      const { selectedProject } = await assertIssueUpdateRules(dbOrTx, existing, data);
 
       const {
         labelIds: nextLabelIds,
@@ -10937,42 +11295,13 @@ export function issueService(db: Db) {
         expectedStatusVersion,
         ...issueData
       } = data;
-      if (expectedStatusVersion !== undefined && (
-        issueData.status !== "todo" || Object.keys(issueData).some(key => key !== "status") ||
-        nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined
-      )) {
-        throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
-      }
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
-      if (
-        issueData.assigneeAgentId !== undefined &&
-        issueData.assigneeAgentId !== existing.assigneeAgentId
-      ) {
-        const externalBinding = await dbOrTx
-          .select({ id: chatConversations.id })
-          .from(chatConversations)
-          .where(
-            and(
-              eq(chatConversations.companyId, existing.companyId),
-              eq(chatConversations.issueId, existing.id),
-            ),
-          )
-          .limit(1)
-          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-        if (externalBinding) {
-          throw conflict(
-            "Agent assignment cannot change while this task is bound to an external channel",
-            {
-              code: "chat_binding_agent_locked",
-              conversationId: externalBinding.id,
-            },
-          );
-        }
-      }
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
+      // The PATCH route never sets this option, so `precheckUpdate` leaves
+      // it out, and its refusal follows the shared rules above.
       if (options.bindRuntimeSharedWorkspace) {
         const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
         if (!workspaceId) {
@@ -11002,10 +11331,6 @@ export function issueService(db: Db) {
         delete issueData.executionWorkspaceSettings;
       }
 
-      if (issueData.status) {
-        assertTransition(existing.status, issueData.status);
-      }
-
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -11015,17 +11340,10 @@ export function issueService(db: Db) {
       } else if (issueData.visibility === "open") {
         patch.privacyRootIssueId = null;
       }
-      if (issueData.projectId) {
-        const selectedProject = await dbOrTx
-          .select({ visibility: projects.visibility })
-          .from(projects)
-          .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, existing.companyId)))
-          .then((rows: Array<{ visibility: string }>) => rows[0] ?? null);
-        if (!selectedProject) throw notFound("Project not found");
-        if (selectedProject.visibility === "private") {
-          patch.visibility = "private";
-          patch.privacyRootIssueId = existing.privacyRootIssueId ?? existing.id;
-        }
+      // The update rules above refused a project the company does not have.
+      if (selectedProject?.visibility === "private") {
+        patch.visibility = "private";
+        patch.privacyRootIssueId = existing.privacyRootIssueId ?? existing.id;
       }
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
@@ -11043,83 +11361,6 @@ export function issueService(db: Db) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
       }
 
-      const nextAssigneeAgentId =
-        issueData.assigneeAgentId !== undefined
-          ? issueData.assigneeAgentId
-          : existing.assigneeAgentId;
-      const nextAssigneeUserId =
-        issueData.assigneeUserId !== undefined
-          ? issueData.assigneeUserId
-          : existing.assigneeUserId;
-
-      if (nextAssigneeAgentId && nextAssigneeUserId) {
-        throw unprocessable("Issue can only have one assignee");
-      }
-      if (
-        patch.status === "in_progress" &&
-        !nextAssigneeAgentId &&
-        !nextAssigneeUserId
-      ) {
-        throw unprocessable("in_progress issues require an assignee");
-      }
-      if (patch.status === "in_progress") {
-        const dependencyReadiness =
-          blockedByIssueIds === undefined
-            ? (
-                await listIssueDependencyReadinessMap(
-                  dbOrTx,
-                  existing.companyId,
-                  [id],
-                )
-              ).get(id)
-            : null;
-        const unresolvedBlockerIssueIds =
-          blockedByIssueIds !== undefined
-            ? await listUnresolvedBlockerIssueIds(
-                dbOrTx,
-                existing.companyId,
-                blockedByIssueIds,
-              )
-            : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
-        if (unresolvedBlockerIssueIds.length > 0) {
-          const unresolvedBlockers = await listUnresolvedBlockerDetails(
-            dbOrTx,
-            existing.companyId,
-            unresolvedBlockerIssueIds,
-            dependencyReadiness?.pendingFinalizeBlockerIssueIds,
-          );
-          throw unprocessable("Issue is blocked by unresolved blockers", {
-            unresolvedBlockerIssueIds,
-            unresolvedBlockers,
-          });
-        }
-      }
-      const shouldValidateNextAssignee =
-        Boolean(nextAssigneeAgentId) &&
-        (issueData.assigneeAgentId !== undefined ||
-          patch.status === "in_progress");
-      if (shouldValidateNextAssignee) {
-        await assertAssignableAgent(
-          dbOrTx as Db,
-          existing.companyId,
-          nextAssigneeAgentId,
-          { kind: "work" },
-        );
-      }
-      if (issueData.assigneeUserId) {
-        await assertAssignableUser(
-          existing.companyId,
-          issueData.assigneeUserId,
-        );
-      }
-      let nextProjectId =
-        issueData.projectId !== undefined
-          ? issueData.projectId
-          : existing.projectId;
-      const nextProjectWorkspaceId =
-        issueData.projectWorkspaceId !== undefined
-          ? issueData.projectWorkspaceId
-          : existing.projectWorkspaceId;
       const nextExecutionWorkspaceId =
         issueData.executionWorkspaceId !== undefined
           ? issueData.executionWorkspaceId
@@ -11141,21 +11382,7 @@ export function issueService(db: Db) {
           ? { ...nextExecutionWorkspaceSettings }
           : null;
       }
-      if (nextProjectWorkspaceId) await assertValidProjectWorkspace(existing.companyId, null, nextProjectWorkspaceId);
-      if (nextExecutionWorkspaceId) await assertValidExecutionWorkspace(existing.companyId, null, nextExecutionWorkspaceId);
-      if (
-        isolatedWorkspacesEnabled &&
-        issueData.executionWorkspaceSettings !== undefined
-      ) {
-        assertExplicitPinnedWorktreeIssueRunnable({
-          projectId: nextProjectId ?? null,
-          projectWorkspaceId: nextProjectWorkspaceId ?? null,
-          executionWorkspaceId: nextExecutionWorkspaceId ?? null,
-          executionWorkspacePreference:
-            nextExecutionWorkspacePreference ?? null,
-          executionWorkspaceSettings: issueData.executionWorkspaceSettings,
-        });
-      }
+      await assertIssueUpdateWorkspaces(existing, issueData, isolatedWorkspacesEnabled);
 
       applyStatusSideEffects(issueData.status, patch);
       if (issueData.status && issueData.status !== "done") {
@@ -11196,66 +11423,30 @@ export function issueService(db: Db) {
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
         if (actorRunId) await assertNoCaseHandoffMutation(tx, actorRunId, id);
-        if (expectedStatusVersion !== undefined && (
-          receiptExisting.statusVersion !== expectedStatusVersion || receiptExisting.status !== "backlog"
-        )) {
-          throw conflict("The task status or assignment changed. Read the task again before starting work.", {
-            code: "issue_status_version_changed",
-          });
-        }
-        if (expectedStatusVersion !== undefined) {
-          const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
-          const transition = applyIssueExecutionPolicyTransition({
-            issue: receiptExisting,
-            policy,
-            previousPolicy: policy,
-            requestedStatus: "todo",
-            requestedAssigneePatch: {},
-            actor: { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-            allowBoardOverride: workspaceSelectionActor?.type === "board" && workspaceSelectionActor.source !== "mcp_oauth",
-          });
-          if (transition.decision ||
-            (transition.patch.status !== undefined && transition.patch.status !== "todo") ||
-            (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
-            (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== receiptExisting.assigneeUserId)) {
-            throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
-          }
-          Object.assign(patch, transition.patch);
-        }
+        Object.assign(patch, expectedStatusVersionPromotionPatch(receiptExisting, {
+          expectedStatusVersion, actorAgentId, actorUserId, workspaceSelectionActor,
+        }));
         if (issueData.executionWorkspaceId !== undefined || issueData.projectWorkspaceId !== undefined ||
             issueData.executionWorkspacePreference !== undefined || issueData.executionWorkspaceSettings !== undefined) {
           Object.assign(patch, await executionWorkspaceService(db).prepareTaskWorkspaceUpdate({
             companyId: receiptExisting.companyId, issueId: receiptExisting.id, patch,
           }, tx));
         }
-        if (expectedExecutionPolicy !== undefined && !isDeepStrictEqual(
-          receiptExisting.executionPolicy ?? null,
-          expectedExecutionPolicy,
-        )) {
-          throw conflict("The task execution settings changed. Try cancelling the monitor again.", {
-            code: "execution_policy_changed",
-          });
-        }
+        assertExpectedExecutionPolicy(receiptExisting, expectedExecutionPolicy);
         if (changesPrivacy) {
-          const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : receiptExisting.projectId;
-          const [privacyProject] = nextProjectId ? await tx.select().from(projects)
-            .where(and(eq(projects.id, nextProjectId), eq(projects.companyId, existing.companyId))) : [];
+          const privacyTree = await readIssuePrivacyTree(tx, existing.companyId, receiptExisting, issueData);
+          if (issueData.visibility === "open") assertIssuePrivacyTreeAllowsOpen(privacyTree);
+          const { project: privacyProject, parent: privacyParent } = privacyTree;
           if (privacyProject?.visibility === "private") {
             if (issueData.visibility === "open") {
-              if (!privacyProject.personalOwnerUserId) throw unprocessable("Move this task out of its private project before making it public");
               patch.projectId = null;
             } else {
               patch.visibility = "private";
               patch.privacyRootIssueId = receiptExisting.privacyRootIssueId ?? receiptExisting.id;
             }
           }
-          const privacyParentId = issueData.parentId !== undefined ? issueData.parentId : receiptExisting.privacyParentIssueId;
-          const [privacyParent] = privacyParentId ? await tx.select().from(issues)
-            .where(and(eq(issues.id, privacyParentId), eq(issues.companyId, existing.companyId))) : [];
           patch.privacyParentIssueId = privacyParent?.id ?? null;
-          if (privacyParent && (privacyParent.visibility === "private" || (privacyParent.projectId && await tx.select({ id: projects.id }).from(projects)
-            .where(and(eq(projects.id, privacyParent.projectId), eq(projects.visibility, "private"))).limit(1).then((rows: Array<{ id: string }>) => rows.length > 0)))) {
-            if (issueData.visibility === "open") throw unprocessable("A task cannot be made public while it inherits private access");
+          if (privacyParent && privacyTree.parentPrivate) {
             patch.visibility = "private";
             patch.privacyRootIssueId = privacyParent.privacyRootIssueId ?? privacyParent.id;
           } else if (issueData.visibility === "private") {
@@ -11270,10 +11461,10 @@ export function issueService(db: Db) {
           });
           assertLegacyRunTaskOwnership(actorRun, receiptExisting);
         }
-        if (actorAgentId && patch.status === "done") {
-          const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
-          if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
-        }
+        await assertNoPendingToolReviewForAgentCompletion(tx, existing, {
+          actorAgentId,
+          status: patch.status,
+        });
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined

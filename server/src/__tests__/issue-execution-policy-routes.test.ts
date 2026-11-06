@@ -9,6 +9,7 @@ const mockIssueService = vi.hoisted(() => ({
   findOpenAncestorCreatedByAgent: vi.fn(async () => null),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   createChild: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),

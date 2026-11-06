@@ -20,6 +20,7 @@ const mockIssueService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
+  precheckUpdate: vi.fn(async () => undefined),
   getByIdentifier: vi.fn(),
   assertCheckoutOwner: vi.fn(),
 }));

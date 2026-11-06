@@ -1494,6 +1494,76 @@ const SSH_LOGIN_PROFILE_STEPS = [
   'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
 ] as const;
 
+// sshd does not stop a command that has no PTY when the connection drops, so an
+// agent keeps running with no owner: it holds memory and can keep changing things
+// while the run is already failed and a retry is starting. The run guard is a
+// small watcher started beside the agent command. It stops the command's process
+// tree once the sshd session behind it is gone and the command is still running.
+//
+// A run ends with its connection, so this takes nothing a reconnect could use, and
+// a normal exit stops the guard without touching anything the run left behind.
+// Three misses in a row keep one failed `ps` under load from stopping a healthy
+// run. The guard fails open: with neither sshd nor a hidden process in its ancestry
+// (or no usable `ps`) it never starts, and a failed check ends it without stopping
+// anything.
+//
+// It watches the parent of the topmost process it can see, not the session itself.
+// A host that mounts /proc with hidepid hides sshd's session process from the user
+// it runs as, because that process is not dumpable. So the first ancestor `ps`
+// cannot see counts as the session, and the session is gone once that topmost
+// process has another parent.
+//
+// It only matches this command: the descendants of its root process plus its own
+// process group, which sshd creates per command. Another run under the same user
+// has another group. The group is left out unless the topmost process leads it, so
+// it can never be sshd's own group. It uses `grep` rather than `case` because bash
+// 3.2, which is /bin/sh on macOS, misparses a `case` pattern inside `$(...)`.
+const SSH_RUN_GUARD_SCRIPT = [
+  "root=$1; session=$2; top=$3; group=$4; self=$$",
+  "run_pids() { ps -A -o pid=,ppid=,pgid= 2>/dev/null | awk -v root=\"$root\" -v group=\"$group\" -v self=\"$self\" '"
+    + "{ pid[NR] = $1; parent[NR] = $2; if (group > 1 && $3 == group) mark[$1] = 1 } "
+    + "END { mark[root] = 1; "
+    + "do { grew = 0; for (i = 1; i <= NR; i++) if (!(pid[i] in mark) && (parent[i] in mark)) { mark[pid[i]] = 1; grew = 1 } } while (grew); "
+    + "for (i = 1; i <= NR; i++) if ((pid[i] in mark) && pid[i] != self && parent[i] != self && pid[i] > 1) print pid[i] }'; }",
+  "misses=0",
+  "while [ \"$misses\" -lt 3 ]; do",
+  "  sleep 5",
+  "  ps -o pid= -p \"$root\" >/dev/null 2>&1 || exit 0",
+  "  if [ \"$(ps -o ppid= -p \"$top\" 2>/dev/null | tr -d \" \")\" = \"$session\" ]; then misses=0; else misses=$((misses + 1)); fi",
+  "done",
+  "if command -v logger >/dev/null 2>&1; then logger -t paperclip-run-guard \"SSH connection lost; stopping process tree of $root\"; fi",
+  "pids=$(run_pids)",
+  "kill -TERM $pids 2>/dev/null",
+  "i=0",
+  "while [ \"$i\" -lt 10 ]; do",
+  "  sleep 1",
+  "  left=",
+  "  for pid in $pids; do if ps -o pid= -p \"$pid\" >/dev/null 2>&1; then left=\"$left $pid\"; fi; done",
+  "  if [ -z \"$left\" ]; then exit 0; fi",
+  "  i=$((i + 1))",
+  "done",
+  "more=$(run_pids)",
+  "kill -KILL $left $more 2>/dev/null",
+].join("\n");
+
+// Runs in the login shell before the profiles and env values load, so no value
+// reaches the watcher's environment. `$$` stays the agent's pid, because the script
+// ends in `exec`. The watcher's stdio is /dev/null, so it never holds the ssh channel
+// open, and the extra fork takes it out of the agent's process tree.
+export const SSH_RUN_GUARD_STEP = [
+  "pc_top=$$; pc_session=$PPID; pc_i=0",
+  "while [ \"$pc_i\" -lt 8 ] && [ \"${pc_session:-0}\" -gt 1 ]; do"
+    + " pc_comm=$(ps -o comm= -p \"$pc_session\" 2>/dev/null);"
+    + " if [ -z \"$pc_comm\" ] || echo \"$pc_comm\" | grep -q sshd; then break; fi;"
+    + " pc_top=$pc_session; pc_session=$(ps -o ppid= -p \"$pc_session\" 2>/dev/null | tr -d \" \"); pc_i=$((pc_i + 1)); done",
+  "if [ \"$pc_i\" -lt 8 ] && [ \"${pc_session:-0}\" -gt 1 ]; then"
+    + " pc_group=$(ps -o pgid= -p \"$$\" 2>/dev/null | tr -d \" \");"
+    + " if [ \"$pc_group\" != \"$pc_top\" ]; then pc_group=0; fi;"
+    + ` ( sh -c ${shellQuote(SSH_RUN_GUARD_SCRIPT)} paperclip-run-guard "$$" "$pc_session" "$pc_top" "\${pc_group:-0}" </dev/null >/dev/null 2>&1 & );`
+    + " fi",
+  "true",
+].join("; ");
+
 const SSH_STAGED_ENV_MARKER = "PAPERCLIP_STAGED_ENV_DIR=";
 // mktemp output under the remote TMPDIR. The path is pasted into the remote
 // script, so quotes, `$`, backquotes and backslashes are refused.
@@ -1840,6 +1910,7 @@ export async function buildSshSpawnTarget(input: {
   // can list (SSH_INLINE_ENV_KEYS): every other value arrives through the
   // staged file, loaded after the profiles.
   const remoteScript = stagedEnvExitTrap(stagedDir) + [
+    SSH_RUN_GUARD_STEP,
     ...SSH_LOGIN_PROFILE_STEPS,
     ...buildSshEnvLoadSteps({ stagedDir, unsetEnvKeys: envPlan.unset, unsetEnvPatterns: envPlan.unsetPatterns }),
     `cd ${shellQuote(input.spec.remoteCwd)}`,

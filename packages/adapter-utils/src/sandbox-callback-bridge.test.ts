@@ -545,6 +545,72 @@ describe("sandbox callback bridge", () => {
     });
   });
 
+  describe("host heartbeat", () => {
+    async function startLocalGateway(hostStaleMs: number) {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-heartbeat-"));
+      cleanupDirs.push(rootDir);
+      const localWorkspaceDir = path.join(rootDir, "local-workspace");
+      const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+      await mkdir(localWorkspaceDir, { recursive: true });
+      await mkdir(remoteWorkspaceDir, { recursive: true });
+      const runner = createExecRunner();
+      const bridgeAsset = await createSandboxCallbackBridgeAsset();
+      cleanupFns.push(bridgeAsset.cleanup);
+      const prepared = await prepareCommandManagedRuntime(
+        queueRuntimeInput(runner, remoteWorkspaceDir, localWorkspaceDir, bridgeAsset),
+      );
+      const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+      const bridge = await startSandboxCallbackBridgeServer({
+        runner,
+        remoteCwd: remoteWorkspaceDir,
+        assetRemoteDir: prepared.assetDirs.bridge,
+        queueDir,
+        bridgeToken: createSandboxCallbackBridgeToken(),
+        timeoutMs: 30_000,
+        hostStaleMs,
+      });
+      cleanupFns.push(async () => {
+        await bridge.stop();
+      });
+      return { bridge, queueDir };
+    }
+
+    function isAlive(pid: number): boolean {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    it("stops the gateway once the host heartbeat goes stale", async () => {
+      const { bridge } = await startLocalGateway(500);
+      expect(isAlive(bridge.pid)).toBe(true);
+
+      await vi.waitFor(() => expect(isAlive(bridge.pid)).toBe(false), { timeout: 10_000, interval: 100 });
+    }, 30_000);
+
+    it("keeps the gateway running while the relay loop refreshes the heartbeat", async () => {
+      const { bridge, queueDir } = await startLocalGateway(1_000);
+      const worker = await startSandboxCallbackBridgeWorker({
+        client: createFileSystemSandboxCallbackBridgeQueueClient(),
+        queueDir,
+        hostHeartbeatIntervalMs: 100,
+        authorizeRequest: async () => null,
+        handleRequest: async () => ({ status: 200, body: "ok" }),
+      });
+      cleanupFns.push(async () => {
+        await worker.stop();
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+
+      expect(isAlive(bridge.pid)).toBe(true);
+      await expect(readFile(sandboxCallbackBridgeDirectories(queueDir).hostHeartbeatFile, "utf8")).resolves.toMatch(/^\d{4}-/);
+    }, 30_000);
+  });
+
   it("drains already-queued requests on stop", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-drain-"));
     cleanupDirs.push(rootDir);
