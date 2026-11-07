@@ -833,6 +833,73 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it.each([
+    {
+      comment: "Monitor re-armed: next check in 4 hours.",
+      monitor: {
+        kind: "external_service",
+        serviceName: "Trello",
+        externalRef: "https://trello.com/c/example",
+        nextCheckAt: "2026-12-01T12:00:00.000Z",
+        timeoutAt: "2026-12-08T12:00:00.000Z",
+        maxAttempts: 100,
+      },
+    },
+    { monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" } },
+    { status: "in_progress", monitor: null },
+  ])("rejects a top-level monitor before changing, commenting on or waking a task: %j", async (body) => {
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send(body);
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("executionPolicy.monitor");
+    expect(res.body.error).toContain("Nothing was changed");
+    expect(res.body.code).toBe("issue_monitor_requires_execution_policy");
+    expect(res.body.details).toMatchObject({ field: "monitor", expected: "executionPolicy.monitor" });
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("keeps updates without a top-level monitor unchanged", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1008",
+      title: "Plain update",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(patch).toMatchObject({ title: "Renamed" });
+    expect(patch).not.toHaveProperty("monitor");
+    expect(patch).not.toHaveProperty("monitorNextCheckAt");
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

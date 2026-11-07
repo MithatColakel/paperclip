@@ -386,6 +386,12 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+// The update schema drops unknown keys. A top-level `monitor` (the runner's
+// set_task_monitor shape) would then return 200 and schedule nothing, so the
+// caller would believe a wait exists that never fires.
+const TOP_LEVEL_MONITOR_MESSAGE =
+  "monitor is not an issue field. Put it inside executionPolicy: executionPolicy.monitor with nextCheckAt " +
+  "(and optionally kind, serviceName, externalRef, timeoutAt, maxAttempts). Nothing was changed.";
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -13633,6 +13639,13 @@ export function issueRoutes(
   router.patch(
     "/issues/:id",
     (req, _res, next) => {
+      if (req.body && typeof req.body === "object" && Object.hasOwn(req.body, "monitor")) {
+        throw unprocessable(TOP_LEVEL_MONITOR_MESSAGE, {
+          code: "issue_monitor_requires_execution_policy",
+          field: "monitor",
+          expected: "executionPolicy.monitor",
+        });
+      }
       if (req.body?.expectedStatusVersion !== undefined && (
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")

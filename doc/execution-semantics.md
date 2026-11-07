@@ -510,6 +510,12 @@ without submitted values. Correct the arguments and retry; the rejection is not
 evidence that the scheduling service is unavailable. Confirm the persisted
 receipt before reporting a scheduled wait.
 
+The REST route uses a different shape. `PATCH /api/issues/{id}` takes a monitor
+only inside `executionPolicy.monitor`. A top-level `monitor` field returns 422
+with code `issue_monitor_requires_execution_policy` and changes nothing: no
+field update, comment or wake. Without this check the field was dropped and the
+request returned 200 with no monitor scheduled.
+
 Native `call_api` text windows use `responseText.limitBytes` from 4 through
 24576 bytes, with a default of 24576. Follow `nextOffsetBytes` until it is null.
 Rejected API fallback arguments return the same bounded schema locations as
