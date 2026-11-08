@@ -152,6 +152,16 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/agents\/me\/secrets$/ },
   { method: "POST", path: /^\/api\/agents\/me\/secrets\/[^/]+\/value$/ },
 
+  // Secret proposals. The Paperclip skill tells an agent to propose each
+  // credential it receives instead of writing it anywhere. The controller
+  // requires the run-bound agent token, adds the value to the run's log
+  // redaction, never returns the value, and stores nothing as a secret until
+  // the board approves. Board approve/reject and company secret management stay
+  // denied.
+  { method: "POST", path: /^\/api\/agents\/me\/secret-proposals$/ },
+  { method: "GET", path: /^\/api\/agents\/me\/secret-proposals$/ },
+  { method: "DELETE", path: /^\/api\/agents\/me\/secret-proposals\/[^/]+$/ },
+
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
 

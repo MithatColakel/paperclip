@@ -1695,6 +1695,9 @@ describe("sandbox callback bridge", () => {
       { method: "DELETE", path: "/api/routine-triggers/t-1" },
       { method: "GET", path: "/api/agents/me/secrets" },
       { method: "POST", path: "/api/agents/me/secrets/APP_DB/value" },
+      { method: "POST", path: "/api/agents/me/secret-proposals" },
+      { method: "GET", path: "/api/agents/me/secret-proposals" },
+      { method: "DELETE", path: "/api/agents/me/secret-proposals/proposal-1" },
     ];
     for (const request of allowed) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
@@ -1746,7 +1749,15 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/agents/me/secrets" },
       { method: "POST", path: "/api/agents/me/secrets/APP_DB/value/extra" },
       { method: "GET", path: "/api/agents/agent-1/secrets" },
-      { method: "POST", path: "/api/agents/me/secret-proposals" },
+      // Proposals: only the agent's own list, create and withdraw. The board's
+      // approve/reject routes and other agents' proposals stay denied.
+      { method: "PATCH", path: "/api/agents/me/secret-proposals/proposal-1" },
+      { method: "GET", path: "/api/agents/me/secret-proposals/proposal-1" },
+      { method: "DELETE", path: "/api/agents/me/secret-proposals" },
+      { method: "POST", path: "/api/agents/agent-1/secret-proposals" },
+      { method: "GET", path: "/api/companies/co-1/secret-proposals" },
+      { method: "POST", path: "/api/companies/co-1/secret-proposals/proposal-1/approve" },
+      { method: "POST", path: "/api/companies/co-1/secret-proposals/proposal-1/reject" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
