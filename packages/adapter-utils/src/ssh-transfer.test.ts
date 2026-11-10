@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { Transform } from "node:stream";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -319,6 +319,56 @@ describe("SSH workspace transfer", () => {
     expect(await readFile(path.join(localDir, "keep.txt"), "utf8")).toBe("local\n");
     expect(await exists(path.join(localDir, "big.bin"))).toBe(false);
   }, 15_000);
+
+  it("keeps a relative symlink relative when it pulls a directory back", async () => {
+    await useFakeSsh("local");
+    const remoteDir = await tempDir("paperclip-ssh-links-remote-");
+    await mkdir(path.join(remoteDir, "App"), { recursive: true });
+    await mkdir(path.join(remoteDir, "MacApp", "Resources"), { recursive: true });
+    await writeFile(path.join(remoteDir, "App", "Strings.xcstrings"), "{}\n", "utf8");
+    await symlink("../../App/Strings.xcstrings", path.join(remoteDir, "MacApp", "Resources", "Strings.xcstrings"));
+    const localDir = await tempDir("paperclip-ssh-links-local-");
+
+    await syncDirectoryFromSsh({ spec: spec(remoteDir), remoteDir, localDir });
+
+    const link = path.join(localDir, "MacApp", "Resources", "Strings.xcstrings");
+    // Not an absolute path into the staging directory, which is gone by now.
+    await expect(readlink(link)).resolves.toBe("../../App/Strings.xcstrings");
+    await expect(readFile(link, "utf8")).resolves.toBe("{}\n");
+  });
+
+  it("keeps a committed relative symlink relative across a git-backed restore", async () => {
+    await useFakeSsh("local");
+    const localDir = await gitWorkspace();
+    await mkdir(path.join(localDir, "MacApp", "Resources"), { recursive: true });
+    await symlink("../../app.swift", path.join(localDir, "MacApp", "Resources", "app.swift"));
+    git(localDir, "add", ".");
+    git(localDir, "commit", "-q", "-m", "link");
+    const remoteRoot = await tempDir("paperclip-ssh-remote-");
+    const remoteDir = path.join(remoteRoot, "workspace");
+    const target = spec(remoteRoot);
+
+    const prepared = await prepareWorkspaceForSshExecution({ spec: target, localDir, remoteDir });
+    const baselineSnapshot = await captureDirectorySnapshot(localDir, {
+      exclude: [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...prepared.ignoredPaths],
+    });
+    await writeFile(path.join(remoteDir, "app.swift"), "let a = 2\n", "utf8");
+
+    await restoreWorkspaceFromSshExecution({
+      spec: target,
+      localDir,
+      remoteDir,
+      baselineSnapshot,
+      ignoredPaths: prepared.ignoredPaths,
+      restoreGitHistory: true,
+    });
+
+    const link = path.join(localDir, "MacApp", "Resources", "app.swift");
+    await expect(readlink(link)).resolves.toBe("../../app.swift");
+    await expect(readFile(link, "utf8")).resolves.toBe("let a = 2\n");
+    // The link is unchanged, so the restore leaves nothing to commit for it.
+    expect(git(localDir, "status", "--porcelain", "--", "MacApp")).toBe("");
+  });
 
   it("leaves git-ignored build output out of the upload and the pull-back", async () => {
     await useFakeSsh("local");
