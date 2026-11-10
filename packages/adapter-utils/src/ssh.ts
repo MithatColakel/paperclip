@@ -749,6 +749,9 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      // Keep relative links as written. By default fs.cp rewrites them to
+      // absolute paths into sourceDir, a staging directory the caller deletes.
+      verbatimSymlinks: true,
     });
   }));
 }
