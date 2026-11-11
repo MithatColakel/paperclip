@@ -385,6 +385,23 @@ export async function githubGuestBotConnectionForSession(
   >,
 ): Promise<string | null> {
   if (!session.runId || !session.agentId || !session.issueId) return null;
+  // Only a GitHub chat endpoint assigned to this agent can make a run a
+  // sponsored guest run (the source query below requires one). Without one the
+  // answer is always null, so skip the identity-chain walk: it throws when a
+  // chain crosses tasks, and that throw would fail every tool listing and call
+  // of an agent whose runs continue work handed over from other tasks.
+  const [githubEndpoint] = await db
+    .select({ id: chatEndpoints.id })
+    .from(chatEndpoints)
+    .where(
+      and(
+        eq(chatEndpoints.companyId, session.companyId),
+        eq(chatEndpoints.assignedAgentId, session.agentId),
+        eq(chatEndpoints.provider, "github"),
+      ),
+    )
+    .limit(1);
+  if (!githubEndpoint) return null;
   const [run] = await db
     .select({
       id: heartbeatRuns.id,

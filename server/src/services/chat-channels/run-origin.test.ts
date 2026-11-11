@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issueComments, issues, runIdentityContexts } from "@paperclipai/db";
+import { agents, chatEndpoints, companies, createDb, heartbeatRuns, issueComments, issues, runIdentityContexts, toolApplications, toolConnections } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { boundRunIssueId, boundRunIssueIdSql } from "../run-task-binding.js";
 import { chatRunSourceMessageId } from "./run-origin.js";
+import { githubGuestBotConnectionForSession } from "../chat-github-tools.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("channel task provenance", () => {
@@ -113,6 +114,24 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(chatRunSourceMessageId(db, f.run)).rejects.toMatchObject({ status: 403 });
     },
   );
+
+  it("keeps tool listing open across tasks when the agent has no GitHub chat endpoint", async () => {
+    const f = await fixture();
+    const [other] = await db.insert(issues).values({ companyId: f.company.id, title: "Earlier task" }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status: "succeeded", nativeIssueId: other.id }).returning();
+    await db.update(runIdentityContexts).set({ runId: otherRun.id, messageId: null }).where(eq(runIdentityContexts.id, f.origin.id));
+    const session = { companyId: f.company.id, agentId: f.agent.id, runId: f.run.id, issueId: f.issue.id };
+    // The chain still crosses tasks: the provenance walk itself keeps refusing.
+    await expect(chatRunSourceMessageId(db, f.run, { provider: "github", allowLegacyWakeComment: true })).rejects.toMatchObject({ status: 403 });
+    // No GitHub endpoint for this agent: a guest restriction is impossible, so
+    // discovery gets "no guest bot" instead of a 403 for the whole listing.
+    expect(await githubGuestBotConnectionForSession(db, session)).toBeNull();
+    // With a GitHub endpoint the guest check still runs and still fails closed.
+    const [application] = await db.insert(toolApplications).values({ companyId: f.company.id, name: "GitHub bot", type: "mcp_http" }).returning();
+    const [connection] = await db.insert(toolConnections).values({ companyId: f.company.id, applicationId: application.id, name: "GitHub bot", uid: randomUUID(), transport: "mcp_remote" }).returning();
+    await db.insert(chatEndpoints).values({ companyId: f.company.id, connectionId: connection.id, assignedAgentId: f.agent.id, provider: "github", publicId: randomUUID(), status: "active" });
+    await expect(githubGuestBotConnectionForSession(db, session)).rejects.toMatchObject({ status: 403 });
+  });
 
   it.each(["native", "issue-column", "legacy-issue", "legacy-task"])("uses the same %s task binding in SQL and runtime authority", async source => {
     const f = await fixture();
