@@ -2114,6 +2114,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
+    // Fork: a closed task's queue is recovered only while it is recent. A
+    // cancelled task keeps its suppression (doc/execution-semantics.md), and a
+    // done task's feedback is replayed only within the orphaned sweep's age
+    // limit, which still covers a child that turned done just before a restart.
+    // Without this, the first boot after an upgrade started runs on tasks closed
+    // weeks earlier from their leftover deferred wakes (2026-11-11 rehearsal).
+    const closedQueueCutoff = new Date(Date.now() - ORPHANED_DEFERRED_WAKE_MAX_AGE_MS);
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
@@ -2123,6 +2130,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
+        ne(issues.status, "cancelled"),
+        or(ne(issues.status, "done"), gte(agentWakeupRequests.requestedAt, closedQueueCutoff)),
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,

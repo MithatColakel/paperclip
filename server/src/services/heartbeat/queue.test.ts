@@ -187,6 +187,36 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(deps.executeRun).not.toHaveBeenCalled();
   });
 
+  // Fork: leftover deferred wakes of closed tasks must not start runs after an upgrade.
+  it.each([
+    { issueStatus: "cancelled", ageHours: 1 },
+    { issueStatus: "cancelled", ageHours: 24 * 30 },
+    { issueStatus: "done", ageHours: 24 * 30 },
+  ])("leaves a stranded queue on a $issueStatus task deferred when it is $ageHours h old", async ({ issueStatus, ageHours }) => {
+    const { issue, pending } = await strandedMention();
+    await db.update(issues).set({ status: issueStatus }).where(eq(issues.id, issue.id));
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - ageHours * 60 * 60 * 1000) })
+      .where(eq(agentWakeupRequests.id, pending.id));
+    const deps = callbacks(db);
+    await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+    expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, pending.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
+  it("still resumes a recent stranded queue on a task that turned done", async () => {
+    const { run, issue, pending } = await strandedMention();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60 * 60 * 1000) })
+      .where(eq(agentWakeupRequests.id, pending.id));
+    const deps = callbacks(db);
+    await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+    expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: run.id }), { suppressImmediateRecovery: true, resumeStrandedQueue: true },
+    );
+  });
+
   it.each(["queued", "running", "scheduled_retry"])("does not replay a finishing owner while another agent has a %s turn", async status => {
     const { company, issue, recipient } = await strandedMention();
     await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: recipient.id, status, invocationSource: "assignment", contextSnapshot: { issueId: issue.id } });
