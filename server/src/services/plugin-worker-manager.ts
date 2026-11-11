@@ -273,8 +273,39 @@ const MAX_DUPLEX_CHANNEL_TOTAL_DATA_BYTES = 256 * 1024 * 1024;
  * The default maximum lifetime for one duplex channel route, in milliseconds.
  * The host starts a timer when the route opens and ends the route when the
  * timer expires, so a route cannot live without limit.
+ *
+ * Fork: a sandbox run (e.g. a Mac Fleet run) keeps one route for its whole
+ * life and reaches the Paperclip API through it, so the upstream 60-minute
+ * lifetime ended every run longer than an hour (`duplex_channel_lost`, the agent
+ * lost API access mid-run). The fork default is 6 hours; the operator may set
+ * `PAPERCLIP_DUPLEX_CHANNEL_MAX_DURATION_MS` (1 minute to 24 hours).
  */
-const MAX_DUPLEX_CHANNEL_DURATION_MS = 60 * 60 * 1000;
+export const DEFAULT_DUPLEX_CHANNEL_MAX_DURATION_MS = 6 * 60 * 60 * 1000;
+const MIN_DUPLEX_CHANNEL_MAX_DURATION_MS = 60 * 1000;
+const MAX_DUPLEX_CHANNEL_MAX_DURATION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Read the duplex channel route lifetime from its environment value. A missing,
+ * non-integer or out-of-range value falls back to the default, so a typo never
+ * removes the bound.
+ */
+export function resolveDuplexChannelMaxDurationMs(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed || !/^[0-9]+$/.test(trimmed)) return DEFAULT_DUPLEX_CHANNEL_MAX_DURATION_MS;
+  const value = Number(trimmed);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MIN_DUPLEX_CHANNEL_MAX_DURATION_MS ||
+    value > MAX_DUPLEX_CHANNEL_MAX_DURATION_MS
+  ) {
+    return DEFAULT_DUPLEX_CHANNEL_MAX_DURATION_MS;
+  }
+  return value;
+}
+
+const MAX_DUPLEX_CHANNEL_DURATION_MS = resolveDuplexChannelMaxDurationMs(
+  process.env.PAPERCLIP_DUPLEX_CHANNEL_MAX_DURATION_MS,
+);
 /** The default open timeout for one duplex channel route, in milliseconds. */
 const DUPLEX_CHANNEL_OPEN_TIMEOUT_MS = 30_000;
 /** The default close timeout for one duplex channel route, in milliseconds. */
