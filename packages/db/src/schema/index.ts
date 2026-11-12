@@ -18,6 +18,7 @@ export { companyUserSidebarPreferences } from "./company_user_sidebar_preference
 export { principalPermissionGrants } from "./principal_permission_grants.js";
 export { companySkillPolicies } from "./company_skill_policies.js";
 export { invites } from "./invites.js";
+export { userPasswordResetLinks } from "./user_password_reset_links.js";
 export { joinRequests } from "./join_requests.js";
 export { budgetPolicies } from "./budget_policies.js";
 export { budgetIncidents } from "./budget_incidents.js";

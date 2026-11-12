@@ -157,6 +157,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
+import { passwordResetLinkRoutes } from "./routes/password-reset-links.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import {
   mcpGatewayProtocolRoutes,
@@ -1090,6 +1091,8 @@ export async function createApp(
       authPublicBaseUrl: opts.authPublicBaseUrl,
     }),
   );
+  // Fork: owner-issued password reset links.
+  api.use(passwordResetLinkRoutes(db, { authPublicBaseUrl: opts.authPublicBaseUrl }));
   let publicMcpEvents: PublicMcpEvents | null = null;
   const grokDispatcher = createGrokRoutineDispatcher(db, () => !isWarmStandby() && !isIdleTaskDrainActive());
   let dotMcpEvents: PublicMcpEvents | null = null;

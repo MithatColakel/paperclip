@@ -2654,6 +2654,13 @@
       "when": 1792713116842,
       "tag": "0380_bored_ghost_rider",
       "breakpoints": true
+    },
+    {
+      "idx": 381,
+      "version": "7",
+      "when": 1794473991099,
+      "tag": "0381_rainy_jackpot",
+      "breakpoints": true
     }
   ]
 }

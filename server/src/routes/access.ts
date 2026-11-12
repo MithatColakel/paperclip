@@ -155,7 +155,7 @@ function requestBaseUrl(req: Request) {
   return `${proto}://${host}`;
 }
 
-function resolveBaseUrl(req: Request, authPublicBaseUrl?: string): string {
+export function resolveBaseUrl(req: Request, authPublicBaseUrl?: string): string {
   const runtimeOrigin = runtimeCanonicalOrigin();
   if (runtimeOrigin) return runtimeOrigin;
   if (authPublicBaseUrl) return authPublicBaseUrl.replace(/\/+$/, "");

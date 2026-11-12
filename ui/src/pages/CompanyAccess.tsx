@@ -34,6 +34,8 @@ import { PageTabBar } from "@/components/PageTabBar";
 import { useHiddenSettings } from "@/hooks/useHiddenSettings";
 import { useCloudInstance } from "@/hooks/useCloudInstance";
 import { InvitesSection } from "@/components/access/InvitesSection";
+import { MemberPasswordResetAction } from "@/components/access/MemberPasswordResetAction";
+import { passwordResetQueryKeys } from "@/api/passwordReset";
 
 const reassignmentIssueStatuses = "backlog,todo,in_progress,in_review,blocked,failed,timed_out";
 type EditableMemberStatus = "pending" | "active" | "suspended";
@@ -116,6 +118,7 @@ export function CompanyAccess() {
     await queryClient.invalidateQueries({ queryKey: queryKeys.access.companyMembers(selectedCompanyId) });
     await queryClient.invalidateQueries({ queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId) });
     await queryClient.invalidateQueries({ queryKey: queryKeys.access.joinRequests(selectedCompanyId, "pending_approval") });
+    await queryClient.invalidateQueries({ queryKey: passwordResetQueryKeys.access(selectedCompanyId) });
   };
 
   const updateMemberMutation = useMutation({
@@ -408,6 +411,9 @@ export function CompanyAccess() {
                         <Button size="sm" variant="outline" onClick={() => setEditingMemberId(member.id)}>
                           Edit
                         </Button>
+                        {selectedCompanyId ? (
+                          <MemberPasswordResetAction companyId={selectedCompanyId} member={member} />
+                        ) : null}
                         <span
                           className="inline-flex"
                           title={!canArchive ? removalReason ?? undefined : undefined}
