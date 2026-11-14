@@ -169,6 +169,7 @@ import {
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
+import { createUnchangedInputGate, loadRecoveryIssueChangeTokens } from "./unchanged-input-gate.js";
 import {
   createActiveRunWatchdog,
   WatchdogDecisionApplicationError,
@@ -1034,6 +1035,12 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * Fork: re-evaluate an issue whose recovery inputs did not change only
+     * after this long (see unchanged-input-gate.ts). 0 or unset evaluates
+     * every candidate on every sweep, as upstream does.
+     */
+    unchangedRecheckMs?: number;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -1041,6 +1048,18 @@ export function recoveryService(
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  const strandedIssueGate = createUnchangedInputGate({ recheckMs: deps.unchangedRecheckMs ?? 0 });
+  const activeRecoveryActionGate = createUnchangedInputGate({ recheckMs: deps.unchangedRecheckMs ?? 0 });
+  // A token read that fails must never stop recovery: fall back to evaluating
+  // every candidate for this pass, which is exactly the ungated behaviour.
+  async function loadChangeTokensOrEvaluateAll(issueIds: readonly string[], sweep: string) {
+    try {
+      return await loadRecoveryIssueChangeTokens(db, issueIds);
+    } catch (err) {
+      logger.warn({ err, sweep }, "recovery change tokens unavailable; evaluating every candidate");
+      return null;
+    }
+  }
 
   async function getAgent(agentId: string, database: DbOrTransaction = db) {
     return database
@@ -3579,9 +3598,22 @@ export function recoveryService(
       escalated: 0,
       resolved: 0,
       skipped: 0,
+      unchanged: 0,
       issueIds: [] as string[],
     };
-    for (const { action, issue } of rows) {
+    // Fork: an action whose row and source-issue inputs are unchanged is
+    // re-evaluated only after the recheck interval (unchanged-input-gate.ts).
+    const sourceTokens = activeRecoveryActionGate.enabled
+      ? await loadChangeTokensOrEvaluateAll(rows.map(({ issue }) => issue.id), "active recovery actions")
+      : null;
+    const actionToken = (action: typeof issueRecoveryActions.$inferSelect, issueId: string) =>
+      sourceTokens?.has(issueId)
+        ? `${action.updatedAt.toISOString()}|${action.status}|${action.ownerType}|${sourceTokens.get(issueId)}`
+        : undefined;
+    const dueRows = rows.filter(({ action, issue }) =>
+      activeRecoveryActionGate.isDue(action.id, actionToken(action, issue.id)));
+    result.unchanged = rows.length - dueRows.length;
+    for (const { action, issue } of dueRows) {
       if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, action)) {
         result.skipped += 1;
         continue;
@@ -3713,6 +3745,12 @@ export function recoveryService(
       // longer schedules another agent-owned wake for them.
       result.skipped += 1;
     }
+    // Recorded only after the whole pass settled: an action whose evaluation
+    // threw is evaluated again on the next sweep.
+    for (const { action, issue } of dueRows) {
+      activeRecoveryActionGate.record(action.id, actionToken(action, issue.id));
+    }
+    activeRecoveryActionGate.retainOnly(rows.map(({ action }) => action.id));
     return result;
   }
 
@@ -4689,6 +4727,7 @@ export function recoveryService(
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
       skipped: 0,
+      unchangedSkipped: 0,
       issueIds: [] as string[],
     };
 
@@ -4716,7 +4755,16 @@ export function recoveryService(
       }
     }
 
-    for (const issue of candidates) {
+    // Fork: skip candidates whose recovery inputs did not change since their
+    // last evaluation, until the recheck interval passes (unchanged-input-gate.ts).
+    const candidateTokens = strandedIssueGate.enabled
+      ? await loadChangeTokensOrEvaluateAll(candidateIssueIds, "stranded issues")
+      : null;
+    const dueCandidates = candidates.filter((issue) =>
+      strandedIssueGate.isDue(issue.id, candidateTokens?.get(issue.id)));
+    result.unchangedSkipped = candidates.length - dueCandidates.length;
+
+    for (const issue of dueCandidates) {
       if (issue.originKind === "chat_channel") {
         await settleSlackConversation(db, issue.companyId, issue.id);
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
@@ -5879,6 +5927,13 @@ export function recoveryService(
         result.skipped += 1;
       }
     }
+
+    // Recorded only after every due candidate settled: a pass that threw part
+    // way leaves no memo, so its candidates are all evaluated next sweep.
+    for (const issue of dueCandidates) {
+      strandedIssueGate.record(issue.id, candidateTokens?.get(issue.id));
+    }
+    strandedIssueGate.retainOnly(candidateIssueIds);
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;

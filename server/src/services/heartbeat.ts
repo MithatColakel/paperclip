@@ -967,6 +967,8 @@ export function heartbeatService(
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    // Fork: read once; unset keeps upstream behaviour (every sweep evaluates every candidate).
+    unchangedRecheckMs: Number(process.env.PAPERCLIP_RECOVERY_UNCHANGED_RECHECK_MS) || 0,
   });
   const runDispatch = createRunDispatch(db);
   // Fork: resource waits (spec 7, 8) and the Claude account pool's run path
