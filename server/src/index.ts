@@ -130,6 +130,7 @@ import {
   createDeviceLoginReaper,
   createProductionLoginSessionReaperRuntime,
 } from "./services/device-login-reaper.js";
+import { createMinIntervalGate } from "./services/min-interval-gate.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
@@ -1750,6 +1751,15 @@ async function startServerWithDatabaseTeardown(
       const notifications = await retentionExecutor.deliverNotifications();
       return { archived, ...notifications };
     };
+    // Fork: auto-archive only acts on items idle for 90 days, yet each pass
+    // rebuilds every active company's attention feed. The tick asks every 30 s;
+    // PAPERCLIP_RETENTION_SWEEP_INTERVAL_MS spaces the passes out (unset: every
+    // tick, as upstream). The startup pass always runs and starts the interval.
+    const retentionSweepGate = createMinIntervalGate({
+      intervalMs: Number(process.env.PAPERCLIP_RETENTION_SWEEP_INTERVAL_MS) || 0,
+    });
+    const runRetentionSweepWhenDue = async () =>
+      retentionSweepGate.tryStart() ? runRetentionSweep() : null;
     // Startup housekeeping: provider and connection sweeps that every timer tick
     // repeats and that neither serving requests nor run recovery depends on.
     // Readiness does not wait for it. It is tracked as scheduler work, so idle
@@ -1782,7 +1792,7 @@ async function startServerWithDatabaseTeardown(
       // Retry any orphan sandbox teardown left by a failed acquire before a
       // server restart, so a leaked sandbox does not stay allocated.
       await step("environment_lease_cleanup", () => runEnvironmentLeaseCleanupSweep(0));
-      await step("retention_sweep", runRetentionSweep);
+      await step("retention_sweep", runRetentionSweepWhenDue);
     };
 
     const createHeartbeatSchedulerTick = (scheduled: ReturnType<typeof registerScheduledWork>) => () => {
@@ -1795,7 +1805,7 @@ async function startServerWithDatabaseTeardown(
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
+        trackHeartbeatSchedulerWork(runRetentionSweepWhenDue().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
