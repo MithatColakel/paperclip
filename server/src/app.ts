@@ -230,10 +230,14 @@ import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
+import { createChatReconciliationGate, isChatChannelStateSignal } from "./services/chat-reconciliation-gate.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
 const CHAT_PUBLICATION_FLUSH_INTERVAL_MS = 1_000;
+// Fork: how long an instance without chat channels waits between existence
+// checks when no tool connection change woke the gate first.
+const CHAT_CHANNEL_STATE_RECHECK_MS = 30_000;
 const VITE_DEV_ASSET_PREFIXES = [
   "/@fs/",
   "/@id/",
@@ -1339,9 +1343,25 @@ export async function createApp(
       logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
     },
   });
+  // Fork: with no chat endpoint and no live provider runtime, the per-second
+  // lanes below only re-plan empty multi-join queries. The gate keeps the tick
+  // quiet until a channel exists; a tool connection change rechecks at once.
+  const chatReconciliationGate = createChatReconciliationGate({
+    hasChannelState: () => chatChannels.hasReconcilableChannelState(),
+    recheckMs: CHAT_CHANNEL_STATE_RECHECK_MS,
+    onError: (err) => {
+      logger.warn({ err }, "Chat channel state check failed; reconciling anyway");
+    },
+  });
   const unsubscribeChatPublicationSignals = subscribeAllCompanyLiveEvents(
     (event) => {
-      if (!isWarmStandby() && !isIdleTaskDrainActive() && isChatPublicationCommitSignal(event))
+      if (isChatChannelStateSignal(event)) chatReconciliationGate.wake();
+      if (
+        !isWarmStandby() &&
+        !isIdleTaskDrainActive() &&
+        isChatPublicationCommitSignal(event) &&
+        chatReconciliationGate.mayHaveChannels()
+      )
         chatReconciliation.notifyPublications();
     },
   );
@@ -1349,7 +1369,8 @@ export async function createApp(
   // Inbox, outbox, and file receipt queues have independent commit/deadline wakes.
   let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
-      if (!isWarmStandby() && !isIdleTaskDrainActive()) chatReconciliation.reconcile();
+      if (!isWarmStandby() && !isIdleTaskDrainActive())
+        chatReconciliationGate.tick(() => chatReconciliation.reconcile());
     },
     CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
   );
@@ -1486,6 +1507,7 @@ export async function createApp(
       await deliveryWork.stop();
       unsubscribeChatPublicationSignals();
       stopPluginResourceWaitWakes(); // Fork: plugin start wakes.
+      chatReconciliationGate.stop();
       chatReconciliation.stop();
       if (chatPublicationTimer) {
         clearInterval(chatPublicationTimer);

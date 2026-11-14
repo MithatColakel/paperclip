@@ -1126,6 +1126,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
+  /**
+   * Fork: whether the periodic chat reconciliation has anything to read.
+   * Every lane starts from chat endpoint rows; a Discord Gateway ownership
+   * held in memory still needs the teardown pass after its endpoint is gone.
+   * Instance-wide existence only: no row data leaves this check.
+   */
+  async function hasReconcilableChannelState() {
+    if (discordGatewayOwnerships.size > 0) return true;
+    const [row] = await db.select({ id: chatEndpoints.id }).from(chatEndpoints).limit(1);
+    return row !== undefined;
+  }
+
   async function reconcileProviderRuntimes() {
     if (shuttingDown) {
       return { eligible: 0, local: 0, ownedElsewhere: 0, failed: 0 };
@@ -3501,6 +3513,7 @@ return {
     publishComment,
     getPublicationBatchStatus,
     publishBoardMessage,
+    hasReconcilableChannelState,
     reconcileProviderRuntimes,
     processPendingPublications,
     enqueueInboundWakeupPublications,
