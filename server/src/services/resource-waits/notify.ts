@@ -5,6 +5,7 @@ import {
   aiAccountAgentBindings,
   aiAccountHosts,
   aiAccounts,
+  deviceLoginLimits,
   environmentAvailability,
   environments,
   executionWaitSettings,
@@ -232,7 +233,9 @@ export function resourceWaitPmNoticeMarkdown(context: Record<string, unknown> | 
   const label = typeof resourceLabel === "string" && resourceLabel.trim() ? resourceLabel.trim().slice(0, 120) : null;
   const resource = kind === "ai_account"
     ? label && label !== HIDDEN_ACCOUNT_TEXT ? `the Claude account "${label}"` : `a Claude account that is no longer available in this company`
-    : kind === "device_slots"
+    : kind === "device_login"
+      ? `the device's own Claude login on "${label ?? "unknown"}"`
+      : kind === "device_slots"
       ? `a free account slot on the device "${label ?? "unknown"}"`
       : `the device "${label ?? "unknown"}"`;
   const reasonText = typeof reason === "string" ? resourceWaitReasonLabel(reason) : "unavailable";
@@ -262,6 +265,8 @@ interface NoticeFacts {
   accountLabel: string | null;
   unavailableSince: Date | null;
   currentRun: { id: string; status: string; contextSnapshot: Record<string, unknown> | null } | null;
+  /** A device-login wait's limit episode start (`device_login_limits`), else null. */
+  loginLimitEpisodeStartedAt: Date | null;
 }
 
 function deviceText(facts: NoticeFacts): string {
@@ -289,6 +294,20 @@ function immediateBody(facts: NoticeFacts): { title: string; tone: IssueCommentP
     ? ` Resumes automatically at **${formatUtc(episode.resumeAt)}** (${episode.resumeAtSource === "provider" ? "provider reset" : "estimated"}).`
     : " Resumes automatically when the limit resets.";
   const startsWhenFixed = "This task starts automatically once that is done.";
+  if (episode.kind === "device_login") {
+    // The device's own login: no pool account, so nobody can clear the limit in Claude accounts.
+    return episode.reason === "credit_balance"
+      ? {
+        title: "Waiting for API credit",
+        tone: "info",
+        body: `Waiting for the Claude login on ${device}: no API credit left.${resumes} Paperclip never moves a task to another account. Add credit on that login; Check now tries again at once.`,
+      }
+      : {
+        title: "Waiting for a usage limit to reset",
+        tone: "info",
+        body: `Waiting for the Claude login on ${device}: usage limit reached.${resumes} Paperclip never moves a task to another account. Check now tries again at once.`,
+      };
+  }
   switch (episode.reason) {
     case "usage_limit":
       return {
@@ -363,6 +382,10 @@ async function loadFacts(db: Db, episode: ResourceWaitEpisodeRow, deploymentMode
     ? await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, episode.currentRunId), eq(heartbeatRuns.companyId, episode.companyId)))
     : [];
+  const [loginLimit] = episode.kind === "device_login" && episode.environmentId
+    ? await db.select({ limitEpisodeStartedAt: deviceLoginLimits.limitEpisodeStartedAt }).from(deviceLoginLimits)
+      .where(and(eq(deviceLoginLimits.environmentId, episode.environmentId), eq(deviceLoginLimits.companyId, episode.companyId)))
+    : [];
   return {
     episode,
     agent: agent ?? null,
@@ -373,6 +396,7 @@ async function loadFacts(db: Db, episode: ResourceWaitEpisodeRow, deploymentMode
     accountLabel: account && ownerIsMember && episode.reason !== "owner_not_member" ? account.label : null,
     unavailableSince: registry?.state === "unavailable" ? registry.unavailableSince ?? null : null,
     currentRun: currentRun ?? null,
+    loginLimitEpisodeStartedAt: loginLimit?.limitEpisodeStartedAt ?? null,
   };
 }
 
@@ -399,7 +423,9 @@ export function resourceEpisodeKeyOf(facts: ResourceEpisodeFacts): string {
 function resourceEpisodeKeyFromFacts(facts: NoticeFacts): string {
   return resourceEpisodeKeyOf({
     episode: facts.episode,
-    limitEpisodeStartedAt: facts.account?.limitEpisodeStartedAt ?? null,
+    limitEpisodeStartedAt: facts.episode.kind === "device_login"
+      ? facts.loginLimitEpisodeStartedAt
+      : facts.account?.limitEpisodeStartedAt ?? null,
     overLimitAt: facts.device?.overLimitAt ?? null,
     unavailableSince: facts.unavailableSince,
   });
@@ -421,6 +447,13 @@ export async function resourceEpisodeKeys(db: Db, episodes: readonly ResourceWai
   const devices = new Map((deviceIds.length > 0
     ? await db.select({ id: aiAccountHosts.id, overLimitAt: aiAccountHosts.overLimitAt }).from(aiAccountHosts).where(inArray(aiAccountHosts.id, deviceIds))
     : []).map((row) => [row.id, row]));
+  const loginEnvironmentIds = [...new Set(episodes
+    .filter((episode) => episode.kind === "device_login" && episode.environmentId)
+    .map((episode) => episode.environmentId as string))];
+  const loginLimits = new Map((loginEnvironmentIds.length > 0
+    ? await db.select({ environmentId: deviceLoginLimits.environmentId, limitEpisodeStartedAt: deviceLoginLimits.limitEpisodeStartedAt })
+      .from(deviceLoginLimits).where(inArray(deviceLoginLimits.environmentId, loginEnvironmentIds))
+    : []).map((row) => [row.environmentId, row]));
   const registry = new Map((environmentIds.length > 0
     ? await db.select({ environmentId: environmentAvailability.environmentId, state: environmentAvailability.state, unavailableSince: environmentAvailability.unavailableSince })
       .from(environmentAvailability).where(inArray(environmentAvailability.environmentId, environmentIds))
@@ -430,7 +463,9 @@ export async function resourceEpisodeKeys(db: Db, episodes: readonly ResourceWai
     const row = episode.environmentId ? registry.get(episode.environmentId) : undefined;
     keys.set(episode.id, resourceEpisodeKeyOf({
       episode,
-      limitEpisodeStartedAt: (episode.accountId ? accounts.get(episode.accountId)?.limitEpisodeStartedAt : null) ?? null,
+      limitEpisodeStartedAt: episode.kind === "device_login"
+        ? (episode.environmentId ? loginLimits.get(episode.environmentId)?.limitEpisodeStartedAt : null) ?? null
+        : (episode.accountId ? accounts.get(episode.accountId)?.limitEpisodeStartedAt : null) ?? null,
       overLimitAt: (episode.deviceId ? devices.get(episode.deviceId)?.overLimitAt : null) ?? null,
       unavailableSince: row?.state === "unavailable" ? row.unavailableSince ?? null : null,
     }));
@@ -499,6 +534,14 @@ export function createResourceWaitNotifier(options: ResourceWaitNotifierOptions)
       if (!episode.accountId) return false;
       const binding = await bindingOfPm();
       return binding?.mode === "pool_account" && binding.accountId === episode.accountId;
+    }
+    if (episode.kind === "device_login") {
+      // A PM on the same environment's own login waits for the same reset.
+      if (!episode.environmentId) return false;
+      const binding = await bindingOfPm();
+      if (binding?.mode === "pool_account") return false;
+      const pmEnvironment = await resolveRunEnvironment(db, { companyId: pm.companyId, agent: pm }, policy).catch(() => null);
+      return pmEnvironment?.environment.id === episode.environmentId;
     }
     const resolved = await resolveRunEnvironment(db, { companyId: pm.companyId, agent: pm }, policy).catch(() => null);
     if (!resolved) return false;

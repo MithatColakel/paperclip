@@ -2,6 +2,7 @@ import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql 
 import {
   type Db,
   aiAccounts,
+  deviceLoginLimits,
   environmentAvailability,
   environments,
   heartbeatRuns,
@@ -288,7 +289,23 @@ export function createSweep(runtime: SweepRuntime) {
         )`,
       ))
       .returning({ id: aiAccounts.id });
-    return rows.length;
+    // Fork: the same release for a device login's probe.
+    const loginRows = await db
+      .update(deviceLoginLimits)
+      .set({ limitProbeRunId: null })
+      .where(and(
+        isNotNull(deviceLoginLimits.limitProbeRunId),
+        sql`not exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.id} = ${deviceLoginLimits.limitProbeRunId}
+            and (
+              ${heartbeatRuns.status} = 'running'
+              or (${heartbeatRuns.status} in ('queued', 'scheduled_retry') and ${heartbeatRuns.updatedAt} >= ${startedBy}::timestamptz)
+            )
+        )`,
+      ))
+      .returning({ environmentId: deviceLoginLimits.environmentId });
+    return rows.length + loginRows.length;
   }
 
   async function abandonEndedEpisodes(now: Date): Promise<number> {

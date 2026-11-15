@@ -15,7 +15,7 @@ export const resourceWaitEpisodes = pgTable("resource_wait_episodes", {
   companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
   agentId: uuid("agent_id").notNull(),
   issueId: uuid("issue_id"),
-  kind: text("kind").$type<"environment" | "ai_account" | "device_slots">().notNull(),
+  kind: text("kind").$type<"environment" | "ai_account" | "device_slots" | "device_login">().notNull(),
   reason: text("reason").notNull(),
   scope: text("scope").$type<"target" | "admission" | "account" | "device">().notNull(),
   /** `environment:<id>`, `account:<id>` or `device:<id>`. */
@@ -49,7 +49,7 @@ export const resourceWaitEpisodes = pgTable("resource_wait_episodes", {
   // delete scans the (never pruned) episodes table.
   index("resource_wait_episodes_company_issue_idx").on(t.companyId, t.issueId),
   index("resource_wait_episodes_company_agent_idx").on(t.companyId, t.agentId),
-  check("resource_wait_episodes_kind_check", sql`${t.kind} in ('environment','ai_account','device_slots')`),
+  check("resource_wait_episodes_kind_check", sql`${t.kind} in ('environment','ai_account','device_slots','device_login')`),
   check("resource_wait_episodes_scope_check", sql`${t.scope} in ('target','admission','account','device')`),
   check("resource_wait_episodes_resume_at_source_check", sql`${t.resumeAtSource} is null or ${t.resumeAtSource} in ('provider','estimated','check')`),
   check("resource_wait_episodes_resolution_check", sql`${t.resolution} is null or ${t.resolution} in ('resolved','superseded','abandoned','refused')`),

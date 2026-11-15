@@ -2661,6 +2661,13 @@
       "when": 1794473991099,
       "tag": "0381_rainy_jackpot",
       "breakpoints": true
+    },
+    {
+      "idx": 382,
+      "version": "7",
+      "when": 1794753373998,
+      "tag": "0382_loving_leo",
+      "breakpoints": true
     }
   ]
 }

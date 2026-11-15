@@ -270,6 +270,7 @@ import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnection
 import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
 // Fork: Claude account pool and resource waits (spec v3 §4, §7, §8). The logic lives in these modules.
 import { createHeartbeatAiAccounts, isPersistedNativeRun, isRoutingCheckUnavailable, ownPoolAttribution } from "./heartbeat-ai-accounts.js";
+import { createHeartbeatDeviceLogin } from "./heartbeat-device-login.js";
 import { createResourceWaits, isResourceWaitDeferral, type CheckNowSource, type ResourceWaitWakeFilter, type ResourceWaitWakeOptions } from "./resource-waits/index.js";
 import {
   getExecutionBlocker,
@@ -996,6 +997,7 @@ export function heartbeatService(
   const heartbeatAiAccounts = createHeartbeatAiAccounts({
     db,
     resourceWaits,
+    deviceLogin: createHeartbeatDeviceLogin({ db, resourceWaits }),
     deps: {
       appendRunEvent: (run, event) => appendRunEvent(run, event),
       scheduleBoundedRetryForRun: (run, agent, opts) => scheduleBoundedRetryForRun(run, agent, opts),

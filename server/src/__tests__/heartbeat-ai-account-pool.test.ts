@@ -18,6 +18,7 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  deviceLoginLimits,
   resourceWaitEpisodes,
 } from "@paperclipai/db";
 import { AI_CREDENTIAL_REF_ENV_KEY, readResourceWaitContext } from "@paperclipai/shared";
@@ -776,6 +777,67 @@ describeEmbeddedPostgres("heartbeat Claude account pool (integration)", () => {
       expect(invocations.length).toBeGreaterThanOrEqual(2);
       expect(invocations.every((call) => call.env.CLAUDE_CODE_OAUTH_TOKEN === limitedAccount.token)).toBe(true);
       expect(invocations.some((call) => call.env.CLAUDE_CODE_OAUTH_TOKEN === spare.token)).toBe(false);
+    }, 120_000);
+  });
+
+  describe("an agent on its device's own login", () => {
+    it("waits for the login's typed reset, starts no provider work for its other tasks, and resumes them after a served probe", async () => {
+      const companyId = await company();
+      const environment = await sshEnvironment(companyId);
+      // No binding row: the agent runs on the SSH user's own Claude login.
+      const worker = await agent(companyId, { name: "Mac builder", defaultEnvironmentId: environment.id });
+      const first = await issue(companyId, worker.id);
+      const second = await issue(companyId, worker.id);
+      heartbeat = heartbeatService(db);
+      const workerCalls = () => invocations.filter((call) => call.agentId === worker.id);
+      const reset = new Date(Date.now() + 20 * HOUR);
+      script(worker.id, usageLimit(reset), finishTask, finishTask);
+
+      const run = await assign(worker.id, first.id);
+      expect(await finishedRun(run.id)).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+      const firstWait = await successorOf(run.id);
+      expect(firstWait).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "device_login_wait" });
+      expect(firstWait.contextSnapshot).toMatchObject({
+        resourceWait: { kind: "device_login", reason: "usage_limit", environmentId: environment.id, resumeAtSource: "provider" },
+      });
+      const [limit] = await db.select().from(deviceLoginLimits).where(eq(deviceLoginLimits.environmentId, environment.id));
+      expect(limit).toMatchObject({ companyId, exhaustedUntil: reset, limitSource: "provider", limitStrikes: 1 });
+      // The upstream provider-quota monitor is not armed: the wait lane owns the task.
+      const [firstTask] = await db.select().from(issues).where(eq(issues.id, first.id));
+      expect(firstTask!.monitorNextCheckAt).toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      // The agent's other task waits for the same login without starting the CLI.
+      const secondRun = await assign(worker.id, second.id);
+      expect(await finishedRun(secondRun.id)).toMatchObject({ status: "cancelled", errorCode: "device_login_limited" });
+      expect(await successorOf(secondRun.id)).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "device_login_wait" });
+      expect(workerCalls()).toHaveLength(1);
+      for (const minutes of [6, 60, 600]) {
+        await tick(new Date(Date.now() + minutes * 60_000));
+        expect(workerCalls()).toHaveLength(1);
+      }
+
+      // The reset passes: exactly one waiting run probes the login, and the provider serves it.
+      const past = new Date(Date.now() - 1_000);
+      await db.update(deviceLoginLimits).set({ exhaustedUntil: past }).where(eq(deviceLoginLimits.environmentId, environment.id));
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: past })
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "scheduled_retry")));
+      await tick();
+      expect(workerCalls()).toHaveLength(2);
+      const [cleared] = await db.select().from(deviceLoginLimits).where(eq(deviceLoginLimits.environmentId, environment.id));
+      expect(cleared).toMatchObject({ exhaustedUntil: null, limitStrikes: 0, limitProbeRunId: null });
+      // The other task was woken (staggered by up to 2 minutes) and runs on the same login.
+      await tick(new Date(Date.now() + 3 * 60_000));
+      expect(workerCalls()).toHaveLength(3);
+      expect(workerCalls().every((call) => call.env.CLAUDE_CODE_OAUTH_TOKEN === undefined)).toBe(true);
+      expect((await db.select().from(issues).where(eq(issues.companyId, companyId))).map((row) => row.status).sort())
+        .toEqual(["done", "done"]);
+      for (const task of [first, second]) {
+        const notices = await systemNotices(task.id);
+        expect(notices.filter((notice) => notice.body.includes("Claude login on") && notice.body.includes("usage limit reached"))).toHaveLength(1);
+        expect(await episodeOf(task.id)).toMatchObject({ kind: "device_login", resolution: "resolved" });
+      }
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "device_login.limit_reached"))).toHaveLength(1);
     }, 120_000);
   });
 

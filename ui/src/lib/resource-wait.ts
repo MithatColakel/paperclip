@@ -2,7 +2,8 @@
  * Fork: how a resource wait reads in the UI. A run whose execution device,
  * Claude account or device account slots are unavailable is cancelled as an
  * expected deferral (no provider work started) and a successor waits in one
- * of three scheduled-retry lanes. It starts automatically when the resource
+ * of four scheduled-retry lanes (the fourth: the usage limit of a device's
+ * own Claude login). It starts automatically when the resource
  * is back, so nothing here is a failure: no failure toasts, neutral chat, and
  * copy that names the fix when a person has to act.
  */
@@ -97,6 +98,13 @@ const KIND_FALLBACK: Record<ResourceWaitKind, Omit<ResourceWaitCopy, "kind" | "r
     short: "account slots full",
     tone: "info",
   },
+  device_login: {
+    title: "Waiting for the device's Claude login",
+    detail: "Starts automatically when its usage limit resets.",
+    chip: "Waiting for limit reset",
+    short: "device login limit",
+    tone: "info",
+  },
 };
 
 function since(wait: ResourceWaitDisplay, now: Date): string {
@@ -135,6 +143,30 @@ export function describeResourceWait(
   const deviceChip = device ? `Waiting for device: ${device}` : "Waiting for device";
   const base = { kind: wait.kind, reason: wait.reason, tone };
   const moveHint = `To run it elsewhere, move ${agent} to another device.`;
+
+  if (wait.kind === "device_login") {
+    // Fork: the device's own login, not a pool account; nobody clears its limit in Claude accounts.
+    const reset = formatResetTime(wait.resumeAt, { now, estimated: isEstimatedSource(wait.resumeAtSource) });
+    const login = `the Claude login on ${deviceName}`;
+    if (wait.reason === "credit_balance") {
+      return {
+        ...base,
+        title: `Waiting for ${login}: no API credit left`,
+        detail: reset
+          ? `Resumes automatically at ${reset}. After adding credit there, Check now tries again at once.`
+          : "Add credit on that login; Check now tries again at once.",
+        chip: reset ? `Waiting for limit reset: ${reset}` : "Waiting for API credit",
+        short: "no API credit",
+      };
+    }
+    return {
+      ...base,
+      title: reset ? `Waiting for ${login}: the usage limit resets at ${reset}` : `Waiting for ${login}: usage limit reached`,
+      detail: "Resumes automatically. Paperclip never moves a task to another account; Check now tries again at once.",
+      chip: reset ? `Waiting for limit reset: ${reset}` : "Waiting for limit reset",
+      short: "device login limit",
+    };
+  }
 
   switch (wait.reason) {
     // Device or connection down (target scope).
@@ -301,6 +333,7 @@ const LANE_LABELS: Record<ResourceWaitRetryReason, string> = {
   environment_wait: "Waiting for device",
   ai_account_wait: "Waiting for Claude account",
   device_slot_wait: "Waiting for account slot",
+  device_login_wait: "Waiting for limit reset",
 };
 
 export function resourceWaitLaneLabel(reason: string | null | undefined): string | null {
@@ -311,6 +344,7 @@ const RESUMED_DETAIL: Record<ResourceWaitRetryReason, string> = {
   environment_wait: "Started after waiting for its device",
   ai_account_wait: "Started after waiting for its Claude account",
   device_slot_wait: "Started after waiting for an account slot",
+  device_login_wait: "Started after its device's Claude login reset",
 };
 
 export type ResourceWaitCheckNowTone = "neutral" | "success" | "error";
@@ -425,8 +459,8 @@ function partialContext(kind: ResourceWaitKind): ResourceWaitContext {
     version: 1,
     episodeId: "",
     kind,
-    reason: kind === "device_slots" ? "slots_full" : "other",
-    scope: kind === "environment" ? "target" : kind === "ai_account" ? "account" : "device",
+    reason: kind === "device_slots" ? "slots_full" : kind === "device_login" ? "usage_limit" : "other",
+    scope: kind === "environment" ? "target" : kind === "ai_account" || kind === "device_login" ? "account" : "device",
     environmentId: null,
     environmentName: null,
     deviceId: null,

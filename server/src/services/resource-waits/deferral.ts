@@ -130,7 +130,7 @@ export function waitDelayMs(input: WaitDelayInput): number {
         // not_allowed, not_serving, stopped, plugin_upgrade_pending: a plugin wake usually ends these first.
         delay = untilRetryAfter ?? doubling(timings.admissionSlowBaseMs, timings.admissionSlowMaxMs, input.episode.checks);
     }
-  } else if (wait.kind === "ai_account" && (wait.reason === "usage_limit" || wait.reason === "credit_balance")) {
+  } else if ((wait.kind === "ai_account" || wait.kind === "device_login") && (wait.reason === "usage_limit" || wait.reason === "credit_balance")) {
     delay = wait.resumeAt ? wait.resumeAt.getTime() - now.getTime() : jittered(timings.recheckMs, input.random);
   } else if (wait.kind === "ai_account" && wait.reason === "auth_unconfirmed") {
     delay = timings.authUnconfirmedMs;
@@ -198,6 +198,8 @@ export function describeWaitShort(wait: ResourceWaitTarget): string {
         : `Waiting for a Claude account (${resourceWaitReasonLabel(wait.reason)})`;
     case "device_slots":
       return `Waiting for an account slot on ${device}`;
+    case "device_login":
+      return `Waiting for the Claude login on ${device} (${resourceWaitReasonLabel(wait.reason)})`;
   }
 }
 
@@ -209,6 +211,8 @@ function waitingEventMessage(wait: ResourceWaitTarget): string {
       return `${describeWaitShort(wait)}. This task starts automatically when the account is available; Paperclip never moves it to another account.`;
     case "device_slots":
       return `${describeWaitShort(wait)}. This task starts automatically when one is free.`;
+    case "device_login":
+      return `${describeWaitShort(wait)}. This task starts automatically after the reset; Paperclip never moves it to another account.`;
   }
 }
 

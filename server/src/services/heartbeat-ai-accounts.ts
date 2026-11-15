@@ -77,6 +77,7 @@ import {
   type WakeEpochSnapshot,
 } from "./resource-waits/index.js";
 import type { RunEnvironmentRow } from "./resource-waits/run-environment.js";
+import type { HeartbeatDeviceLogin, PlanDeviceLoginInput } from "./heartbeat-device-login.js";
 
 /**
  * Fork: the run-path side of the Claude account pool (spec 4). Input-only:
@@ -921,7 +922,7 @@ export interface RunFailureProvenance {
   retryNotBeforeSource?: "provider_terminal" | null;
 }
 
-interface RunFailureFacts {
+export interface RunFailureFacts {
   errorCode: string | null;
   /** The run's error line (the CLI's own result message). */
   error: string | null;
@@ -940,7 +941,7 @@ interface RunFailureFacts {
  * only from the CLI's own output (W16), so a result that names no source
  * (an adapter build from before it) counts as terminal for those two.
  */
-async function readRunFailureFacts(db: Db, runId: string, explicit: RunFailureProvenance | null | undefined): Promise<RunFailureFacts | null> {
+export async function readRunFailureFacts(db: Db, runId: string, explicit: RunFailureProvenance | null | undefined): Promise<RunFailureFacts | null> {
   const [row] = await db
     .select({
       errorCode: heartbeatRuns.errorCode,
@@ -1048,7 +1049,7 @@ export function endedWithoutAccountFailure(end: RunEndFacts): boolean {
  * Reads a finished run's end from its row (a caller may hold a projected row
  * without `usageJson` or `resultJson`), with its stored `aiConnection`.
  */
-async function readRunEnd(db: Db, runId: string): Promise<{ end: RunEndFacts; aiConnection: unknown } | null> {
+export async function readRunEnd(db: Db, runId: string): Promise<{ end: RunEndFacts; aiConnection: unknown } | null> {
   const [row] = await db
     .select({
       status: heartbeatRuns.status,
@@ -1113,6 +1114,8 @@ export interface CreateHeartbeatAiAccountsOptions {
   now?: () => Date;
   /** Decrypts stored credential material; defaults to the local encrypted provider. */
   decryptCredential?: (material: Record<string, unknown>) => Promise<string>;
+  /** Fork: limits of a device's own Claude login (runs without a pool account). */
+  deviceLogin?: HeartbeatDeviceLogin;
 }
 
 export interface AcquireInput {
@@ -1177,7 +1180,7 @@ function environmentRefOfRun(run: Pick<HeartbeatRunRow, "contextSnapshot">): { i
 }
 
 export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOptions) {
-  const { db, resourceWaits, deps } = options;
+  const { db, resourceWaits, deps, deviceLogin } = options;
   const clock = options.now ?? (() => new Date());
   const deploymentMode = options.deploymentMode ?? configuredDeploymentMode();
   const decrypt = options.decryptCredential
@@ -1765,9 +1768,10 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
   /**
    * The provider-quota dispatcher (hook H9): a pool or legacy host-pool
    * attribution goes to `handleRunLimit`, a `company_pool` one to
-   * `handleCompanyPoolLimit`. Anything else is not handled.
+   * `handleCompanyPoolLimit`, and a device-login attribution to the device
+   * login's limit (fork). Anything else is not handled.
    */
-  async function handleProviderLimit(input: FailureInput): Promise<{ handled: boolean; reason: string; via: "pool_account" | "company_pool" | null }> {
+  async function handleProviderLimit(input: FailureInput): Promise<{ handled: boolean; reason: string; via: "pool_account" | "company_pool" | "device_login" | null }> {
     if (ownPoolAttribution(input.run)) {
       const outcome = await handleRunLimit(input);
       return { handled: outcome.handled, reason: outcome.reason, via: "pool_account" };
@@ -1775,6 +1779,10 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     if (asRecord(asRecord(input.run.contextSnapshot).aiConnection).mode === "company_pool") {
       const outcome = await handleCompanyPoolLimit(input);
       return { handled: outcome.handled, reason: outcome.reason, via: "company_pool" };
+    }
+    if (deviceLogin) {
+      const outcome = await deviceLogin.handleDeviceLoginLimit({ run: input.run, agent: input.agent, provenance: input.provenance, now: input.now });
+      if (outcome.reason !== "not_device_login_run") return { handled: outcome.handled, reason: outcome.reason, via: "device_login" };
     }
     return { handled: false, reason: "not_pool_run", via: null };
   }
@@ -1831,6 +1839,14 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
         result.woken = woken.runIds.length;
       }
     }
+    if (deviceLogin) {
+      // Fork: a served device-login run ends that login's limit state the same way.
+      const login = await deviceLogin.noteDeviceLoginRunSucceeded({ run, now: input.now });
+      if (login.cleared) {
+        result.cleared = true;
+        result.woken += login.woken;
+      }
+    }
     const passedWait = await resourceWaits.noteRunPassed({ run, step: "succeeded" });
     result.episodeResolved = passedWait.resolved;
     return result;
@@ -1844,6 +1860,8 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     inject,
     dropStaleAttribution: (input: Parameters<typeof dropStaleAttribution>[1]) => dropStaleAttribution(db, input),
     handleProviderLimit,
+    /** Fork: device-login runs (no pool account) plan their login's limit; null without the service. */
+    planDeviceLogin: (input: PlanDeviceLoginInput) => deviceLogin ? deviceLogin.planDeviceLogin(input) : Promise.resolve(null),
     handleRunLimit,
     handleCompanyPoolLimit,
     handleRunAuthFailure,

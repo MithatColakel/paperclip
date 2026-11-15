@@ -21,6 +21,12 @@ import { environmentAvailabilityService, isFreshlyUnavailable } from "../environ
 import { executionRetryAttemptCount } from "../execution-recovery-attempt.js";
 import { capOf, deviceForEnvironment, runningPoolAccountsOnDevice, wouldExceedDeviceCap } from "../execution-devices.js";
 import { evaluateAccountPlan } from "./account-plan.js";
+import {
+  claimDeviceLoginProbe,
+  deviceLoginProbeApplies,
+  oldestDeviceLoginWaiter,
+  readDeviceLoginLimit,
+} from "./device-login.js";
 import { jittered, resourceWaitJitterMs, waitDelayMs, type EpisodeEndedHandler } from "./deferral.js";
 import { chainOfRun, handOverOrAbandon, resourceKeyOf } from "./episodes.js";
 import { readRunEnvironmentPolicy, resolveRunEnvironment, type RunEnvironmentPolicy, type RunEnvironmentRow } from "./run-environment.js";
@@ -459,6 +465,38 @@ export function createHold(runtime: HoldRuntime) {
   }
 
   /**
+   * Device-login waits (fork): a pool binding or another environment proceeds
+   * (the next attempt plans again). Otherwise the environment's login limit
+   * holds until its reset plus `jitter(runId)`; once it has passed, only the
+   * oldest waiter proceeds, as the login's single probe, until a served run
+   * clears the limit and wakes the rest.
+   */
+  async function canProceedDeviceLogin(
+    run: HeartbeatRunRow,
+    agent: AgentRow,
+    view: ResourceWaitEpisodeRow,
+    policy: RunEnvironmentPolicy,
+    now: Date,
+  ): Promise<ProceedDecision & { probeClaimed?: boolean }> {
+    const binding = await bindingOf(agent.id);
+    if (binding?.mode === "pool_account") return proceed("binding_changed");
+    const environment = await environmentNow(run, agent, view, policy);
+    if (!environment || environment.id !== view.environmentId) return proceed("environment_changed");
+    const limit = await readDeviceLoginLimit(db, { companyId: run.companyId, environmentId: environment.id });
+    if (!limit?.exhaustedUntil) return proceed("login_available");
+    if (limit.exhaustedUntil.getTime() > now.getTime()) {
+      return hold(new Date(limit.exhaustedUntil.getTime() + resourceWaitJitterMs(run.id)), "limit_not_reset");
+    }
+    if (!deviceLoginProbeApplies(limit)) return proceed("login_available");
+    // This run holds the probe already (Check now hands it over).
+    if (limit.limitProbeRunId === run.id) return proceed("probe_held");
+    const first = await oldestDeviceLoginWaiter(db, { companyId: run.companyId, environmentId: environment.id });
+    if (first && first !== view.id) return hold(recheck(now), "probe_waiting");
+    if (!(await claimDeviceLoginProbe(db, environment.id, run.id))) return hold(recheck(now), "probe_claimed_elsewhere");
+    return { ...proceed("probe_claimed"), probeClaimed: true };
+  }
+
+  /**
    * Re-arms a held row unless a wake moved `scheduled_retry_at` or
    * `updated_at` since it was read. `nextCheckAt` is the episode's
    * bookkeeping; undefined leaves it (an admission wait keeps its uncapped
@@ -541,6 +579,7 @@ export function createHold(runtime: HoldRuntime) {
     const resolvedPolicy = policy ?? await readRunEnvironmentPolicy(db);
     if (view.kind === "environment") return canProceedEnvironment(run, agent, view, resolvedPolicy, now);
     if (view.kind === "ai_account") return canProceedAccount(run, agent, view, resolvedPolicy, now);
+    if (view.kind === "device_login") return canProceedDeviceLogin(run, agent, view, resolvedPolicy, now);
     return decideSlots(run, agent, view, resolvedPolicy, now);
   }
 

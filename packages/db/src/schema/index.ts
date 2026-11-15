@@ -230,6 +230,7 @@ export { aiAccountAgentBindings } from "./ai_account_agent_bindings.js";
 export { aiAccountRunSlots } from "./ai_account_run_slots.js";
 export { environmentAvailability } from "./environment_availability.js";
 export { resourceWaitEpisodes, resourceWaitNotices } from "./resource_wait_episodes.js";
+export { deviceLoginLimits } from "./device_login_limits.js";
 export { executionWaitSettings } from "./execution_wait_settings.js";
 export { deferredDataMigrations } from "./deferred_data_migrations.js";
 export * from "./email.js";

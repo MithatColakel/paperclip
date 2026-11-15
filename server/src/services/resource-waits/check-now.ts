@@ -1,5 +1,5 @@
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { type Db, environments, heartbeatRuns, resourceWaitEpisodes, resourceWaitNotices } from "@paperclipai/db";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { type Db, deviceLoginLimits, environments, heartbeatRuns, resourceWaitEpisodes, resourceWaitNotices } from "@paperclipai/db";
 import {
   isEnvironmentAvailableToCompany,
   isResourceWaitRetryReason,
@@ -208,9 +208,27 @@ export function createCheckNow(runtime: {
         }
       }
     }
+    // Fork: a device login has no owner who could clear its limit, so "Check
+    // now" ends the recorded wait and makes this run the login's probe. A
+    // served run then clears the limit and wakes the rest; another limit
+    // records the new reset.
+    const loginAttempt = input.source !== "comment" && view?.kind === "device_login" && Boolean(view.environmentId);
+    if (loginAttempt && view?.environmentId) {
+      await db.update(deviceLoginLimits)
+        .set({
+          exhaustedUntil: sql`least(${deviceLoginLimits.exhaustedUntil}, ${checkedAt}::timestamptz)`,
+          limitProbeRunId: run.id,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(deviceLoginLimits.environmentId, view.environmentId),
+          eq(deviceLoginLimits.companyId, run.companyId),
+          isNotNull(deviceLoginLimits.exhaustedUntil),
+        ));
+    }
     // "Check now" spends one real attempt on a driver's refusal; a comment
     // only re-evaluates, so it never shortens the backoff.
-    const attemptNow = input.source !== "comment" && view?.kind === "environment" && view.scope === "admission";
+    const attemptNow = loginAttempt || (input.source !== "comment" && view?.kind === "environment" && view.scope === "admission");
     const decision = attemptNow
       ? { proceed: true as const, reason: "check_now_attempt" }
       : await runtime.hold.decide(run, wait, now);

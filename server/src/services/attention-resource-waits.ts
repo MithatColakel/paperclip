@@ -6,6 +6,7 @@ import {
   aiAccounts,
   companies,
   companyMemberships,
+  deviceLoginLimits,
   environmentAvailability,
   environments,
   executionWaitSettings,
@@ -232,7 +233,9 @@ function loadCompanyWaits(db: Db, companyId: string, readCondition: SQL<boolean>
           and ${companyMemberships.status} = 'active'
           and ${companyMemberships.principalId} = ${accountOwner}
       )`,
-      limitEpisodeStartedAt: aiAccounts.limitEpisodeStartedAt,
+      // Fork: a device-login wait's limit episode lives on its environment's row.
+      limitEpisodeStartedAt: sql<Date | null>`case when ${resourceWaitEpisodes.kind} = 'device_login'
+        then ${deviceLoginLimits.limitEpisodeStartedAt} else ${aiAccounts.limitEpisodeStartedAt} end`.mapWith(aiAccounts.limitEpisodeStartedAt),
       deviceName: aiAccountHosts.name,
       overLimitAt: aiAccountHosts.overLimitAt,
       environmentName: environments.name,
@@ -251,6 +254,11 @@ function loadCompanyWaits(db: Db, companyId: string, readCondition: SQL<boolean>
     .leftJoin(aiAccountHosts, eq(aiAccountHosts.id, resourceWaitEpisodes.deviceId))
     .leftJoin(environments, eq(environments.id, resourceWaitEpisodes.environmentId))
     .leftJoin(environmentAvailability, eq(environmentAvailability.environmentId, resourceWaitEpisodes.environmentId))
+    .leftJoin(deviceLoginLimits, and(
+      eq(deviceLoginLimits.environmentId, resourceWaitEpisodes.environmentId),
+      eq(deviceLoginLimits.companyId, companies.id),
+      eq(resourceWaitEpisodes.kind, "device_login"),
+    ))
     .where(eq(companies.id, companyId))
     .orderBy(asc(resourceWaitEpisodes.since), asc(resourceWaitEpisodes.id));
 }
@@ -356,6 +364,12 @@ function waitText(group: WaitGroup, input: { now: Date; accountLabel: string | n
   const resumes = first.resumeAt ? ` at ${utcTime(first.resumeAt)} (${first.resumeAtSource === "provider" ? "provider reset" : "estimated"})` : "";
   const driverFix = first.runWaitReason === first.reason && first.runWaitMessage ? first.runWaitMessage : null;
   const never = "Paperclip never moves a task to another account.";
+  if (first.kind === "device_login") {
+    // Fork: the device's own login; nobody clears its limit in Claude accounts.
+    return first.reason === "credit_balance"
+      ? { title: `The Claude login on ${device} has no API credit left`, whyNow: `${tasksWait(count)} for API credit${resumes}. ${never} Add credit on that login; Check now tries again at once.` }
+      : { title: `The Claude login on ${device} reached its usage limit`, whyNow: `${tasksWait(count)} for the limit to reset${resumes}; they resume automatically. ${never} Check now tries again at once.` };
+  }
   switch (first.reason) {
     case "usage_limit":
       return {

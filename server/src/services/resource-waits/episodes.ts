@@ -45,7 +45,10 @@ export function needsNewImmediateNotice(previousReason: string, reason: string):
   return !(isLimitReason(previousReason) && isLimitReason(reason));
 }
 
-/** `environment:<id>`, `account:<id>` (`account:none` while unassigned) or `device:<id>`. */
+/**
+ * `environment:<id>`, `account:<id>` (`account:none` while unassigned),
+ * `device:<id>`, or `device_login:<environment id>` for a device's own login.
+ */
 export function resourceKeyOf(wait: Pick<ResourceWaitTarget | ResourceWaitContext, "kind" | "environmentId" | "accountId" | "deviceId">): string {
   switch (wait.kind) {
     case "environment":
@@ -54,6 +57,8 @@ export function resourceKeyOf(wait: Pick<ResourceWaitTarget | ResourceWaitContex
       return `account:${wait.accountId ?? "none"}`;
     case "device_slots":
       return `device:${wait.deviceId ?? "none"}`;
+    case "device_login":
+      return `device_login:${wait.environmentId ?? "none"}`;
   }
 }
 

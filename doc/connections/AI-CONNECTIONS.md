@@ -854,7 +854,7 @@ ends as a deferral, and a waiting run takes its place:
 
 - **The deferral** is the run, cancelled before any provider work. The
   cancellation is expected, the error code is `environment_unavailable`,
-  `ai_account_unavailable` or `device_slots_full`, and
+  `ai_account_unavailable`, `device_slots_full` or `device_login_limited`, and
   `resultJson.executionRecovery` is `{kind: "resource_wait", providerWorkStarted:
   false}`. It uses no failure retry and no daily run cap slot, raises no error
   report and starts no legacy reconciliation. The run list shows it as "Waited".
@@ -889,6 +889,7 @@ it runs.
 | `ai_account_wait` | account | `auth_unconfirmed` | 10 minutes, for this run only | None |
 | `ai_account_wait` | account | `signed_out`, `withdrawn`, `unassigned`, `owner_not_member`, `reserved_elsewhere`, `device_unknown`, `credential_type_unsupported` | A database check every 60 s ± 20 %, plus event wakes | At once |
 | `device_slot_wait` | device | `slots_full` | A free slot, first in first out; checked every 60 s ± 20 % | At once |
+| `device_login_wait` | account | `usage_limit`, `credit_balance` | The reset of the environment's own Claude login plus up to 2 minutes; at the reset one waiting run goes first as a probe ([Device login limits](#device-login-limits-fork)) | At once, once per limit |
 
 A target-scope reason means the target is down for everyone: it is recorded in
 the availability registry, and every company's runs on that environment wait. An
@@ -1058,8 +1059,50 @@ normal retry path.
 change needs a restart (a container restart in Docker). With it off, the
 environment preflight and the classification of lease errors are off, so
 environment errors fail runs as before this release (`setup_failed`), and every
-waiting `environment_wait` run gets one real attempt on the next tick. Account
-and slot waits cannot be switched off, because they replace failover.
+waiting `environment_wait` run gets one real attempt on the next tick. Account,
+slot and device login waits cannot be switched off, because they replace
+failover.
+
+### Device login limits (fork)
+
+An agent without a pool account (no binding row, or `device_login`) runs on the
+Claude login of the user its environment runs as: a Mac's own account, or an
+SSH user's. Since 2026-11-15 such a login's usage limit (the 5-hour session
+limit or the weekly limit) is handled like a pool account's:
+
+- **Which runs.** A `claude_local` run whose credentials are planned without a
+  pool account, an upstream `aiConnection` or a Claude credential variable
+  (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) in
+  its resolved env, on a known environment, and that is not a resumed
+  persisted native run. It gets `contextSnapshot.deviceLogin` (environment and
+  device names); a retried run drops a copied one.
+- **The limit.** Only the CLI's own result or stderr records it, with the pool
+  account rules: a typed reset (for example "resets 7am (Europe/Istanbul)" or
+  "resets Nov 16, 4am (UTC)") clamped to 7 days and 1 hour, otherwise 1 hour
+  doubling per limit in a row up to 12 hours (24 hours for an exhausted credit
+  balance). It is stored per environment in `device_login_limits`
+  (company-scoped; `device_id` is display only), so an SSH host whose users
+  have their own logins keeps one limit per user. `device_login.limit_reached`
+  is logged once per limit episode in the run's company.
+- **Waiting.** The run that hit the limit gets a `device_login_wait` successor
+  (kind `device_login`, scope `account`, resource key
+  `device_login:<environment id>`), and every later device-login run on that
+  environment waits there instead of starting, until the reset plus up to
+  2 minutes. The task shows "Waiting for the Claude login on \<device>: the
+  usage limit resets at \<time>" and gets the immediate notice once per limit.
+  The upstream "AI provider quota" monitor is not used for these runs.
+- **Resuming.** At the reset the oldest waiting run goes first as the login's
+  probe; the others hold. A run the provider then serves clears the limit and
+  wakes the rest, staggered over up to 2 minutes. A probe that hits the limit
+  again starts the next, longer estimate. The sweep releases a probe that has
+  not started within 15 minutes.
+- **Check now.** Nobody can clear a device login's limit in Claude accounts, so
+  Check now on such a wait (not a comment) ends the recorded wait, hands that
+  run the probe and starts it at once. If the login is still limited, the run
+  records the new reset and the task waits again.
+- **Moving on.** A wait whose agent is bound to a pool account, or whose agent
+  now resolves another environment, proceeds and plans again. Paperclip never
+  moves a task to another account or device.
 
 ### Plugin targets API
 

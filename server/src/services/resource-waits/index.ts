@@ -198,6 +198,15 @@ export { createEpisodeEnd } from "./episode-end.js";
 export type { PreflightResult, RunEnvironmentRef } from "./preflight.js";
 export { claimAccountProbe, type HoldPassResult, type ProceedDecision, type RunWait } from "./hold.js";
 export {
+  claimDeviceLoginProbe,
+  deviceLoginProbeApplies,
+  deviceLoginProbeHeldElsewhere,
+  deviceLoginWaitDeferral,
+  deviceLoginWaitReason,
+  readDeviceLoginLimit,
+  type DeviceLoginLimitRow,
+} from "./device-login.js";
+export {
   environmentIdsForPlugin,
   wakeResourceWaits,
   type ResourceWaitWakeFilter,

@@ -86,7 +86,7 @@ export interface HeartbeatExecutionConfigurationInput {
     appendRunEvent: ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
     finalizeAiConnectionBusyDeferral: ReturnType<typeof createHeartbeatRetries>["finalizeAiConnectionBusyDeferral"];
     /** Fork: the Claude account pool's run path (spec 4). The service always passes it. */
-    heartbeatAiAccounts?: Pick<HeartbeatAiAccounts, "dropStaleAttribution" | "planCredential" | "assertRoutingCompatible" | "acquire" | "inject">;
+    heartbeatAiAccounts?: Pick<HeartbeatAiAccounts, "dropStaleAttribution" | "planCredential" | "assertRoutingCompatible" | "acquire" | "inject" | "planDeviceLogin">;
     /** Fork: ends account and slot waits after credentials (spec 7). The service always passes it. */
     resourceWaits?: Pick<ReturnType<typeof createResourceWaits>, "noteRunPassed">;
   };
@@ -218,6 +218,14 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     }).catch(rethrowRefusalAsConfigurationFailure);
     const credential = await heartbeatAiAccounts.acquire({ run, plan: poolPlan }).catch(rethrowRefusalAsConfigurationFailure);
     await heartbeatAiAccounts.inject({ run, config: resolvedConfig, secretKeys, context, credential });
+  } else if (heartbeatAiAccounts) {
+    // Fork: a run on the device's own Claude login waits while that login's
+    // usage limit is in force, as a pool account's runs do (no failover).
+    await heartbeatAiAccounts.planDeviceLogin({
+      run, agent, binding: accountBinding, environment: selectedEnvironmentForConfig,
+      resolvedEnv: resolvedConfig.env, managedAiConnection: Boolean(aiBinding),
+      persisted: Boolean(persistedNativeExecutionInput), context,
+    });
   }
   await resourceWaits?.noteRunPassed({ run, step: "credentials" }).catch((err) => {
     logger.warn({ err, runId: run.id }, "failed to end a resource wait after credentials");

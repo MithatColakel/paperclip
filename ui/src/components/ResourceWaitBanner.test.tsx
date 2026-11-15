@@ -52,6 +52,7 @@ const SCOPE_BY_KIND: Record<ResourceWaitKind, ScheduledRetryResourceWait["scope"
   environment: "target",
   ai_account: "account",
   device_slots: "device",
+  device_login: "account",
 };
 
 function wait(overrides: Partial<ScheduledRetryResourceWait> = {}): ScheduledRetryResourceWait {
@@ -156,6 +157,19 @@ describe("describeResourceWait", () => {
     );
     expect(later.chip).toBe(`Waiting for limit reset: ${formatResetTime(tomorrow, { now: NOW })}`);
     expect(later.chip).toMatch(/^Waiting for limit reset: [A-Z][a-z]{2} 09:30$/);
+  });
+
+  it("names the device's own Claude login for a device-login limit, never an account to clear", () => {
+    const copy = describeResourceWait(
+      wait({ kind: "device_login", reason: "usage_limit", resumeAt: RESET.toISOString(), resumeAtSource: "provider" }),
+      { now: NOW },
+    );
+    expect(copy.title).toBe("Waiting for the Claude login on Build box: the usage limit resets at 18:00");
+    expect(copy.chip).toBe("Waiting for limit reset: 18:00");
+    expect(copy.detail).toContain("Check now tries again at once");
+    expect(copy.detail).not.toContain("owner can clear");
+    expect(copy.tone).toBe("info");
+    expect(resourceWaitLaneLabel("device_login_wait")).toBe("Waiting for limit reset");
   });
 
   it("explains throttling as a short pause", () => {

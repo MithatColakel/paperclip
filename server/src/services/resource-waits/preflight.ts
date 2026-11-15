@@ -10,6 +10,7 @@ import {
 } from "../environment-availability.js";
 import { deviceForEnvironment } from "../execution-devices.js";
 import { classifyEnvironmentError } from "./classify.js";
+import { readDeviceLoginLimit } from "./device-login.js";
 import { readWakeEpochs } from "./epochs.js";
 import { resolveEpisode } from "./episodes.js";
 import { formatWaitDuration, type ResourceWaitNotifier } from "./notify.js";
@@ -270,8 +271,20 @@ export function createPreflight(runtime: PreflightRuntime) {
    * the agent still runs on it. Only the run's success ends it.
    */
   async function isLimitProbe(episode: ResourceWaitEpisodeRow, run: Pick<HeartbeatRunRow, "id" | "agentId">): Promise<boolean> {
-    if (episode.kind !== "ai_account" || !episode.accountId) return false;
     if (episode.reason !== "usage_limit" && episode.reason !== "credit_balance") return false;
+    if (episode.kind === "device_login" && episode.environmentId) {
+      // Fork: the device login's probe, the same rule as a pool account's.
+      const limit = await readDeviceLoginLimit(db, { companyId: episode.companyId, environmentId: episode.environmentId });
+      if (!limit) return false;
+      if (limit.limitProbeRunId === run.id) return true;
+      if (limit.limitStrikes <= 0) return false;
+      const [binding] = await db
+        .select({ mode: aiAccountAgentBindings.mode })
+        .from(aiAccountAgentBindings)
+        .where(eq(aiAccountAgentBindings.agentId, run.agentId));
+      return binding?.mode !== "pool_account";
+    }
+    if (episode.kind !== "ai_account" || !episode.accountId) return false;
     const [account] = await db
       .select({ limitStrikes: aiAccounts.limitStrikes, limitProbeRunId: aiAccounts.limitProbeRunId })
       .from(aiAccounts)

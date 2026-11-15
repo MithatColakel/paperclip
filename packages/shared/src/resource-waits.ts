@@ -2,7 +2,7 @@
  * Fork: resource waits. A run whose execution device, Claude account or device
  * account slots are unavailable does not fail. Paperclip cancels it as an
  * expected deferral (no provider work started) and schedules a successor in
- * one of three scheduled-retry lanes. The successor waits there until the
+ * one of four scheduled-retry lanes. The successor waits there until the
  * resource is back and then starts automatically. Nothing here moves a task
  * to another account or another device.
  *
@@ -10,10 +10,15 @@
  */
 
 /** The scheduled-retry lanes (`heartbeat_runs.scheduled_retry_reason`). */
-export const RESOURCE_WAIT_RETRY_REASONS = ["environment_wait", "ai_account_wait", "device_slot_wait"] as const;
+export const RESOURCE_WAIT_RETRY_REASONS = ["environment_wait", "ai_account_wait", "device_slot_wait", "device_login_wait"] as const;
 export type ResourceWaitRetryReason = (typeof RESOURCE_WAIT_RETRY_REASONS)[number];
 
-export const RESOURCE_WAIT_KINDS = ["environment", "ai_account", "device_slots"] as const;
+/**
+ * `device_login`: the device's own Claude login (an agent without a pool
+ * account, or bound to `device_login`) reached a usage limit. Its runs on that
+ * environment wait for the provider's reset, like a pool account's runs.
+ */
+export const RESOURCE_WAIT_KINDS = ["environment", "ai_account", "device_slots", "device_login"] as const;
 export type ResourceWaitKind = (typeof RESOURCE_WAIT_KINDS)[number];
 
 /**
@@ -30,12 +35,14 @@ export const RESOURCE_WAIT_LANE_BY_KIND: Readonly<Record<ResourceWaitKind, Resou
   environment: "environment_wait",
   ai_account: "ai_account_wait",
   device_slots: "device_slot_wait",
+  device_login: "device_login_wait",
 };
 
 export const RESOURCE_WAIT_KIND_BY_LANE: Readonly<Record<ResourceWaitRetryReason, ResourceWaitKind>> = {
   environment_wait: "environment",
   ai_account_wait: "ai_account",
   device_slot_wait: "device_slots",
+  device_login_wait: "device_login",
 };
 
 /** Wake reason of the successor run each lane schedules. */
@@ -43,6 +50,7 @@ export const RESOURCE_WAIT_WAKE_REASONS: Readonly<Record<ResourceWaitRetryReason
   environment_wait: "environment_wait_retry",
   ai_account_wait: "ai_account_wait_retry",
   device_slot_wait: "device_slot_wait_retry",
+  device_login_wait: "device_login_wait_retry",
 };
 
 /** The device or its connection is down: held until the registry says otherwise. */
@@ -88,6 +96,10 @@ export type AiAccountWaitReason = (typeof AI_ACCOUNT_WAIT_REASONS)[number];
 export const DEVICE_SLOT_WAIT_REASONS = ["slots_full"] as const;
 export type DeviceSlotWaitReason = (typeof DEVICE_SLOT_WAIT_REASONS)[number];
 
+/** A device login waits only for its limit to reset (the reasons are shared with account waits). */
+export const DEVICE_LOGIN_WAIT_REASONS = ["usage_limit", "credit_balance"] as const;
+export type DeviceLoginWaitReason = (typeof DEVICE_LOGIN_WAIT_REASONS)[number];
+
 export const RESOURCE_WAIT_REASONS = [
   ...ENVIRONMENT_WAIT_REASONS,
   ...AI_ACCOUNT_WAIT_REASONS,
@@ -99,10 +111,12 @@ export const RESOURCE_WAIT_REASONS_BY_KIND: Readonly<{
   environment: readonly EnvironmentWaitReason[];
   ai_account: readonly AiAccountWaitReason[];
   device_slots: readonly DeviceSlotWaitReason[];
+  device_login: readonly DeviceLoginWaitReason[];
 }> = {
   environment: ENVIRONMENT_WAIT_REASONS,
   ai_account: AI_ACCOUNT_WAIT_REASONS,
   device_slots: DEVICE_SLOT_WAIT_REASONS,
+  device_login: DEVICE_LOGIN_WAIT_REASONS,
 };
 
 /**
@@ -140,13 +154,14 @@ export const RESOURCE_WAIT_NOTICE_POLICY: Readonly<Record<ResourceWaitReason, Re
 };
 
 /** `errorCode` of the cancelled deferral run, one per kind. */
-export const RESOURCE_WAIT_ERROR_CODES = ["environment_unavailable", "ai_account_unavailable", "device_slots_full"] as const;
+export const RESOURCE_WAIT_ERROR_CODES = ["environment_unavailable", "ai_account_unavailable", "device_slots_full", "device_login_limited"] as const;
 export type ResourceWaitErrorCode = (typeof RESOURCE_WAIT_ERROR_CODES)[number];
 
 export const RESOURCE_WAIT_ERROR_CODE_BY_KIND: Readonly<Record<ResourceWaitKind, ResourceWaitErrorCode>> = {
   environment: "environment_unavailable",
   ai_account: "ai_account_unavailable",
   device_slots: "device_slots_full",
+  device_login: "device_login_limited",
 };
 
 /** `resultJson.executionRecovery.kind` of a deferral run. */
@@ -232,6 +247,7 @@ const SCOPES_BY_KIND: Readonly<Record<ResourceWaitKind, ReadonlySet<string>>> = 
   environment: new Set(["target", "admission"]),
   ai_account: new Set(["account"]),
   device_slots: new Set(["device"]),
+  device_login: new Set(["account"]),
 };
 
 export function isResourceWaitRetryReason(value: unknown): value is ResourceWaitRetryReason {

@@ -67,6 +67,7 @@ const RESOURCE_WAIT_DEFERRAL_ACTIONS: Readonly<Record<ResourceWaitErrorCode, str
   environment_unavailable: "This run waited for its execution device and started no provider work. The task continues in its next run.",
   ai_account_unavailable: "This run waited for its Claude account and started no provider work. The task continues in its next run.",
   device_slots_full: "This run waited for a Claude account slot on its device and started no provider work. The task continues in its next run.",
+  device_login_limited: "This run waited for its device's Claude login to reset and started no provider work. The task continues in its next run.",
 };
 
 function utcTime(value: string | null): string | null {
@@ -124,6 +125,18 @@ function accountWaitProjection(wait: ResourceWaitContext | null) {
   }
 }
 
+/** Fork: a wait for the usage limit of the device's own Claude login. */
+function deviceLoginWaitProjection(wait: ResourceWaitContext | null) {
+  const device = wait?.deviceName ?? wait?.environmentName ?? null;
+  const login = device ? `The Claude login on ${device}` : "The device's own Claude login";
+  const resets = utcTime(wait?.resumeAt ?? null);
+  const at = resets ? ` at ${resets}${wait?.resumeAtSource === "provider" ? "" : " (estimated)"}` : "";
+  const never = "Paperclip never moves a task to another account; Check now tries again at once.";
+  return wait?.reason === "credit_balance"
+    ? { label: "Waiting for API credit", nextAction: `${login} has no API credit left. The task resumes automatically${at}. ${never}` }
+    : { label: "Waiting for usage limit reset", nextAction: `${login} reached its usage limit. The task resumes automatically when it resets${at}. ${never}` };
+}
+
 /** The projection of a resource-wait lane successor or its deferral; null for every other run. */
 function resourceWaitProjection(run: Run): { phase: ExecutionProjection["phase"]; label: string; nextAction: string } | null {
   if (run.status === "cancelled" && isResourceWaitErrorCode(run.errorCode)) {
@@ -134,6 +147,7 @@ function resourceWaitProjection(run: Run): { phase: ExecutionProjection["phase"]
   const wait = readResourceWaitContext(run.contextSnapshot?.resourceWait);
   if (lane === "environment_wait") return { phase: "retry_scheduled", ...environmentWaitProjection(wait) };
   if (lane === "ai_account_wait") return { phase: "retry_scheduled", ...accountWaitProjection(wait) };
+  if (lane === "device_login_wait") return { phase: "retry_scheduled", ...deviceLoginWaitProjection(wait) };
   const device = wait?.deviceName ?? null;
   return {
     phase: "retry_scheduled",
