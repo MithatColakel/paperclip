@@ -50,6 +50,7 @@ import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { isQueryAbortError, runWithQueryAbort } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
@@ -3015,6 +3016,10 @@ type IssueListInflightEntry = {
   startedAt: number;
   waiterCount: number;
   stormLogged: boolean;
+  /** Fork: requests still connected and waiting for this computation. */
+  connectedWaiters: number;
+  /** Fork: aborted when the last connected waiter disconnects. */
+  abandon: AbortController;
 };
 
 const issueListResponseCache = new Map<string, IssueListCacheEntry>();
@@ -3191,13 +3196,52 @@ function decrementIssueListActorClientInflight(actorClientKey: string) {
   else issueListActorClientInflight.set(actorClientKey, next);
 }
 
+/**
+ * Fork: counts one waiting request until it either gets its response or
+ * disconnects. When the last connected waiter of a computation disconnects,
+ * nobody can receive its result any more. If `cancelWhenAbandoned` is set,
+ * the computation is aborted, which cancels its database work, and is removed
+ * from the in-flight map so that a later identical request starts afresh
+ * instead of joining the aborted one. Returns the function that stops
+ * watching once the waiter has its response.
+ */
+function watchIssueListWaiter(input: {
+  req: Request;
+  res: Response;
+  key: string;
+  entry: IssueListInflightEntry;
+  cancelWhenAbandoned: boolean;
+}): () => void {
+  const { req, res, key, entry } = input;
+  let left = false;
+  const leave = () => {
+    if (left || res.writableEnded) return;
+    left = true;
+    entry.connectedWaiters -= 1;
+    if (entry.connectedWaiters > 0 || !input.cancelWhenAbandoned) return;
+    entry.abandon.abort();
+    if (issueListInflight.get(key) === entry) issueListInflight.delete(key);
+  };
+  req.once("aborted", leave);
+  res.once("close", leave);
+  // The client may have gone while the handler awaited earlier work; its
+  // close event then fired before this listener existed.
+  if (res.destroyed) leave();
+  return () => {
+    req.off("aborted", leave);
+    res.off("close", leave);
+  };
+}
+
 async function coordinateIssueListGet(input: {
   req: Request;
+  res: Response;
   companyId: string;
   requestKey: ReturnType<typeof issueListRequestKey>;
   allowTtlCache: boolean;
   diagnostics?: IssueListDiagnostics;
-  compute: () => Promise<IssueListPreparedResponse>;
+  cancelWhenAbandoned: boolean;
+  compute: (signal: AbortSignal) => Promise<IssueListPreparedResponse>;
 }): Promise<{
   response: IssueListPreparedResponse | null;
   cacheStatus: IssueListCacheStatus;
@@ -3246,8 +3290,20 @@ async function coordinateIssueListGet(input: {
       logger.warn(event, "request_storm_detected");
       input.diagnostics?.onStormDetected?.(event);
     }
-    const response = await existing.promise;
-    return { response, cacheStatus: "coalesced", identicalInFlightCount };
+    existing.connectedWaiters += 1;
+    const stopWatching = watchIssueListWaiter({
+      req: input.req,
+      res: input.res,
+      key: input.requestKey.key,
+      entry: existing,
+      cancelWhenAbandoned: input.cancelWhenAbandoned,
+    });
+    try {
+      const response = await existing.promise;
+      return { response, cacheStatus: "coalesced", identicalInFlightCount };
+    } finally {
+      stopWatching();
+    }
   }
 
   const actorClientKey = `${input.requestKey.actor.key}:${input.requestKey.client.key}`;
@@ -3271,20 +3327,30 @@ async function coordinateIssueListGet(input: {
   }
 
   issueListActorClientInflight.set(actorClientKey, actorClientInflight + 1);
+  const abandon = new AbortController();
   const promise = (async () => {
     await input.diagnostics?.onComputeStart?.({
       companyId: input.companyId,
       cacheKeyHash: input.requestKey.keyHash,
     });
-    return input.compute();
+    return input.compute(abandon.signal);
   })();
   const inflightEntry: IssueListInflightEntry = {
     promise,
     startedAt: now,
     waiterCount: 0,
     stormLogged: false,
+    connectedWaiters: 1,
+    abandon,
   };
   issueListInflight.set(input.requestKey.key, inflightEntry);
+  const stopWatching = watchIssueListWaiter({
+    req: input.req,
+    res: input.res,
+    key: input.requestKey.key,
+    entry: inflightEntry,
+    cancelWhenAbandoned: input.cancelWhenAbandoned,
+  });
 
   try {
     const response = await promise;
@@ -3297,6 +3363,7 @@ async function coordinateIssueListGet(input: {
     }
     return { response, cacheStatus: "miss", identicalInFlightCount: 1 };
   } finally {
+    stopWatching();
     if (issueListInflight.get(input.requestKey.key) === inflightEntry) {
       issueListInflight.delete(input.requestKey.key);
     }
@@ -3398,6 +3465,12 @@ export function issueRoutes(
   } = {},
 ) {
   const router = Router();
+  // Fork: an issue list whose every client disconnected stops its database
+  // work. PAPERCLIP_CANCEL_ABANDONED_ISSUE_LISTS=false restores the upstream
+  // behaviour, where the computation always runs to the end.
+  const cancelAbandonedIssueLists = !["false", "0"].includes(
+    (process.env.PAPERCLIP_CANCEL_ABANDONED_ISSUE_LISTS ?? "").trim().toLowerCase(),
+  );
   const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
@@ -8537,13 +8610,7 @@ export function issueRoutes(
         view: compactView ? "compact" : undefined,
       },
     });
-    const coordinated = await coordinateIssueListGet({
-      req,
-      companyId,
-      requestKey,
-      allowTtlCache: compactView,
-      diagnostics: opts.issueListDiagnostics,
-      compute: async () => {
+    const computeIssueList = async (): Promise<IssueListPreparedResponse> => {
         const rawResult = await svc.list(companyId, listFilters);
         const visibleRows = await actorCanReadCompanyScope(req, companyId)
           ? rawResult
@@ -8616,8 +8683,32 @@ export function issueRoutes(
             interruption: interruptions.get(issue.id) ?? null,
           })),
         };
-      },
-    });
+    };
+    let coordinated: Awaited<ReturnType<typeof coordinateIssueListGet>>;
+    try {
+      coordinated = await coordinateIssueListGet({
+        req,
+        res,
+        companyId,
+        requestKey,
+        allowTtlCache: compactView,
+        diagnostics: opts.issueListDiagnostics,
+        cancelWhenAbandoned: cancelAbandonedIssueLists,
+        compute: (signal) =>
+          cancelAbandonedIssueLists ? runWithQueryAbort(db, signal, computeIssueList) : computeIssueList(),
+      });
+    } catch (error) {
+      // Every client of this list disconnected and its database work was
+      // cancelled. There is nobody left to answer.
+      if (isQueryAbortError(error) && res.destroyed && !res.writableEnded) {
+        logger.debug(
+          { event: "issue_list_abandoned", companyId, cacheKeyHash: requestKey.keyHash },
+          "issue list cancelled after its clients disconnected",
+        );
+        return;
+      }
+      throw error;
+    }
 
     res.setHeader("X-Paperclip-Request-Cache", coordinated.cacheStatus);
     if (!coordinated.response) {

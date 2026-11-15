@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { installDatabaseWorkSignals } from "./work-signals.js";
+import { installQueryAbortRouting, runQueryAbortScope } from "./query-abort.js";
 import * as schema from "./schema/index.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
@@ -293,6 +294,36 @@ export async function closeLivenessDb(db: Db, timeoutSeconds: number): Promise<v
   await livenessDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
 }
 
+// Fork: work that its caller may abandon (an HTTP read whose client left)
+// reserves one connection of a small private pool, so a cancel request can
+// only reach statements of that work (see query-abort.ts). The pool also
+// bounds how many such reads run at once. Created on first use.
+const queryAbortDbFactories = new WeakMap<object, () => Db>();
+const queryAbortDbs = new WeakMap<object, Db>();
+const QUERY_ABORT_POOL_MAX_CONNECTIONS = 4;
+
+/**
+ * Runs `work` so that aborting `signal` stops its database work: queued
+ * statements are dropped, running ones are cancelled (SQLSTATE 57014) and new
+ * ones fail with `QueryAbortedError`. Transactions are never cut. A `db` that
+ * `createDb` did not create (test doubles, transactions) runs `work` as is.
+ */
+export async function runWithQueryAbort<T>(db: Db, signal: AbortSignal, work: () => Promise<T>): Promise<T> {
+  const factory = queryAbortDbFactories.get(db);
+  if (!factory) return work();
+  let pool = queryAbortDbs.get(db);
+  if (!pool) {
+    pool = factory();
+    queryAbortDbs.set(db, pool);
+  }
+  return runQueryAbortScope({ owner: db.$client, pool: pool.$client, signal, work });
+}
+
+/** Ends the abandonable-work pool if one was created. */
+export async function closeQueryAbortDb(db: Db, timeoutSeconds: number): Promise<void> {
+  await queryAbortDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
+}
+
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
   return createDbClient(url, resolved);
@@ -300,6 +331,7 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
 
 function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: object) {
   const sql = postgres(url, postgresJsOptions(resolved));
+  installQueryAbortRouting(sql);
   const key = hostPortKeyOrNull(url);
   if (key) registerClient(key, sql);
   // A disconnect can lose the response after a statement has committed.
@@ -312,6 +344,9 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   }, db));
   livenessDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
+  }, db));
+  queryAbortDbFactories.set(db, () => createDbClient(url, {
+    ...resolved, maxConnections: QUERY_ABORT_POOL_MAX_CONNECTIONS, applicationName: "paperclip-abandonable-read",
   }, db));
   return db;
 }
