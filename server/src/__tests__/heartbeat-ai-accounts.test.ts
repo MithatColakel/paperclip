@@ -1498,6 +1498,75 @@ describeEmbeddedPostgres("heartbeat AI accounts (database)", () => {
 
   // -------------------------------------------------------------------------
 
+  describe("noteAccountRateLimit", () => {
+    const report = (usedPercent: number, resetsAt = "2026-11-20T06:00:00.000Z") => ({
+      status: "allowed",
+      usingOverage: false,
+      windows: [{ id: "seven_day", usedPercent, resetsAt, status: "allowed" }],
+    });
+
+    async function ownPoolRun(worker: AgentRow, poolId: string, status = "succeeded") {
+      const row = await run(worker, { status });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { aiConnection: { mode: "pool_account", accountId: poolId, runId: row.id } } })
+        .where(eq(heartbeatRuns.id, row.id));
+      return row;
+    }
+
+    it("saves the provider's report on the run's own pool account and never touches its limit state", async () => {
+      const { accounts } = service();
+      const now = new Date();
+      const limitUntil = at(now, HOUR);
+      const { worker, pool } = await poolFixture({
+        accountOverrides: { exhaustedUntil: limitUntil, limitSource: "provider", limitStrikes: 1 },
+      });
+      const finished = await ownPoolRun(worker, pool.id, "failed");
+
+      const outcome = await accounts.noteAccountRateLimit({ run: finished, rateLimit: report(32), now });
+      expect(outcome).toEqual({ accountId: pool.id, saved: true });
+      const row = await accountRow(pool.id);
+      expect(row.providerQuota).toEqual(report(32));
+      expect(row.providerQuotaObservedAt?.toISOString()).toBe(now.toISOString());
+      // Display only: the limit, its source and the strikes stay as they were.
+      expect(row).toMatchObject({ exhaustedUntil: limitUntil, limitSource: "provider", limitStrikes: 1 });
+    });
+
+    it("keeps the newest reading", async () => {
+      const { accounts } = service();
+      const now = new Date();
+      const { worker, pool } = await poolFixture();
+      const first = await ownPoolRun(worker, pool.id);
+      const second = await ownPoolRun(worker, pool.id);
+
+      await accounts.noteAccountRateLimit({ run: first, rateLimit: report(40), now });
+      expect(await accounts.noteAccountRateLimit({ run: second, rateLimit: report(35), now: at(now, -60_000) }))
+        .toEqual({ accountId: pool.id, saved: false });
+      expect((await accountRow(pool.id)).providerQuota).toEqual(report(40));
+
+      await accounts.noteAccountRateLimit({ run: second, rateLimit: report(41), now: at(now, 60_000) });
+      expect((await accountRow(pool.id)).providerQuota).toEqual(report(41));
+    });
+
+    it("saves nothing without the run's own pool attribution or a valid report", async () => {
+      const { accounts } = service();
+      const now = new Date();
+      const { worker, pool } = await poolFixture();
+      const deviceLogin = await run(worker, { status: "succeeded" });
+      expect(await accounts.noteAccountRateLimit({ run: deviceLogin, rateLimit: report(10), now })).toEqual({ accountId: null, saved: false });
+
+      // An attribution copied from another run does not count.
+      const copied = await run(worker, { status: "succeeded" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { aiConnection: { mode: "pool_account", accountId: pool.id, runId: deviceLogin.id } } })
+        .where(eq(heartbeatRuns.id, copied.id));
+      expect(await accounts.noteAccountRateLimit({ run: copied, rateLimit: report(10), now })).toEqual({ accountId: null, saved: false });
+
+      const own = await ownPoolRun(worker, pool.id);
+      for (const rateLimit of [null, {}, { windows: [] }, { windows: [{ id: "Bad Id", usedPercent: 5 }] }]) {
+        expect(await accounts.noteAccountRateLimit({ run: own, rateLimit, now })).toEqual({ accountId: null, saved: false });
+      }
+      expect(await accountRow(pool.id)).toMatchObject({ providerQuota: null, providerQuotaObservedAt: null });
+    });
+  });
+
   describe("handleRunAuthFailure", () => {
     const authFailure = (worker: AgentRow, poolId: string, resultJson: Record<string, unknown> = {}) =>
       failedPoolRun({ worker, poolId, errorCode: "claude_auth_required", error: "Invalid API key · Please run /login", resultJson });

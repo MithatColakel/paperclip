@@ -419,6 +419,7 @@ export function accountOptionsWithCurrent(
       state: account.state,
       exhaustedUntil: account.exhaustedUntil,
       limitSource: account.limitSource,
+      providerQuota: null,
       canBind: true,
       agents: [],
       devices: [],

@@ -322,6 +322,36 @@ Pages:
   `ai_account.limit_reached` (once per limit) and `ai_account.signed_out` in
   the run's company.
 
+### Provider quota readings
+
+A setup token cannot read the account's official usage: Anthropic's usage
+endpoint (`api/oauth/usage`) answers 403 for it, because the token lacks the
+profile scope. Claude Code itself prints the account's limits on its stream
+during a run (`rate_limit_event`, with each window's utilization and reset),
+so Paperclip keeps the latest of those per pool account:
+
+- **Capture.** The `claude_local` stream parser keeps the last reading of each
+  window a run printed and returns it as the adapter result's
+  `providerRateLimit`. When the run ends, with any outcome (a limit too), run
+  completion saves it on the run's pool account (`ai_accounts.provider_quota`
+  and `provider_quota_observed_at`), only for the run's own `pool_account`
+  attribution; a device login, a company pool or an unbound run saves nothing.
+  An older reading never replaces a newer one, and a malformed one is dropped.
+  The ACP engine prints no such event, so its runs save nothing.
+- **Shown.** `providerQuota` on `GET /api/me/ai-accounts`, the company account
+  list and `GET /api/instance/ai-accounts`, to everyone who sees the account's
+  state; it carries no run id. Each subscription account card shows each window
+  as a bar ("Weekly limit · 32% used · Resets Fri 09:00"), the age of the
+  reading, and "no reading yet" before the first run that printed one. A window
+  whose reset has passed shows "Reset" until the next run brings a new reading.
+- **Scope.** The reading counts all use of the account, also outside
+  Paperclip, unlike the per-account usage rows (Paperclip's own runs, from cost
+  events). It is only as fresh as the last run on the account.
+- **Display only.** Selection, waits, limits and probes never read it, so the
+  product rule holds: no account is picked, skipped or moved because of it.
+- **New token.** Replacing the token clears the reading, because the new token
+  may belong to another subscription.
+
 ### Bindings
 
 An agent's binding (`ai_account_agent_bindings`) is read at every run start, so

@@ -81,7 +81,8 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   processRunCancellationSettlements: Pick<HeartbeatRunControlDependencies["processRunCancellationSettlements"], "get">;
   failedProcessRunCancellations: HeartbeatRunCompletionDependencies["processRunCancellationSettlements"];
   /** Fork: account limits and sign-in failures (hooks H9, H10, H14). The service always passes it. */
-  heartbeatAiAccounts?: Pick<HeartbeatAiAccounts, "handleProviderLimit" | "handleRunAuthFailure" | "noteAccountRunSucceeded">;
+  heartbeatAiAccounts?: Pick<HeartbeatAiAccounts, "handleProviderLimit" | "handleRunAuthFailure" | "noteAccountRunSucceeded">
+    & Partial<Pick<HeartbeatAiAccounts, "noteAccountRateLimit">>;
 }
 
 interface RunCompletionOutput {
@@ -770,6 +771,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         );
       }
       const livenessRun = finalizedRun;
+      // Fork: the provider's own usage report for the run's pool account, for display only.
+      if (heartbeatAiAccounts?.noteAccountRateLimit && adapterResult.providerRateLimit) {
+        await heartbeatAiAccounts.noteAccountRateLimit({ run: livenessRun, rateLimit: adapterResult.providerRateLimit }).catch((err) => {
+          logger.warn({ err, runId: livenessRun.id }, "failed to save a pool account's provider quota reading");
+        });
+      }
       await measureRunPhase("completion.summary", () => refreshContinuationSummaryForRun(livenessRun, agent));
       if (await pendingCaseHandoffForRun(db, livenessRun.id, livenessRun.companyId)) {
         // The returning agent must resume its own settled session with the

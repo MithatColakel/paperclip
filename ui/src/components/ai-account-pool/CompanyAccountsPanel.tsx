@@ -7,6 +7,7 @@ import {
   maskEmail,
 } from "@/lib/ai-account-pool";
 import { AiAccountStateBadge } from "./AccountSelect";
+import { ProviderQuotaMeter } from "./ProviderQuotaMeter";
 
 function ownerLine(account: CompanyAiAccountOption): string {
   if (account.ownedByMe) return "Yours";
@@ -38,6 +39,9 @@ export function CompanyAccountsPanel({ accounts, now }: { accounts: readonly Com
               {agents.length > 0 ? `Agents: ${agents.join(", ")}` : "No agent here uses it yet."}
             </p>
             {devices.length > 0 && <p className="text-xs text-muted-foreground">Devices: {devices.join(", ")}</p>}
+            {account.credentialType === "subscription" || account.providerQuota ? (
+              <ProviderQuotaMeter quota={account.providerQuota} now={now} />
+            ) : null}
           </li>
         );
       })}

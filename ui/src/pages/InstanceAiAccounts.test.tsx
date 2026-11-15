@@ -195,6 +195,7 @@ function account(overrides: Partial<InstanceAiAccountSummary>): InstanceAiAccoun
     exhaustedUntil: null,
     limitReason: null,
     limitSource: null,
+    providerQuota: null,
     limitStrikes: 0,
     lastLimitedAt: null,
     legacyHostId: null,

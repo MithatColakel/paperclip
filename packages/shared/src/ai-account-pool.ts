@@ -6,6 +6,7 @@ import {
   type AiAccountHostKind,
   type AiAccountLimitReason,
   type AiAccountProjectSummary,
+  type AiAccountProviderQuota,
   type AiAccountStatus,
   type AiAccountUsage,
 } from "./ai-account-hosts.js";
@@ -530,6 +531,8 @@ export interface MyAiAccount {
   /** Number of other companies whose agents use the account. */
   otherCompanies: number;
   usage: AiAccountUsage;
+  /** The provider's own last usage report, from a run; null until a run printed one. */
+  providerQuota: AiAccountProviderQuota | null;
   lastUsedAt: string | null;
   createdAt: string;
 }
@@ -553,6 +556,8 @@ export interface CompanyAiAccountOption {
   state: AiAccountState;
   exhaustedUntil: string | null;
   limitSource: AiAccountLimitSource | null;
+  /** The provider's own last usage report, from a run; null until a run printed one. */
+  providerQuota: AiAccountProviderQuota | null;
   /** Whether this caller may bind the account to an agent of this company. */
   canBind: boolean;
   /** This company's agents bound to the account. */
@@ -862,6 +867,8 @@ export interface InstanceAiAccountSummary {
   reservedProjects: AiAccountProjectSummary[];
   companies: Array<{ companyId: string; companyName: string; agentCount: number }>;
   usage: AiAccountUsage;
+  /** The provider's own last usage report, from a run; null until a run printed one. */
+  providerQuota: AiAccountProviderQuota | null;
   lastUsedAt: string | null;
   createdAt: string;
 }

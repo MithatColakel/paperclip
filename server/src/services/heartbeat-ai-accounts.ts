@@ -23,6 +23,7 @@ import {
   findPoolRunForbiddenEnvKeys,
   findPoolRunSettingsConflicts,
   isResourceWaitErrorCode,
+  normalizeAiAccountProviderQuota,
   type AiAccountBindingMode,
   type AiAccountCredentialType,
   type AiAccountLimitSource,
@@ -1158,6 +1159,12 @@ export interface AccountRunSucceededOutcome {
   episodeResolved: boolean;
 }
 
+export interface AccountRateLimitOutcome {
+  /** The account whose provider quota reading was saved, if any. */
+  accountId: string | null;
+  saved: boolean;
+}
+
 interface FailureInput {
   /** The finished run (status `failed`). */
   run: HeartbeatRunRow;
@@ -1852,6 +1859,39 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     return result;
   }
 
+  /**
+   * Fork: saves the provider's own usage report a finished run saw (Claude
+   * Code's `rate_limit_event`) on the run's pool account, so account pages
+   * can show it. Any outcome counts, a limit too. Only the run's own pool
+   * attribution qualifies; a device login, a company pool or an unbound run
+   * saves nothing. A reading never replaces a newer one. Display only:
+   * selection, waits and limits never read it, so it changes no run.
+   */
+  async function noteAccountRateLimit(input: {
+    run: Pick<HeartbeatRunRow, "id">;
+    rateLimit: unknown;
+    now?: Date;
+  }): Promise<AccountRateLimitOutcome> {
+    const snapshot = normalizeAiAccountProviderQuota(input.rateLimit);
+    if (!snapshot) return { accountId: null, saved: false };
+    const [row] = await db
+      .select({ aiConnection: sql<unknown>`${heartbeatRuns.contextSnapshot} -> 'aiConnection'` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, input.run.id));
+    const attribution = row ? ownPoolAttribution({ id: input.run.id, contextSnapshot: { aiConnection: row.aiConnection } }) : null;
+    if (!attribution) return { accountId: null, saved: false };
+    const now = input.now ?? clock();
+    const saved = await db
+      .update(aiAccounts)
+      .set({ providerQuota: snapshot, providerQuotaObservedAt: now })
+      .where(and(
+        eq(aiAccounts.id, attribution.accountId),
+        sql`(${aiAccounts.providerQuotaObservedAt} is null or ${aiAccounts.providerQuotaObservedAt} <= ${now.toISOString()}::timestamptz)`,
+      ))
+      .returning({ id: aiAccounts.id });
+    return { accountId: attribution.accountId, saved: saved.length > 0 };
+  }
+
   return {
     readBinding: (input: Parameters<typeof readBinding>[1]) => readBinding(db, input),
     planCredential,
@@ -1866,6 +1906,7 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
     handleCompanyPoolLimit,
     handleRunAuthFailure,
     noteAccountRunSucceeded,
+    noteAccountRateLimit,
   };
 }
 

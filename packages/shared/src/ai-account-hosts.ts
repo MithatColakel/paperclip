@@ -74,6 +74,85 @@ export interface AiAccountUsage {
   thisMonth: AiAccountUsageWindow;
 }
 
+/** One provider limit window, e.g. `five_hour` or `seven_day`. */
+export interface AiAccountProviderQuotaWindow {
+  /** The provider's window name (lowercase letters, digits and `_`). */
+  id: string;
+  /** Share of the window used, 0–100 (above 100 only if the provider says so). */
+  usedPercent: number | null;
+  resetsAt: string | null;
+  /** The provider's word for the window, e.g. `allowed`, `allowed_warning`, `rejected`. */
+  status: string | null;
+}
+
+/**
+ * Fork: the account's official usage as the provider reported it to the CLI
+ * during the latest run on the account that printed a report (Claude Code's
+ * `rate_limit_event`). It covers all use of the account, also outside
+ * Paperclip, but it is only as fresh as `observedAt`. Display only: Paperclip
+ * never picks, skips or moves an account on it.
+ */
+export interface AiAccountProviderQuota {
+  observedAt: string;
+  status: string | null;
+  usingOverage: boolean | null;
+  windows: AiAccountProviderQuotaWindow[];
+}
+
+/** What `ai_accounts.provider_quota` holds; the observation time is its own column. */
+export type AiAccountProviderQuotaSnapshot = Omit<AiAccountProviderQuota, "observedAt">;
+
+const PROVIDER_QUOTA_WINDOW_ID = /^[a-z0-9_]{1,40}$/;
+const PROVIDER_QUOTA_STATUS = /^[a-z0-9_]{1,40}$/;
+export const AI_ACCOUNT_PROVIDER_QUOTA_MAX_WINDOWS = 8;
+
+function quotaStatus(value: unknown): string | null {
+  return typeof value === "string" && PROVIDER_QUOTA_STATUS.test(value) ? value : null;
+}
+
+function quotaPercent(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.min(1000, Math.round(value * 10) / 10);
+}
+
+function quotaInstant(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+/**
+ * Validates a provider quota snapshot from an adapter or the database: a
+ * malformed one is dropped (null), unknown fields are removed, and windows are
+ * capped. It never throws.
+ */
+export function normalizeAiAccountProviderQuota(value: unknown): AiAccountProviderQuotaSnapshot | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.windows)) return null;
+  const seen = new Set<string>();
+  const windows: AiAccountProviderQuotaWindow[] = [];
+  for (const raw of record.windows) {
+    if (windows.length >= AI_ACCOUNT_PROVIDER_QUOTA_MAX_WINDOWS) break;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.id !== "string" || !PROVIDER_QUOTA_WINDOW_ID.test(entry.id) || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    windows.push({
+      id: entry.id,
+      usedPercent: quotaPercent(entry.usedPercent),
+      resetsAt: quotaInstant(entry.resetsAt),
+      status: quotaStatus(entry.status),
+    });
+  }
+  if (windows.length === 0) return null;
+  return {
+    status: quotaStatus(record.status),
+    usingOverage: typeof record.usingOverage === "boolean" ? record.usingOverage : null,
+    windows,
+  };
+}
+
 export interface AiAccountSummary {
   id: string;
   /** The legacy host the account was added to; null for pool accounts. */

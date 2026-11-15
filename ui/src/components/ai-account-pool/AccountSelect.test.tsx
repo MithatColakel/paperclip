@@ -49,6 +49,7 @@ function option(overrides: Partial<CompanyAiAccountOption> = {}): CompanyAiAccou
     state: "active",
     exhaustedUntil: null,
     limitSource: null,
+    providerQuota: null,
     canBind: true,
     agents: [],
     devices: [],

@@ -25,6 +25,7 @@ import { aiAccountHostsApi } from "@/api/ai-account-hosts";
 import { aiAccountPoolApi, aiAccountPoolKeys, invalidateAiAccountPoolQueries } from "@/api/ai-account-pool";
 import { executionDeviceKeys, executionDevicesApi } from "@/api/execution-devices";
 import { AiAccountStateBadge } from "@/components/ai-account-pool/AccountSelect";
+import { ProviderQuotaMeter } from "@/components/ai-account-pool/ProviderQuotaMeter";
 import { DeviceLinkDialog, type DeviceLinkRequest } from "@/components/ai-accounts/DeviceLinkDialog";
 import {
   HOST_KIND_DESCRIPTIONS,
@@ -691,6 +692,9 @@ function InstanceAccountRow({
       ) : null}
       {account.legacyHostName ? (
         <p className="text-xs text-muted-foreground">Added to {account.legacyHostName} before accounts had owners.</p>
+      ) : null}
+      {account.credentialType === "subscription" || account.providerQuota ? (
+        <ProviderQuotaMeter quota={account.providerQuota} />
       ) : null}
       <AccountUsage account={account} />
 

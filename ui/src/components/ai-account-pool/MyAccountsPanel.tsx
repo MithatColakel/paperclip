@@ -28,6 +28,7 @@ import {
 } from "@/lib/ai-account-pool";
 import { cn, formatCents, formatDateTime, relativeTime } from "@/lib/utils";
 import { AiAccountStateBadge } from "./AccountSelect";
+import { ProviderQuotaMeter } from "./ProviderQuotaMeter";
 import {
   PoolCredentialField,
   cleanCredentialValue,
@@ -242,6 +243,9 @@ function MyAccountCard({ account, now }: { account: MyAiAccount; now?: Date }) {
       )}
 
       <AccountUsedBy account={account} />
+      {account.credentialType === "subscription" || account.providerQuota ? (
+        <ProviderQuotaMeter quota={account.providerQuota} />
+      ) : null}
       <AccountUsage account={account} />
 
       {error && (

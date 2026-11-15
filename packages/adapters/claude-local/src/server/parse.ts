@@ -1,4 +1,4 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterProviderRateLimit, AdapterProviderRateLimitWindow, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
@@ -66,6 +66,69 @@ export function claudeModelReceipts(modelUsage: unknown) {
   return receipts.every((part) => part !== null) ? receipts : undefined;
 }
 
+const RATE_LIMIT_WORD = /^[a-z0-9_]{1,40}$/;
+const RATE_LIMIT_MAX_WINDOWS = 8;
+
+function rateLimitWord(value: unknown): string | null {
+  return typeof value === "string" && RATE_LIMIT_WORD.test(value) ? value : null;
+}
+
+/** Claude Code reports utilization as a fraction (0.32 = 32 %). */
+function rateLimitPercent(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.min(1000, Math.round(value * 1000) / 10);
+}
+
+/** Unix seconds (or milliseconds), or an ISO string. */
+function rateLimitInstant(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const date = new Date(value > 1e12 ? value : value * 1000);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
+  return null;
+}
+
+/**
+ * Fork: folds one top-level `rate_limit_event` into the run's report. Each
+ * window keeps its latest reading; `unifiedWindows` lists the windows, and an
+ * older CLI that names only `rateLimitType` gives that one window.
+ */
+export function foldClaudeRateLimitEvent(
+  event: Record<string, unknown>,
+  previous: AdapterProviderRateLimit | null,
+): AdapterProviderRateLimit | null {
+  const info = parseObject(event.rate_limit_info);
+  if (Object.keys(info).length === 0) return previous;
+  const windows = new Map<string, AdapterProviderRateLimitWindow>((previous?.windows ?? []).map((window) => [window.id, window]));
+  let added = 0;
+  const put = (id: string | null, raw: Record<string, unknown>, fallbackStatus: string | null) => {
+    if (!id) return;
+    if (!windows.has(id) && windows.size >= RATE_LIMIT_MAX_WINDOWS) return;
+    added += 1;
+    windows.set(id, {
+      id,
+      usedPercent: rateLimitPercent(raw.utilization),
+      resetsAt: rateLimitInstant(raw.resetsAt ?? raw.resets_at),
+      status: rateLimitWord(raw.status) ?? fallbackStatus,
+    });
+  };
+  const status = rateLimitWord(info.status);
+  const unified = parseObject(info.unifiedWindows);
+  if (Object.keys(unified).length > 0) {
+    for (const [id, raw] of Object.entries(unified)) put(rateLimitWord(id), parseObject(raw), null);
+  } else {
+    put(rateLimitWord(info.rateLimitType), info, status);
+  }
+  // A report without a readable window changes nothing.
+  if (added === 0) return previous;
+  const usingOverage = typeof info.isUsingOverage === "boolean" ? info.isUsingOverage : previous?.usingOverage ?? null;
+  return { status: status ?? previous?.status ?? null, usingOverage, windows: [...windows.values()] };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   return createClaudeStreamParser()(stdout);
 }
@@ -79,6 +142,7 @@ export function createClaudeStreamParser() {
   const messageUsage = new Map<string, UsageSummary>();
   let anonymousMessage = 0;
   const observedTotals = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  let rateLimit: AdapterProviderRateLimit | null = null;
 
   return (stdout: string) => {
     for (const rawLine of stdout.split(/\r?\n/)) {
@@ -123,6 +187,11 @@ export function createClaudeStreamParser() {
         continue;
       }
 
+      if (type === "rate_limit_event") {
+        rateLimit = foldClaudeRateLimitEvent(event, rateLimit);
+        continue;
+      }
+
       if (type === "result") {
         finalResult = event;
         sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
@@ -138,6 +207,7 @@ export function createClaudeStreamParser() {
         usageBasis: "per_run" as const,
         summary: assistantTexts.join("\n\n").trim(),
         resultJson: null as Record<string, unknown> | null,
+        rateLimit,
       };
     }
 
@@ -162,6 +232,7 @@ export function createClaudeStreamParser() {
       usageBasis: "per_run" as const,
       summary,
       resultJson: finalResult,
+      rateLimit,
     };
   };
 }

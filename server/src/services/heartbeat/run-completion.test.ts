@@ -141,6 +141,30 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.status).toBe("in_progress");
   });
 
+  it("saves the provider's usage report on the run's own pool account", async () => {
+    const runId = randomUUID();
+    const [account] = await db.insert(aiAccounts).values({ credentialType: "subscription", label: "Max", credentialFingerprint: randomUUID(),
+      credentialMaterial: { provider: "local_encrypted", ciphertext: "sealed" } }).returning();
+    const f = await fixture({ id: runId, contextSnapshot: { aiConnection: { mode: "pool_account", accountId: account.id, runId } } });
+    const providerRateLimit = { status: "allowed", usingOverage: false,
+      windows: [{ id: "seven_day", usedPercent: 32, resetsAt: "2026-11-20T06:00:00.000Z", status: "allowed" }] };
+    f.input.adapterResult = { ...f.input.adapterResult, providerRateLimit };
+    const resourceWaits = {
+      scheduleResourceWait: vi.fn(),
+      noteRunPassed: vi.fn(async () => ({ resolved: false, episodeId: null })),
+      noteRunRefused: vi.fn(),
+      wakeResourceWaits: vi.fn(async () => ({ runIds: [], agentIds: [], companyIds: [] })),
+    };
+    const heartbeatAiAccounts = createHeartbeatAiAccounts({ db, resourceWaits, deploymentMode: "authenticated",
+      deps: { appendRunEvent: vi.fn(async () => {}), scheduleBoundedRetryForRun: vi.fn() } });
+
+    await createHeartbeatRunCompletion(db, { ...f.deps, heartbeatAiAccounts }).completeRun(f.input);
+
+    const [after] = await db.select().from(aiAccounts).where(eq(aiAccounts.id, account.id));
+    expect(after?.providerQuota).toEqual(providerRateLimit);
+    expect(after?.providerQuotaObservedAt).toBeInstanceOf(Date);
+  });
+
   it.each(["succeeded", "failed"] as const)("settles a pool account after a %s run that handed off its case, without an account wait", async outcome => {
     const runId = randomUUID();
     const [account] = await db.insert(aiAccounts).values({ credentialType: "subscription", label: "Max", credentialFingerprint: randomUUID(),

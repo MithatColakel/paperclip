@@ -99,6 +99,24 @@ export type AdapterExecutionErrorFamily =
   | "refresh_token_expired"
   | "refresh_token_invalidated";
 
+/** Fork: one provider limit window as a CLI reported it. */
+export interface AdapterProviderRateLimitWindow {
+  /** The provider's window name, e.g. "five_hour" or "seven_day". */
+  id: string;
+  /** Share of the window used, 0–100. */
+  usedPercent: number | null;
+  resetsAt: string | null;
+  /** The provider's word, e.g. "allowed", "allowed_warning" or "rejected". */
+  status: string | null;
+}
+
+/** Fork: the provider's usage report a run saw for its account. */
+export interface AdapterProviderRateLimit {
+  status: string | null;
+  usingOverage: boolean | null;
+  windows: AdapterProviderRateLimitWindow[];
+}
+
 export interface AdapterExecutionResult {
   /** Positive evidence for retrying bootstrap; absent evidence never authorizes replay. */
   executionRecovery?: { kind: "bootstrap"; providerWorkStarted: false } | {
@@ -123,6 +141,13 @@ export interface AdapterExecutionResult {
   classificationSource?: "terminal" | "transcript" | null;
   /** Fork: "provider_terminal" when `retryNotBefore` is the provider's own reset time. */
   retryNotBeforeSource?: "provider_terminal" | null;
+  /**
+   * Fork: the provider's own usage report for the account this run used, as
+   * the CLI printed it on its terminal stream (Claude Code's
+   * `rate_limit_event`; the last report per window wins). Display only:
+   * Paperclip never picks, skips or moves an account on it.
+   */
+  providerRateLimit?: AdapterProviderRateLimit | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /** Complete per-model receipts, when supplied by the runtime. Their sums must match the run totals. */

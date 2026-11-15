@@ -3,6 +3,7 @@ import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react
 import type {
   AgentAiAccountBindingDetail,
   AiAccountLimitSource,
+  AiAccountProviderQuota,
   AiAccountState,
   AiConnectionList,
   AiRuntimeConnectionBinding,
@@ -37,6 +38,7 @@ import {
 import { queryKeys } from "@/lib/queryKeys";
 import type { ResourceWaitLedgerRunLike, ResourceWaitRunLike } from "@/lib/resource-wait";
 import { AccountSelect, AiAccountStateBadge } from "./AccountSelect";
+import { ProviderQuotaMeter } from "./ProviderQuotaMeter";
 import { AgentClaudeAccountField, AgentClaudeAccountLeftOver } from "./AgentClaudeAccountField";
 import { RunResourceWaitBadge } from "./RunResourceWaitBadge";
 
@@ -91,6 +93,7 @@ function option(overrides: Partial<CompanyAiAccountOption>): CompanyAiAccountOpt
     state: "active",
     exhaustedUntil: null,
     limitSource: null,
+    providerQuota: null,
     canBind: true,
     agents: [],
     devices: [],
@@ -575,6 +578,35 @@ function createExampleClient(now: Date): QueryClient {
   return client;
 }
 
+/** Provider quota readings: mid-week, close to the weekly limit, and none yet. */
+function providerQuotaSamples(now: Date): Array<{ key: string; quota: AiAccountProviderQuota | null }> {
+  const hours = (count: number) => new Date(now.getTime() + count * 3_600_000).toISOString();
+  return [
+    {
+      key: "mid-week",
+      quota: {
+        observedAt: hours(-0.5),
+        status: "allowed",
+        usingOverage: false,
+        windows: [
+          { id: "seven_day", usedPercent: 32, resetsAt: hours(4 * 24 + 13), status: "allowed" },
+          { id: "five_hour", usedPercent: 12, resetsAt: hours(3), status: "allowed" },
+        ],
+      },
+    },
+    {
+      key: "near-limit",
+      quota: {
+        observedAt: hours(-2),
+        status: "allowed_warning",
+        usingOverage: false,
+        windows: [{ id: "seven_day", usedPercent: 92, resetsAt: hours(40), status: "allowed_warning" }],
+      },
+    },
+    { key: "none", quota: null },
+  ];
+}
+
 function Example({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="space-y-2">
@@ -626,6 +658,7 @@ export function AccountPoolDesignExamples() {
     badges: stateBadgeSamples(now),
     waitingTasks: waitingTaskSamples(now),
     ledger: ledgerRuns(now),
+    providerQuotas: providerQuotaSamples(now),
   }));
   const [linkRequest, setLinkRequest] = useState<DeviceLinkRequest | null>(null);
   return (
@@ -684,6 +717,13 @@ export function AccountPoolDesignExamples() {
           <div className="flex flex-wrap items-center gap-2">
             {samples.badges.map((account) => (
               <AiAccountStateBadge key={`${account.state}:${account.limitSource ?? ""}`} display={aiAccountStateDisplay(account, now)} />
+            ))}
+          </div>
+        </Example>
+        <Example title="ProviderQuotaMeter: the account's Claude usage from its latest run">
+          <div className="max-w-md space-y-4">
+            {samples.providerQuotas.map((sample) => (
+              <ProviderQuotaMeter key={sample.key} quota={sample.quota} now={now} />
             ))}
           </div>
         </Example>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
+  foldClaudeRateLimitEvent,
   parseClaudeStreamJson,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -707,5 +708,58 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
     expect(parsed.usageBasis).toBe("per_run");
     expect(parsed.costUsd).toBeNull();
+  });
+});
+
+describe("Claude rate-limit reports", () => {
+  // The shape Claude Code 2.1.x prints on stream-json (seen on production runs).
+  const event = (utilization: number, extra: Record<string, unknown> = {}) => JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "allowed",
+      resetsAt: 1795154400,
+      rateLimitType: "seven_day",
+      overageStatus: "rejected",
+      overageDisabledReason: "org_level_disabled",
+      isUsingOverage: false,
+      unifiedWindows: { seven_day: { utilization, resetsAt: 1795154400 } },
+      ...extra,
+    },
+  });
+
+  it("keeps the last reading of each window, also without a final result", () => {
+    const stdout = [
+      event(0.31),
+      JSON.stringify({ type: "assistant", message: { id: "m1", content: [{ type: "text", text: "working" }] } }),
+      event(0.32, { unifiedWindows: { seven_day: { utilization: 0.32, resetsAt: 1795154400, status: "allowed" }, five_hour: { utilization: 0.054, resetsAt: 1794782400 } } }),
+    ].join("\n");
+    expect(parseClaudeStreamJson(stdout).rateLimit).toEqual({
+      status: "allowed",
+      usingOverage: false,
+      windows: [
+        { id: "seven_day", usedPercent: 32, resetsAt: "2026-11-20T06:00:00.000Z", status: "allowed" },
+        { id: "five_hour", usedPercent: 5.4, resetsAt: new Date(1794782400 * 1000).toISOString(), status: null },
+      ],
+    });
+  });
+
+  it("reads an older report that names only its window type", () => {
+    const folded = foldClaudeRateLimitEvent({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", rateLimitType: "five_hour", utilization: 1, resetsAt: "2026-11-15T20:00:00Z" },
+    }, null);
+    expect(folded).toEqual({
+      status: "rejected",
+      usingOverage: null,
+      windows: [{ id: "five_hour", usedPercent: 100, resetsAt: "2026-11-15T20:00:00.000Z", status: "rejected" }],
+    });
+  });
+
+  it("ignores malformed reports and keeps none when the run printed none", () => {
+    expect(parseClaudeStreamJson(JSON.stringify({ type: "result", result: "ok" })).rateLimit).toBeNull();
+    expect(foldClaudeRateLimitEvent({ type: "rate_limit_event" }, null)).toBeNull();
+    expect(foldClaudeRateLimitEvent({ type: "rate_limit_event", rate_limit_info: { unifiedWindows: { "Bad Name": { utilization: 0.5 } } } }, null)).toBeNull();
+    const kept = foldClaudeRateLimitEvent(JSON.parse(event(0.2)), null);
+    expect(foldClaudeRateLimitEvent({ type: "rate_limit_event", rate_limit_info: { status: 42 } }, kept)).toBe(kept);
   });
 });

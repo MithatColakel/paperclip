@@ -7,6 +7,8 @@ export type {
   AdapterBillingType,
   AdapterRuntimeServiceReport,
   AdapterExecutionResult,
+  AdapterProviderRateLimit,
+  AdapterProviderRateLimitWindow,
   AdapterInvocationMeta,
   AdapterRuntimeEvent,
   AdapterRuntimeMcpServer,

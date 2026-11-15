@@ -640,6 +640,37 @@ describeEmbeddedPostgres("account pool service (database)", () => {
       expect(entries[0]!.details).toMatchObject({ accountLabel: "Max" });
     });
 
+    it("shows the provider's last report to the owner, company members and instance admins, and drops it on a new token", async () => {
+      const companyId = await company();
+      await user("owner");
+      await user("peer");
+      await member(companyId, "owner");
+      await member(companyId, "peer");
+      const owner = board("owner", [[companyId, "operator"]]);
+      const created = await pool.create(ctx(owner), { label: "Max", credentialType: "subscription", value: sub(`q-${tag()}`) });
+      // No run has reported yet.
+      expect((await pool.listMine(ctx(owner))).accounts.find((account) => account.id === created.id)?.providerQuota).toBeNull();
+
+      const observedAt = new Date("2026-11-15T17:17:40.000Z");
+      const snapshot = { status: "allowed", usingOverage: false, windows: [{ id: "seven_day", usedPercent: 32, resetsAt: "2026-11-20T06:00:00.000Z", status: "allowed" }] };
+      await db.update(aiAccounts).set({ providerQuota: snapshot, providerQuotaObservedAt: observedAt }).where(eq(aiAccounts.id, created.id));
+      const expected = { observedAt: observedAt.toISOString(), ...snapshot };
+
+      expect((await pool.listMine(ctx(owner))).accounts.find((account) => account.id === created.id)?.providerQuota).toEqual(expected);
+      const peerView = await pool.listForCompany(ctx(board("peer", [[companyId, "operator"]])), companyId);
+      expect(peerView.accounts.find((account) => account.id === created.id)?.providerQuota).toEqual(expected);
+      expect((await pool.listAll()).accounts.find((account) => account.id === created.id)?.providerQuota).toEqual(expected);
+
+      // A stored value that no longer validates is not shown.
+      await db.update(aiAccounts).set({ providerQuota: { windows: "broken" } as never }).where(eq(aiAccounts.id, created.id));
+      expect((await pool.listAll()).accounts.find((account) => account.id === created.id)?.providerQuota).toBeNull();
+
+      await db.update(aiAccounts).set({ providerQuota: snapshot }).where(eq(aiAccounts.id, created.id));
+      const replaced = await pool.replaceCredential(ctx(owner), created.id, { value: sub(`q2-${tag()}`) });
+      expect(replaced.providerQuota).toBeNull();
+      expect((await db.select().from(aiAccounts).where(eq(aiAccounts.id, created.id)))[0]).toMatchObject({ providerQuota: null, providerQuotaObservedAt: null });
+    });
+
     it("refuses a duplicate credential or e-mail with a generic 409", async () => {
       const companyId = await company();
       await user("one");

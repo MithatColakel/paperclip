@@ -1,6 +1,12 @@
 import { sql } from "drizzle-orm";
 import { boolean, check, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
-import type { AiAccountCredentialType, AiAccountHostKind, AiAccountLimitReason, AiAccountStatus } from "@paperclipai/shared";
+import type {
+  AiAccountCredentialType,
+  AiAccountHostKind,
+  AiAccountLimitReason,
+  AiAccountProviderQuotaSnapshot,
+  AiAccountStatus,
+} from "@paperclipai/shared";
 import { environments } from "./environments.js";
 import { projects } from "./projects.js";
 
@@ -103,6 +109,13 @@ export const aiAccounts = pgTable("ai_accounts", {
   /** The first unconfirmed auth failure (two-strike rule). */
   authSuspectAt: timestamp("auth_suspect_at", { withTimezone: true }),
   authSuspectRunId: uuid("auth_suspect_run_id"),
+  /**
+   * Fork: the provider's own last usage report from a run on this account
+   * (Claude Code's `rate_limit_event`), and when that run reported it.
+   * Display only; selection and waits never read it.
+   */
+  providerQuota: jsonb("provider_quota").$type<AiAccountProviderQuotaSnapshot>(),
+  providerQuotaObservedAt: timestamp("provider_quota_observed_at", { withTimezone: true }),
   ownerUserId: text("owner_user_id"),
   origin: text("origin").$type<"pool" | "legacy_host_pool">().notNull().default("pool"),
   /** Instance-admin withdrawal, separate from the owner's `status`. Only admins clear it. */

@@ -1073,6 +1073,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
         billingType,
         costUsd: parsedStream.costUsd,
+        providerRateLimit: parsedStream.rateLimit,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
@@ -1159,6 +1160,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
         billingType,
         costUsd: parsedStream.costUsd,
+        providerRateLimit: parsedStream.rateLimit,
         errorMessage: fallbackErrorMessage,
         errorCode,
         errorFamily,
@@ -1371,6 +1373,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       model: Object.keys(parseObject(parsed.modelUsage)).length > 1 ? "mixed" : parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd,
+      providerRateLimit: parsedStream.rateLimit,
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession:

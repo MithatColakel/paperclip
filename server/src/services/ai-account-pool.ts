@@ -18,6 +18,7 @@ import {
 import {
   credentialTypeOfValue,
   deriveAiAccountState,
+  normalizeAiAccountProviderQuota,
   type AgentAiAccountBindingDetail,
   type AgentAiAccountBindingSummary,
   type AiAccountBindingAccountRef,
@@ -29,6 +30,7 @@ import {
   type AiAccountOwnerRef,
   type AiAccountPlanWaitReason,
   type AiAccountProjectSummary,
+  type AiAccountProviderQuota,
   type AiAccountSelectionWarning,
   type AiAccountUnselectableReason,
   type AiAccountUsage,
@@ -111,6 +113,16 @@ import { noteDeviceOverLimit } from "./attention-resource-waits.js";
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type PoolDb = Db | Tx;
 export type AiAccountRow = typeof aiAccounts.$inferSelect;
+
+/** Fork: the provider's last usage report saved on the account, for display only. */
+export function providerQuotaOf(
+  row: Pick<AiAccountRow, "providerQuota" | "providerQuotaObservedAt">,
+): AiAccountProviderQuota | null {
+  const snapshot = normalizeAiAccountProviderQuota(row.providerQuota);
+  return snapshot && row.providerQuotaObservedAt
+    ? { observedAt: row.providerQuotaObservedAt.toISOString(), ...snapshot }
+    : null;
+}
 export type PoolAgentRow = Pick<
   typeof agents.$inferSelect,
   "id" | "companyId" | "name" | "status" | "adapterType" | "defaultEnvironmentId" | "runtimeConfig"
@@ -1059,6 +1071,7 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
         usedBy: summarizeUsedBy(accountUses.filter((use) => callerCompanies.has(use.companyId)), devicesByAgent),
         otherCompanies: unique(accountUses.filter((use) => !callerCompanies.has(use.companyId)).map((use) => use.companyId)).length,
         usage: usage.get(row.id) ?? EMPTY_USAGE,
+        providerQuota: providerQuotaOf(row),
         lastUsedAt: iso(row.lastUsedAt),
         createdAt: row.createdAt.toISOString(),
       };
@@ -1118,6 +1131,7 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
         reservedProjects: reservations.get(row.id) ?? [],
         companies: [...companyCounts.values()].sort((a, b) => a.companyName.localeCompare(b.companyName)),
         usage: usage.get(row.id) ?? EMPTY_USAGE,
+        providerQuota: providerQuotaOf(row),
         lastUsedAt: iso(row.lastUsedAt),
         createdAt: row.createdAt.toISOString(),
       };
@@ -1197,6 +1211,7 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
         state: accountStateOf(account, now),
         exhaustedUntil: iso(account.exhaustedUntil),
         limitSource: account.limitSource,
+        providerQuota: providerQuotaOf(account),
         canBind,
         agents: accountUses.map((use) => ({ agentId: use.agentId, agentName: use.agentName })),
         devices: [...deviceRefs.values()],
@@ -1438,6 +1453,9 @@ export function aiAccountPoolService(db: Db, options: AiAccountPoolServiceOption
         limitProbeRunId: null,
         authSuspectAt: null,
         authSuspectRunId: null,
+        // A new token may belong to another subscription; its usage is unknown until a run reports it.
+        providerQuota: null,
+        providerQuotaObservedAt: null,
         updatedAt: touched(aiAccounts.updatedAt, now),
       }).where(eq(aiAccounts.id, account.id)).returning() as [AiAccountRow];
     } catch (error) {
