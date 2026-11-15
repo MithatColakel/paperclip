@@ -3,6 +3,8 @@ export {
   withDedicatedDbConnection,
   livenessDb,
   closeLivenessDb,
+  runWithQueryAbort,
+  closeQueryAbortDb,
   closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
@@ -46,3 +48,4 @@ export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";
 
 export { signalDatabaseWork, subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "./work-signals.js";
+export { QueryAbortedError, isQueryAbortError } from "./query-abort.js";
