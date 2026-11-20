@@ -35,6 +35,8 @@ import { redactCurrentUserText } from "../../log-redaction.js";
 import { isAiAuthenticationFailure } from "../ai-auth-failure.js";
 // Fork: Claude account pool (spec 4.6). The logic lives in this module.
 import { ownPoolAttribution, type HeartbeatAiAccounts } from "../heartbeat-ai-accounts.js";
+import { CODEX_FALLBACK_RETRY_REASON, type HeartbeatCodexFallback } from "../heartbeat-codex-fallback.js";
+import { executionRetryAttemptCount } from "../execution-recovery-attempt.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
@@ -83,6 +85,8 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   /** Fork: account limits and sign-in failures (hooks H9, H10, H14). The service always passes it. */
   heartbeatAiAccounts?: Pick<HeartbeatAiAccounts, "handleProviderLimit" | "handleRunAuthFailure" | "noteAccountRunSucceeded">
     & Partial<Pick<HeartbeatAiAccounts, "noteAccountRateLimit">>;
+  /** Fork: how a Codex fallback run ended (AI-CONNECTIONS.md, "Codex fallback on a device"). */
+  codexFallback?: Pick<HeartbeatCodexFallback, "noteRunEnded">;
 }
 
 interface RunCompletionOutput {
@@ -386,6 +390,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     processRunCancellationSettlements,
     failedProcessRunCancellations,
     heartbeatAiAccounts,
+    codexFallback,
   } = dependencies;
 
   async function completeRun(input: CompleteHeartbeatRunInput) {
@@ -944,7 +949,25 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         retryNotBefore: adapterResult.retryNotBefore ?? null,
         retryNotBeforeSource: adapterResult.retryNotBeforeSource ?? null,
       };
-      if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+      // Fork: Codex fallback. A fallback run Codex served clears any block on its
+      // device; a Codex limit, or a failure before Codex served the run, turns the
+      // fallback off there, and the task is retried at once: the retry goes back
+      // to Claude and waits for its reset (never another account).
+      const codexEnd = codexFallback && (outcome === "succeeded" || outcome === "failed" || outcome === "timed_out")
+        ? await codexFallback.noteRunEnded({ run: livenessRun, provenance }).catch((err) => {
+          logger.warn({ err, runId: livenessRun.id }, "failed to note how a Codex fallback run ended");
+          return null;
+        })
+        : null;
+      if (codexEnd?.blocked) {
+        const retry = await scheduleBoundedRetryForRun(livenessRun, agent, {
+          retryReason: CODEX_FALLBACK_RETRY_REASON,
+          wakeReason: CODEX_FALLBACK_RETRY_REASON,
+          maxAttempts: executionRetryAttemptCount(livenessRun, CODEX_FALLBACK_RETRY_REASON) + 1,
+          delayMs: 1_000,
+        });
+        accountWaitOwnsTask = retry?.outcome === "scheduled";
+      } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
         if (policy.enabled && policy.maxAttempts > 0) {
           await scheduleBoundedRetryForRun(livenessRun, agent, {

@@ -239,7 +239,10 @@ an account. When an account hits its limit, its tasks wait for the reset, start
 again automatically on the same account, and the task's manager agent and the
 board get a notice at once. A task that waits for its device is never moved to
 another device either; the notice tells people how to move the agent
-themselves.
+themselves. One exception, chosen per agent by a company admin: the
+[Codex fallback on a device](#codex-fallback-on-a-device-fork) runs a Claude
+agent on its own device's Codex login until the Claude reset, instead of
+waiting.
 
 Pages:
 
@@ -1132,7 +1135,69 @@ limit or the weekly limit) is handled like a pool account's:
   records the new reset and the task waits again.
 - **Moving on.** A wait whose agent is bound to a pool account, or whose agent
   now resolves another environment, proceeds and plans again. Paperclip never
-  moves a task to another account or device.
+  moves a task to another account or device, except to the device's own Codex
+  login when the agent has the [Codex fallback](#codex-fallback-on-a-device-fork)
+  on.
+
+### Codex fallback on a device (fork)
+
+Since 2026-11-20 (owner decision) a Claude agent (`claude_local`) can run on
+its device's own Codex login while its Claude account is at its usage limit,
+instead of waiting for the reset. This is the one exception to the product rule
+above and to core rule 3 in [AGENTS.md](../../AGENTS.md): it never moves a task
+to another Claude account, another device, or a Codex login that is not that
+device's own.
+
+- **Setting.** `runtimeConfig.codexFallback = { enabled, model?,
+  modelReasoningEffort? }`, set on the agent's Runtime page under "Codex
+  fallback" (`GET`/`PUT /api/agents/:agentId/codex-fallback`). Company members
+  read it; only company admins change it. A change is logged as
+  `agent.codex_fallback_updated` in the agent's company. Turning it on needs a
+  Claude agent whose own default environment is an active device (`sandbox`,
+  Mac Fleet) environment, and wakes the agent's Claude limit waits.
+- **When.** A claimed `claude_local` run of an agent with the fallback on, on
+  its device environment, whose Claude account is at its usage limit now: its
+  pool account's `exhausted_until` (pool-bound agent) or the environment's
+  [device login limit](#device-login-limits-fork) (unbound or `device_login`
+  agent) is ahead. An agent served by an upstream AI connection, a passed reset
+  (the next Claude run tests it), or a Codex block on the device (below) keeps
+  the normal wait.
+- **Switch.** Before anything adapter-specific, the run's claim
+  (`runnerProfileJson.adapterDispatch.adapterType`) moves to `codex_local` in
+  one compare-and-set with its `contextSnapshot.codexFallback` attribution
+  (device, Claude source and reset, model). The Claude attributions it copied
+  (`deviceLogin`, a pool `aiConnection`) are dropped, so no Claude handler ever
+  charges it. The run event says which Claude account is limited until when;
+  `agent.codex_fallback_started` is logged once per agent, device and reset. A
+  resumed execution keeps the adapter its claim names.
+- **Codex config.** Built from the Claude agent's own config: instructions,
+  prompt, working directory, workspace strategy, timeouts and non-credential
+  env stay; Claude-only settings and `CLAUDE_*`, `ANTHROPIC_*`,
+  `OPENAI_API_KEY` and `CODEX_HOME` env go. Codex runs on the CLI engine,
+  with approvals bypassed exactly when Claude skipped its permission prompts,
+  and on the chosen model (the Codex CLI default when unset). Codex keeps its
+  own task sessions; Claude's session is untouched and resumes after the reset.
+- **The device's own login only** (`deviceCodexLogin` in the Codex adapter
+  config). No host `auth.json` is shipped to the device; the run's Codex home
+  links `auth.json` to the device's `~/.codex/auth.json`, so a token refresh
+  lands in the device's own login; nothing is copied back to the server or to
+  its credential cache. A device without a Codex login fails the run at once
+  ("This device has no Codex login"). The ACP engine is refused.
+- **Waits.** When a Claude limit is recorded, the agent's limit waits
+  (`ai_account`, `device_login`) are woken and the hold lets them proceed
+  (`codex_fallback`), so waiting tasks start on Codex at once.
+- **Codex limit or failure.** A fallback run that ends on Codex's own usage
+  limit, or fails before Codex served it (no login, Codex missing, a sign-in
+  failure), turns the fallback off on that environment
+  (`device_login_limits.codex_fallback_blocked_until`): until Codex's typed
+  reset (at most 7 days and 1 hour), 5 hours for an untyped limit, 1 hour for a
+  failure. The task is retried at once (`codex_fallback_unavailable`) and then
+  waits for the Claude reset as before. A fallback run that Codex served clears
+  the block; a failure after Codex served it is an ordinary failure.
+- **Back to Claude.** Once the Claude limit has passed, the next run is a Claude
+  run again (the limit's probe rules apply). Nothing is switched back by hand.
+- **Not covered.** SSH environments (Codex there would need the server's own
+  login) and the Local environment.
 
 ### Plugin targets API
 

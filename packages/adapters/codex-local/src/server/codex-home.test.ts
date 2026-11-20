@@ -1083,6 +1083,19 @@ describe("stageCodexHomeForSync", () => {
     } finally { if (staged) await fs.rm(staged, { recursive: true, force: true }); await fs.rm(root, { recursive: true, force: true }); }
   });
 
+  // Fork: the Codex fallback never ships a host credential to the device.
+  it("leaves auth.json out when asked to exclude it", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-stage-noauth-"));
+    let staged: string | undefined;
+    try {
+      const { home } = await buildFakeHome(root);
+      staged = await stageCodexHomeForSync(home, { runId: "run-1", excludeAuth: true });
+      const entries = await fs.readdir(staged);
+      expect(entries).not.toContain("auth.json");
+      expect(entries).toContain("skills");
+    } finally { if (staged) await fs.rm(staged, { recursive: true, force: true }); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   // Builds a fake managed CODEX_HOME containing the full allowlist (with
   // `auth.json` as a symlink into a separate source-bytes file and a populated
   // `skills/` symlink, mirroring the real managed home) plus decoy runtime

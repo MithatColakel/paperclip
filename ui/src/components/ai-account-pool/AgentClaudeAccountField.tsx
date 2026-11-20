@@ -62,6 +62,7 @@ import {
 import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { AccountSelect, AiAccountStateBadge } from "./AccountSelect";
+import { AgentCodexFallbackField } from "./AgentCodexFallbackField";
 
 /** Enough recent runs to find a wait: a waiting run is re-armed in place, not replaced. */
 const RECENT_RUNS_LIMIT = 25;
@@ -467,6 +468,7 @@ export function AgentClaudeAccountField({
             waitRun={waitRunQuery.data ?? null}
             now={now}
           />
+          <AgentCodexFallbackField agentId={agent.id} agentName={agent.name} now={now} />
           {binding.needsReview ? (
             <InlineBanner
               tone="info"

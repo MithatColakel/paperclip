@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,11 +50,18 @@ describe("codex home auth merge on sandbox asset extract", () => {
     sandboxAuth?: string;
     hostAuth?: string;
     imageAuth?: string;
+    /** Fork: the prior lease's auth.json is a link to the image login (a Codex fallback run). */
+    sandboxAuthLinkedToImage?: boolean;
+    /** Fork: the Codex fallback's device-login mode. */
+    deviceLogin?: boolean;
   }): Promise<{
     commandText: string;
     writtenPaths: string[];
     finalAuth: string;
     finalMode: number;
+    finalLinkTarget: string | null;
+    imageAuthPath: string;
+    imageAuthAfter: string | null;
     combinedOutput: string;
   }> {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-merge-"));
@@ -78,8 +85,12 @@ describe("codex home auth merge on sandbox asset extract", () => {
     // A fake in-sandbox $HOME whose ~/.codex may carry the image's own login.
     const imageHomeDir = path.join(rootDir, "image-home");
     await mkdir(path.join(imageHomeDir, ".codex"), { recursive: true });
+    const imageAuthPath = path.join(imageHomeDir, ".codex", "auth.json");
     if (input.imageAuth !== undefined) {
-      await writeFile(path.join(imageHomeDir, ".codex", "auth.json"), input.imageAuth, { mode: 0o600 });
+      await writeFile(imageAuthPath, input.imageAuth, { mode: 0o600 });
+    }
+    if (input.sandboxAuthLinkedToImage) {
+      await symlink(imageAuthPath, path.join(remoteHomeDir, "auth.json"));
     }
 
     const commands: string[] = [];
@@ -150,17 +161,21 @@ describe("codex home auth merge on sandbox asset extract", () => {
         // seam. This matrix drives the sandbox core directly, supplying the same
         // contribution the codex adapter (`execute.ts`) attaches in production —
         // proving the seam reproduces inbound behavior.
-        provision: buildCodexAuthInboundProvision(),
+        provision: buildCodexAuthInboundProvision({ deviceLogin: input.deviceLogin }),
       }],
     });
 
     const commandText = commands.find((command) => command.includes("codex-auth-merge-extract.sh")) ?? "";
     const finalAuthPath = path.join(remoteHomeDir, "auth.json");
+    const finalStat = await lstat(finalAuthPath).catch(() => null);
     return {
       commandText,
       writtenPaths,
-      finalAuth: await readFile(finalAuthPath, "utf8"),
-      finalMode: (await lstat(finalAuthPath)).mode & 0o777,
+      finalAuth: finalStat ? await readFile(finalAuthPath, "utf8") : "",
+      finalMode: finalStat ? finalStat.mode & 0o777 : 0,
+      finalLinkTarget: finalStat?.isSymbolicLink() ? await readlink(finalAuthPath) : null,
+      imageAuthPath,
+      imageAuthAfter: await readFile(imageAuthPath, "utf8").catch(() => null),
       combinedOutput: outputs.join("\n"),
     };
   }
@@ -445,6 +460,37 @@ describe("codex home auth merge on sandbox asset extract", () => {
     });
 
     expect(result.finalAuth).toBe(sandboxAuth);
+  });
+
+  // Fork: the Codex fallback of a Claude agent runs on the device's own login only.
+  it("links auth.json to the device's own login in device mode and never installs host or prior-lease auth", async () => {
+    const hostAuth = subscriptionAuth({ accountId: "acct-host", lastRefresh: "2026-07-09T00:00:00Z", marker: "host" });
+    const sandboxAuth = subscriptionAuth({ accountId: "acct-1", lastRefresh: "2026-07-09T00:00:00Z", marker: "prior-lease" });
+    const imageAuth = subscriptionAuth({ accountId: "acct-device", lastRefresh: "2026-07-01T00:00:00Z", marker: "device" });
+    const result = await runCodexHomeAssetExtract({ hostAuth, sandboxAuth, imageAuth, deviceLogin: true });
+
+    expect(result.commandText).toMatch(/ device$/);
+    expect(result.finalLinkTarget).toBe(result.imageAuthPath);
+    expect(result.finalAuth).toBe(imageAuth);
+    expect(result.imageAuthAfter).toBe(imageAuth);
+  });
+
+  it("leaves auth.json out in device mode when the device has no Codex login", async () => {
+    const hostAuth = subscriptionAuth({ accountId: "acct-host", lastRefresh: "2026-07-09T00:00:00Z", marker: "host" });
+    const result = await runCodexHomeAssetExtract({ hostAuth, deviceLogin: true });
+
+    expect(result.finalLinkTarget).toBeNull();
+    expect(result.finalAuth).toBe("");
+  });
+
+  it("never keeps a device-login link as a sandbox credential in merge mode", async () => {
+    const hostAuth = subscriptionAuth({ accountId: "acct-device", lastRefresh: "2026-07-01T00:00:00Z", marker: "host" });
+    const imageAuth = subscriptionAuth({ accountId: "acct-device", lastRefresh: "2026-07-09T00:00:00Z", marker: "device" });
+    const result = await runCodexHomeAssetExtract({ hostAuth, imageAuth, sandboxAuthLinkedToImage: true });
+
+    expect(result.finalLinkTarget).toBeNull();
+    expect(result.finalAuth).toBe(hostAuth);
+    expect(result.imageAuthAfter).toBe(imageAuth);
   });
 
   it("routes the Codex home asset through a single native syncIn operation whose post-command is the auth-merge (#4, C5/C6)", async () => {

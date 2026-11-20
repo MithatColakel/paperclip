@@ -143,6 +143,13 @@ If you change schema/API behavior, update all impacted layers:
   hits its limit, its tasks wait for the reset and start again on the same
   account. See
   [AI Connections](doc/connections/AI-CONNECTIONS.md#claude-account-pool-fork).
+  One exception (owner decision 2026-11-20): a company admin can turn on an
+  agent's Codex fallback, so while its Claude account is at its usage limit a
+  Claude agent on a device runs on that device's own Codex login and goes back
+  to Claude after the reset. It never uses another Claude account, another
+  device, or a Codex login other than the device's own, and the device's Codex
+  login never leaves the device. See
+  [Codex fallback](doc/connections/AI-CONNECTIONS.md#codex-fallback-on-a-device-fork).
 
 4. Do not replace strategic docs wholesale unless asked.
 Prefer additive updates. Keep `doc/SPEC.md` and `doc/SPEC-implementation.md` aligned.

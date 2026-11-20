@@ -978,3 +978,44 @@ export interface AiAccountMigrationReport {
     agents: AiAccountMigrationGoNoGoEntry[];
   };
 }
+
+// ---------------------------------------------------------------------------
+// Fork: Codex fallback on a device (AI-CONNECTIONS.md, "Codex fallback on a device")
+// ---------------------------------------------------------------------------
+
+/** `runtimeConfig.codexFallback` of a Claude agent. */
+export const agentCodexFallbackConfigSchema = z.object({
+  enabled: z.boolean(),
+  /** Codex model id; the Codex CLI default when unset. */
+  model: z.string().trim().min(1).max(200).nullable().optional(),
+  /** Codex reasoning effort (low, medium, high, xhigh, …); the model default when unset. */
+  modelReasoningEffort: z.string().trim().min(1).max(40).nullable().optional(),
+}).strict();
+export type AgentCodexFallbackConfig = z.infer<typeof agentCodexFallbackConfigSchema>;
+
+/** `PUT /api/agents/:agentId/codex-fallback`. */
+export const setAgentCodexFallbackSchema = agentCodexFallbackConfigSchema;
+export type SetAgentCodexFallback = AgentCodexFallbackConfig;
+
+/** Why an agent cannot use the fallback at all. */
+export type AgentCodexFallbackUnsupportedReason = "adapter" | "no_device_environment";
+
+/** `GET`/`PUT /api/agents/:agentId/codex-fallback`. */
+export interface AgentCodexFallbackView {
+  agentId: string;
+  enabled: boolean;
+  model: string | null;
+  modelReasoningEffort: string | null;
+  /** Company admins change it. */
+  canChange: boolean;
+  /** Null when the agent can use it: a Claude agent whose default environment is a device. */
+  unsupportedReason: AgentCodexFallbackUnsupportedReason | null;
+  environment: { id: string; name: string } | null;
+  /** Codex runs now in place of Claude: the Claude account is at its limit. */
+  active: boolean;
+  /** The Claude reset the fallback covers, when active. */
+  claudeUntil: string | null;
+  /** The fallback is off on the device until then: Codex hit its own limit or a run failed. */
+  codexBlockedUntil: string | null;
+  codexBlockReason: "codex_limit" | "codex_failed" | null;
+}

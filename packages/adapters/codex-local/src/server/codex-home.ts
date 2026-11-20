@@ -405,6 +405,11 @@ export interface StageCodexHomeForSyncOptions {
   additionalFiles?: readonly string[];
   /** Run id, used only to make the staged temp-dir name traceable in logs. */
   runId?: string;
+  /**
+   * Fork: leave `auth.json` out (the Codex fallback runs on the device's own
+   * login, so no host credential is ever shipped to the device).
+   */
+  excludeAuth?: boolean;
 }
 
 /**
@@ -632,6 +637,7 @@ export async function stageCodexHomeForSync(
       await fs.writeFile(path.join(stagedHome, filename), await fs.readFile(source), { mode: 0o600, flag: "wx" });
     }
     for (const entry of CODEX_SYNC_ALLOWLIST) {
+      if (options.excludeAuth && entry === "auth.json") continue;
       await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
     }
     return stagedHome;

@@ -66,6 +66,8 @@ const poolApi = vi.hoisted(() => ({
   clearAgentBinding: vi.fn(),
   reviewAgentBinding: vi.fn(),
   listCompanyAccounts: vi.fn(),
+  getCodexFallback: vi.fn(),
+  setCodexFallback: vi.fn(),
 }));
 const invalidatePool = vi.hoisted(() => vi.fn(async () => undefined));
 const connectionsApi = vi.hoisted(() => ({ list: vi.fn() }));
@@ -347,6 +349,12 @@ beforeEach(() => {
     disconnect() {}
   };
   poolApi.listCompanyAccounts.mockResolvedValue({ accounts: [TEAM, MINE], canBindAny: true });
+  // Fork: the Codex fallback below the field (its own tests are in AgentCodexFallbackField.test.tsx).
+  poolApi.getCodexFallback.mockResolvedValue({
+    agentId: "agent-1", enabled: false, model: null, modelReasoningEffort: null, canChange: true,
+    unsupportedReason: "no_device_environment", environment: null, active: false, claudeUntil: null,
+    codexBlockedUntil: null, codexBlockReason: null,
+  });
   connectionsApi.list.mockResolvedValue(connectionList([connection()]));
   // The viewer has saved a Claude login under My secrets.
   agentsApiMock.getClaudeOAuthTokenStatus.mockResolvedValue({ secretId: "secret-1", latestVersion: 1 });

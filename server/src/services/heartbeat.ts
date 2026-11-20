@@ -271,6 +271,8 @@ import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
 // Fork: Claude account pool and resource waits (spec v3 §4, §7, §8). The logic lives in these modules.
 import { createHeartbeatAiAccounts, isPersistedNativeRun, isRoutingCheckUnavailable, ownPoolAttribution } from "./heartbeat-ai-accounts.js";
 import { createHeartbeatDeviceLogin } from "./heartbeat-device-login.js";
+import { createHeartbeatCodexFallback } from "./heartbeat-codex-fallback.js";
+import { stripClaudeOnlyAdapterConfig } from "./codex-fallback-policy.js";
 import { createResourceWaits, isResourceWaitDeferral, type CheckNowSource, type ResourceWaitWakeFilter, type ResourceWaitWakeOptions } from "./resource-waits/index.js";
 import {
   getExecutionBlocker,
@@ -994,10 +996,17 @@ export function heartbeatService(
       evaluateScheduledRetryGate: (input) => runDispatch.evaluateScheduledRetryGate(input),
     },
   });
+  // Fork: Codex fallback on a device (AI-CONNECTIONS.md, "Codex fallback on a device").
+  const codexFallback = createHeartbeatCodexFallback({
+    db,
+    wakeResourceWaits: (filter, wakeOptions) => resourceWaits.wakeResourceWaits(filter, wakeOptions),
+    appendRunEvent: (run, event) => appendRunEvent(run, event),
+  });
   const heartbeatAiAccounts = createHeartbeatAiAccounts({
     db,
     resourceWaits,
     deviceLogin: createHeartbeatDeviceLogin({ db, resourceWaits }),
+    codexFallback,
     deps: {
       appendRunEvent: (run, event) => appendRunEvent(run, event),
       scheduleBoundedRetryForRun: (run, agent, opts) => scheduleBoundedRetryForRun(run, agent, opts),
@@ -1779,6 +1788,7 @@ export function heartbeatService(
     processRunCancellationSettlements,
     failedProcessRunCancellations,
     heartbeatAiAccounts,
+    codexFallback,
   });
 
   async function executeRun(
@@ -1985,6 +1995,21 @@ export function heartbeatService(
         const failedRun = await getRun(runId);
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
+      }
+
+      // Fork: Codex fallback. While the Claude agent's account is at its usage
+      // limit, an opted-in agent on a device runs on that device's own Codex
+      // login; the claim moves to Codex here, before anything adapter-specific.
+      let codexFallbackActive = false;
+      try {
+        const applied = await codexFallback.applyToRun({ run, agent });
+        run = applied.run;
+        if (applied.fallback) {
+          agent = applied.fallback.agent;
+          codexFallbackActive = true;
+        }
+      } catch (err) {
+        logger.warn({ err, runId: run.id }, "Codex fallback check failed; the run goes on with the agent's own adapter");
       }
 
       // The claimed adapter identity is immutable recovery evidence. Do not
@@ -2237,6 +2262,10 @@ export function heartbeatService(
               issueContext.assigneeAdapterOverrides,
             )
           : null;
+      if (issueAssigneeOverrides?.adapterConfig && codexFallbackActive) {
+        // Fork: a Codex fallback run takes no Claude-only per-task override (a Claude model id, effort, …).
+        issueAssigneeOverrides = { ...issueAssigneeOverrides, adapterConfig: stripClaudeOnlyAdapterConfig(issueAssigneeOverrides.adapterConfig) };
+      }
       const experimentalInstanceSettings =
         await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled =

@@ -36,14 +36,17 @@ const CODEX_AUTH_MERGE_DECISION_SCRIPT_BYTES = readFileSync(
  * interpolated into the shell (C5). This is behaviour-identical to the extraction
  * the sandbox core previously drove through the custom-provision tar path.
  */
-export function buildCodexAuthInboundProvision(): SandboxManagedRuntimeAssetProvision {
+export function buildCodexAuthInboundProvision(options: { deviceLogin?: boolean } = {}): SandboxManagedRuntimeAssetProvision {
   return {
     stageFiles: [
       { name: CODEX_AUTH_MERGE_EXTRACT_SCRIPT_NAME, contents: CODEX_AUTH_MERGE_EXTRACT_SCRIPT_BYTES },
       { name: CODEX_AUTH_MERGE_DECISION_SCRIPT_NAME, contents: CODEX_AUTH_MERGE_DECISION_SCRIPT_BYTES },
     ],
+    // Fork: `device` links the home's auth.json to the device's own
+    // ~/.codex/auth.json (Codex fallback), so a token refresh lands in the
+    // device's login and no credential is kept or copied anywhere else.
     postUploadCommand: ({ assetTarPath, assetDir, runtimeRootDir }) =>
       `sh ${shellQuote(path.posix.join(runtimeRootDir, CODEX_AUTH_MERGE_EXTRACT_SCRIPT_NAME))} ` +
-      `${shellQuote(assetDir)} ${shellQuote(assetTarPath)}`,
+      `${shellQuote(assetDir)} ${shellQuote(assetTarPath)}${options.deviceLogin ? " device" : ""}`,
   };
 }

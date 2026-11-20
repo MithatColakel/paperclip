@@ -175,6 +175,42 @@ describe("codex sandbox-target credential gate", () => {
     ).rejects.toThrow(/the sandbox has no Codex login/);
   });
 
+  // Fork: the Codex fallback of a Claude agent runs on the device's own login only.
+  it("uses only the device's own login in device-login mode, even when the host has one", async () => {
+    const { env, managedAgentHome } = await makeCredentiallessManagedHome();
+    await fs.mkdir(managedAgentHome, { recursive: true });
+    await fs.writeFile(path.join(managedAgentHome, "auth.json"), '{"OPENAI_API_KEY":"sk-host"}', { mode: 0o600 });
+    mockRunTargetShellCommand.mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "", stderr: "" });
+    const logs: string[] = [];
+    const input = {
+      runId: "run-device-login",
+      companyId: "company-1",
+      configuredCodexHome: managedAgentHome,
+      configuredApiKey: null,
+      effectiveCodexHome: managedAgentHome,
+      target: sandboxTarget,
+      cwd: "/workspace",
+      env,
+      onLog: async (_stream: string, line: string) => {
+        logs.push(line);
+      },
+      deviceLogin: true,
+    };
+    await expect(assertCodexCredentialsLaunchable(input)).resolves.toBeUndefined();
+    expect(mockRunTargetShellCommand).toHaveBeenCalledWith(
+      "run-device-login",
+      sandboxTarget,
+      'test -f "$HOME/.codex/auth.json"',
+      expect.objectContaining({ cwd: "/workspace" }),
+    );
+    expect(logs.join("")).toContain("this device's own Codex login");
+
+    mockRunTargetShellCommand.mockResolvedValue({ exitCode: 1, timedOut: false, stdout: "", stderr: "" });
+    await expect(assertCodexCredentialsLaunchable(input)).rejects.toThrow(/no Codex login/);
+    const sshTarget = { kind: "remote", transport: "ssh" } as unknown as typeof sandboxTarget;
+    await expect(assertCodexCredentialsLaunchable({ ...input, target: sshTarget })).rejects.toThrow(/only on a device/);
+  });
+
   it("proceeds with a warning when the sandbox login probe fails operationally", async () => {
     const { env, managedAgentHome } = await makeCredentiallessManagedHome();
     mockRunTargetShellCommand.mockRejectedValue(new Error("transport lost"));

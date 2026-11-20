@@ -5,6 +5,7 @@ import {
   isUuidLike,
   replaceAiAccountCredentialSchema,
   setAgentAiAccountSchema,
+  setAgentCodexFallbackSchema,
   updateInstanceAiAccountSchema,
   updateMyAiAccountSchema,
   type DeploymentMode,
@@ -16,6 +17,7 @@ import {
   type PoolAgentRow,
   type PoolContext,
 } from "../services/ai-account-pool.js";
+import { codexFallbackSettingsService } from "../services/codex-fallback-settings.js";
 import { assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
 
 /**
@@ -28,6 +30,7 @@ import { assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAcces
 export function aiAccountPoolRoutes(db: Db, options: { deploymentMode?: DeploymentMode } = {}) {
   const router = Router();
   const svc = aiAccountPoolService(db, { deploymentMode: options.deploymentMode });
+  const codexFallback = codexFallbackSettingsService(db);
 
   function context(req: Request): PoolContext {
     return { actor: req.actor, audit: getActorInfo(req) };
@@ -158,6 +161,19 @@ export function aiAccountPoolRoutes(db: Db, options: { deploymentMode?: Deployme
     if (!agent) return;
     await svc.clearBinding(context(req), agent.id);
     res.status(204).end();
+  });
+
+  // Fork: Codex fallback on a device (AI-CONNECTIONS.md). Members read it; company admins change it.
+  router.get("/agents/:agentId/codex-fallback", async (req, res) => {
+    const agent = await accessibleAgent(req, res, false);
+    if (!agent) return;
+    res.json(await codexFallback.get(req.actor, agent.id));
+  });
+
+  router.put("/agents/:agentId/codex-fallback", validate(setAgentCodexFallbackSchema), async (req, res) => {
+    const agent = await accessibleAgent(req, res, true);
+    if (!agent) return;
+    res.json(await codexFallback.set(context(req), agent.id, req.body));
   });
 
   router.post("/agents/:agentId/ai-account/review", async (req, res) => {

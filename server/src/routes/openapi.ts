@@ -31,6 +31,7 @@ import {
   linkDeviceTargetSchema,
   replaceAiAccountCredentialSchema,
   setAgentAiAccountSchema,
+  setAgentCodexFallbackSchema,
   updateExecutionDeviceSchema,
   updateExecutionWaitSettingsSchema,
   updateInstanceAiAccountSchema,
@@ -1604,6 +1605,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PUT /api/agents/{agentId}/ai-account",
   "DELETE /api/agents/{agentId}/ai-account",
   "POST /api/agents/{agentId}/ai-account/review",
+  "GET /api/agents/{agentId}/codex-fallback",
+  "PUT /api/agents/{agentId}/codex-fallback",
   "GET /api/companies/{companyId}/devices",
   "GET /api/companies/{companyId}/devices/{deviceId}",
   "POST /api/companies/{companyId}/devices/{deviceId}/check-now",
@@ -11619,6 +11622,38 @@ registerForkRoute({
     401: r.unauthorized,
     403: aiAccountBindingForbiddenResponse("the caller is not a company admin."),
     404: r.notFound,
+  },
+});
+
+registerForkRoute({
+  method: "get",
+  path: "/api/agents/{agentId}/codex-fallback",
+  tags: ["ai-accounts", "agents"],
+  summary: "Get an agent's Codex fallback",
+  description:
+    "Board users with access to the agent's company. Whether the Claude agent runs on its device's own Codex login while " +
+    "its Claude account is at its usage limit, whether that is happening now (`active`, `claudeUntil`), and whether Codex " +
+    "is turned off on the device for a while (`codexBlockedUntil`).",
+  responses: { 200: sharedBody("AgentCodexFallbackView"), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registerForkRoute({
+  method: "put",
+  path: "/api/agents/{agentId}/codex-fallback",
+  tags: ["ai-accounts", "agents"],
+  summary: "Turn an agent's Codex fallback on or off",
+  description:
+    "Company admins only. Only a Claude agent whose default environment is an active device (sandbox) environment can " +
+    "turn it on. Turning it on wakes the agent's Claude limit waits, so waiting tasks start on Codex at once. Logged as " +
+    "`agent.codex_fallback_updated` in the agent's company.",
+  body: setAgentCodexFallbackSchema,
+  responses: {
+    200: sharedBody("AgentCodexFallbackView"),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
   },
 });
 

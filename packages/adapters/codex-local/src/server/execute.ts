@@ -395,7 +395,28 @@ export async function assertCodexCredentialsLaunchable(input: {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   onLog: AdapterExecutionContext["onLog"];
+  /** Fork: the run must use the sandbox device's own Codex login (Codex fallback). */
+  deviceLogin?: boolean;
 }): Promise<void> {
+  if (input.deviceLogin) {
+    if (input.target?.kind !== "remote" || input.target.transport !== "sandbox") {
+      throw new Error("The Codex fallback runs only on a device (sandbox) environment, with that device's own Codex login.");
+    }
+    const deviceAuthJson = await probeSandboxCodexAuthJson({ runId: input.runId, target: input.target, cwd: input.cwd });
+    if (deviceAuthJson === "absent") {
+      throw new Error(
+        "This device has no Codex login (~/.codex/auth.json). Sign in to Codex on the device " +
+          "(codex login), or turn the agent's Codex fallback off.",
+      );
+    }
+    await input.onLog(
+      "stdout",
+      deviceAuthJson === "present"
+        ? "Using this device's own Codex login (Codex fallback).\n"
+        : "Could not verify this device's Codex login (probe failed); proceeding with it (Codex fallback).\n",
+    );
+    return;
+  }
   const credentialReadiness = await evaluateCodexCredentialReadiness({
     env: input.env ?? process.env,
     companyId: input.companyId,
@@ -591,6 +612,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
   if (engineSelection.engine === "acp") {
+    if (ctx.config.deviceCodexLogin === true) {
+      // Fork: the ACP path may ship and copy back host credentials; the Codex fallback is CLI-only.
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "adapter_engine_unavailable",
+        errorMessage: "The Codex fallback runs on the Codex CLI engine only.",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      };
+    }
     return executeCodexAcp(ctx);
   }
 
@@ -652,6 +684,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
       : null;
+  // Fork: the Codex fallback of a Claude agent (Paperclip server,
+  // AI-CONNECTIONS.md "Codex fallback on a device"). Codex runs on the device's
+  // own login only: no host credential is shipped to the device, and nothing
+  // is copied back from it.
+  const deviceCodexLogin = config.deviceCodexLogin === true;
   const skillSourceHome = configuredCodexHome;
   const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
     && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
@@ -762,6 +799,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     target: executionTarget,
     cwd,
     onLog,
+    deviceLogin: deviceCodexLogin,
   });
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
@@ -855,7 +893,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // the single-use `auth.json`) are dereferenced to bytes. This drops the
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
-          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId, additionalFiles: observabilityProfile ? [observabilityProfile.filename] : [] });
+          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+            runId,
+            additionalFiles: observabilityProfile ? [observabilityProfile.filename] : [],
+            excludeAuth: deviceCodexLogin,
+          });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,
@@ -881,7 +923,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // that already carries a Codex `auth.json` keeps whichever
                 // credential is newer. The sandbox runtime core stays adapter-
                 // agnostic — it just invokes this generic `provision` seam.
-                provision: buildCodexAuthInboundProvision(),
+                provision: buildCodexAuthInboundProvision({ deviceLogin: deviceCodexLogin }),
                 // Outbound (sandbox→host) auth copy-back contribution: at
                 // teardown, read the sandbox's `auth.json` and — guarded by the
                 // same direction-agnostic decision predicate under a directory
@@ -891,7 +933,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // generic `restore` seam per asset before destroying the sandbox.
                 // Target is the shared symlink SOURCE (what managed homes point
                 // `auth.json` at), not the in-sandbox symlink.
-                restore: async ({ assetDir, readFile }) =>
+                // A device-login run never copies the device's credential to the host.
+                restore: deviceCodexLogin ? undefined : async ({ assetDir, readFile }) =>
                   void (await copyBackCodexAuth({
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostAuthPath: path.join(config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
@@ -927,7 +970,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? preparedExecutionTargetRuntime?.assetDirs.home ??
         path.posix.join(effectiveExecutionCwd, ".paperclip-runtime", "codex", "home")
       : null;
-    await emitSandboxAuthPrecedenceWarningIfNeeded({
+    if (!deviceCodexLogin) await emitSandboxAuthPrecedenceWarningIfNeeded({
       runId,
       target: runtimeExecutionTarget,
       cwd: effectiveExecutionCwd,

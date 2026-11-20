@@ -1,4 +1,5 @@
 import { agentAppearanceSchema } from "../agent-appearance.js";
+import { agentCodexFallbackConfigSchema } from "../ai-account-pool.js";
 import { aiRuntimeConnectionBindingSchema as aiConnectionBindingSchema } from "../ai-connection-router.js";
 import { z } from "zod";
 import {
@@ -70,6 +71,8 @@ export const createAgentInstructionsBundleSchema = z.object({
 
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),
+  // Fork: Codex fallback on a device (AI-CONNECTIONS.md).
+  codexFallback: agentCodexFallbackConfigSchema.optional(),
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),

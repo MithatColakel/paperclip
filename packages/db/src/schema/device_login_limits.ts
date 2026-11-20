@@ -34,6 +34,15 @@ export const deviceLoginLimits = pgTable("device_login_limits", {
   limitProbeRunId: uuid("limit_probe_run_id"),
   limitRunId: uuid("limit_run_id"),
   lastLimitedAt: timestamp("last_limited_at", { withTimezone: true }),
+  /**
+   * Fork: Codex fallback (AI-CONNECTIONS.md, "Codex fallback on a device").
+   * While set and ahead, a Claude agent that opted in does not switch to the
+   * device's own Codex login here: its last fallback run hit Codex's own
+   * usage limit or failed. Its tasks wait for the Claude reset meanwhile.
+   */
+  codexFallbackBlockedUntil: timestamp("codex_fallback_blocked_until", { withTimezone: true }),
+  codexFallbackBlockReason: text("codex_fallback_block_reason").$type<"codex_limit" | "codex_failed">(),
+  codexFallbackBlockRunId: uuid("codex_fallback_block_run_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -41,4 +50,5 @@ export const deviceLoginLimits = pgTable("device_login_limits", {
   index("device_login_limits_device_idx").on(t.deviceId),
   check("device_login_limits_reason_check", sql`${t.limitReason} is null or ${t.limitReason} in ('provider_quota','credit_balance')`),
   check("device_login_limits_source_check", sql`${t.limitSource} is null or ${t.limitSource} in ('provider','estimated')`),
+  check("device_login_limits_codex_block_reason_check", sql`${t.codexFallbackBlockReason} is null or ${t.codexFallbackBlockReason} in ('codex_limit','codex_failed')`),
 ]);

@@ -20,6 +20,7 @@ import { logger } from "../../middleware/logger.js";
 import { environmentAvailabilityService, isFreshlyUnavailable } from "../environment-availability.js";
 import { executionRetryAttemptCount } from "../execution-recovery-attempt.js";
 import { capOf, deviceForEnvironment, runningPoolAccountsOnDevice, wouldExceedDeviceCap } from "../execution-devices.js";
+import { evaluateCodexFallback } from "../codex-fallback-policy.js";
 import { evaluateAccountPlan } from "./account-plan.js";
 import {
   claimDeviceLoginProbe,
@@ -576,6 +577,11 @@ export function createHold(runtime: HoldRuntime) {
     if (!runtime.environmentWaitsEnabled && view.kind === "environment") return proceed("environment_waits_off");
     const [agent] = await db.select().from(agents).where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)));
     if (!agent) return proceed("agent_missing");
+    // Fork: a Claude limit wait of an agent with the Codex fallback proceeds now; the run goes on Codex.
+    if ((view.kind === "device_login" || (view.kind === "ai_account" && isLimitReason(view.reason)))
+      && (await evaluateCodexFallback(db, { agent, now })).eligible) {
+      return proceed("codex_fallback");
+    }
     const resolvedPolicy = policy ?? await readRunEnvironmentPolicy(db);
     if (view.kind === "environment") return canProceedEnvironment(run, agent, view, resolvedPolicy, now);
     if (view.kind === "ai_account") return canProceedAccount(run, agent, view, resolvedPolicy, now);

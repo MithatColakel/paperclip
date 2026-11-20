@@ -2,6 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import type {
   AgentAiAccountBindingDetail,
   AgentAiAccountBindingSummary,
+  AgentCodexFallbackView,
   AiAccountMigrationReport,
   CompanyAiAccountBindingsResponse,
   CompanyAiAccountsResponse,
@@ -13,6 +14,7 @@ import type {
   ReplaceAiAccountCredential,
   SetAgentAiAccount,
   SetAgentAiAccountResponse,
+  SetAgentCodexFallback,
   UpdateInstanceAiAccount,
   UpdateMyAiAccount,
 } from "@paperclipai/shared";
@@ -32,6 +34,7 @@ export const aiAccountPoolKeys = {
     ["ai-account-pool", "company", companyId, "accounts", agentId ?? null] as const,
   bindings: (companyId: string) => ["ai-account-pool", "company", companyId, "bindings"] as const,
   agent: (agentId: string) => ["ai-account-pool", "agent", agentId] as const,
+  codexFallback: (agentId: string) => ["ai-account-pool", "agent", agentId, "codex-fallback"] as const,
   instanceAccounts: ["ai-account-pool", "instance", "accounts"] as const,
   migration: ["ai-account-pool", "instance", "migration"] as const,
 };
@@ -83,6 +86,12 @@ export const aiAccountPoolApi = {
     api.put<SetAgentAiAccountResponse>(`/agents/${segment(agentId)}/ai-account`, input),
   /** Back to the agent's AI connection or the device's own login. */
   clearAgentBinding: (agentId: string) => api.delete<void>(`/agents/${segment(agentId)}/ai-account`),
+  /** Fork: the agent's Codex fallback (its device's own Codex login while Claude is at its limit). */
+  getCodexFallback: (agentId: string) =>
+    api.get<AgentCodexFallbackView>(`/agents/${segment(agentId)}/codex-fallback`),
+  /** Company admins; saves at once. */
+  setCodexFallback: (agentId: string, input: SetAgentCodexFallback) =>
+    api.put<AgentCodexFallbackView>(`/agents/${segment(agentId)}/codex-fallback`, input),
   /** Company admins confirm a migrated binding. */
   reviewAgentBinding: (agentId: string) =>
     api.post<AgentAiAccountBindingSummary>(`/agents/${segment(agentId)}/ai-account/review`, {}),

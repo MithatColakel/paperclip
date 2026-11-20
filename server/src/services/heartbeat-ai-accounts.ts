@@ -79,6 +79,7 @@ import {
 } from "./resource-waits/index.js";
 import type { RunEnvironmentRow } from "./resource-waits/run-environment.js";
 import type { HeartbeatDeviceLogin, PlanDeviceLoginInput } from "./heartbeat-device-login.js";
+import type { HeartbeatCodexFallback } from "./heartbeat-codex-fallback.js";
 
 /**
  * Fork: the run-path side of the Claude account pool (spec 4). Input-only:
@@ -1117,6 +1118,8 @@ export interface CreateHeartbeatAiAccountsOptions {
   decryptCredential?: (material: Record<string, unknown>) => Promise<string>;
   /** Fork: limits of a device's own Claude login (runs without a pool account). */
   deviceLogin?: HeartbeatDeviceLogin;
+  /** Fork: wakes an agent's limit waits when its runs would use the device's Codex login instead. */
+  codexFallback?: Pick<HeartbeatCodexFallback, "wakeIfEligible">;
 }
 
 export interface AcquireInput {
@@ -1779,6 +1782,19 @@ export function createHeartbeatAiAccounts(options: CreateHeartbeatAiAccountsOpti
    * login's limit (fork). Anything else is not handled.
    */
   async function handleProviderLimit(input: FailureInput): Promise<{ handled: boolean; reason: string; via: "pool_account" | "company_pool" | "device_login" | null }> {
+    const outcome = await dispatchProviderLimit(input);
+    if (outcome.handled && (outcome.via === "pool_account" || outcome.via === "device_login") && options.codexFallback) {
+      // Fork: Codex fallback. The limit is recorded and the task waits; with the
+      // fallback on, its waits (this one too) start now on the device's Codex login.
+      await options.codexFallback.wakeIfEligible({ agent: input.agent, now: input.now }).catch((err) => {
+        logger.warn({ err, runId: input.run.id }, "failed to start the Codex fallback after a Claude limit");
+        return false;
+      });
+    }
+    return outcome;
+  }
+
+  async function dispatchProviderLimit(input: FailureInput): Promise<{ handled: boolean; reason: string; via: "pool_account" | "company_pool" | "device_login" | null }> {
     if (ownPoolAttribution(input.run)) {
       const outcome = await handleRunLimit(input);
       return { handled: outcome.handled, reason: outcome.reason, via: "pool_account" };
